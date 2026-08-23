@@ -1,14 +1,14 @@
-# Qwenthin（q38）
+# Qwenthin
 
-本地编码助手控制台。主界面是 `q38 web`，对话循环在进程内跑，连任意 OpenAI 兼容接口。主要对着 **Qwen3.8-27B**（同架构的 3.5 / 3.6 也能用）。
+本地编码助手控制台。连任意 OpenAI 兼容接口。主要对着 Qwen3.8-27B优化harness（同架构的 3.5 / 3.6 也能用）。
 
 更细的内部结构见 [技术说明](docs/architecture.md)。
 
 ## 需要什么
 
-- Rust（`rustup`）
+- Rust依赖（`rustup`）
 - 一个 OpenAI 兼容端点：llama.cpp `llama-server`、vLLM、SGLang、Ollama `/v1`，或远程网关
-- 打开控制台用浏览器
+
 
 ## 三步跑起来
 
