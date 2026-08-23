@@ -20,6 +20,7 @@ use crate::hub::AppState;
 
 pub struct WebOpts {
     pub bind: String,
+    pub allow_lan: bool,
     pub workspace: PathBuf,
     pub session_id: String,
     pub open_browser: bool,
@@ -84,6 +85,11 @@ pub async fn run(opts: WebOpts) -> Result<std::process::ExitCode> {
     }
 
     let addr: SocketAddr = opts.bind.parse().context("bind address")?;
+    if !addr.ip().is_loopback() && !opts.allow_lan {
+        anyhow::bail!(
+            "refusing non-loopback bind {addr}; pass --allow-lan to expose the local console"
+        );
+    }
     let state = AppState::new(session, cfg, cfg_path, opts.agents_md, opts.agents_md_head)?;
     state.spawn_background();
 
@@ -142,4 +148,17 @@ fn open_browser(url: &str) {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_bind_is_the_safe_default() {
+        let local: SocketAddr = "127.0.0.1:3848".parse().unwrap();
+        let lan: SocketAddr = "0.0.0.0:3848".parse().unwrap();
+        assert!(local.ip().is_loopback());
+        assert!(!lan.ip().is_loopback());
+    }
 }

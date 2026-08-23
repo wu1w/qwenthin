@@ -1,14 +1,19 @@
 //! Cheap stutter / restatement detectors. The model never sees these.
 //!
-//! JSONL `stop.reason` uses [`STOP_STUTTER`] / [`STOP_DUMP`]. Fire counts:
+//! JSONL `stop.reason` uses [`STOP_STUTTER`]. Dump-like hops receive a soft
+//! trajectory note instead of a harness stop.
 //! `python3 scripts/stop_reasons.py`.
 
 use std::collections::HashSet;
 
 /// Lossy text stutter. Distinct from dump-hop so JSONL can attribute fires.
 pub const STOP_STUTTER: &str = "budget:repeat:stutter";
-/// Answer dump / write-rm hop. Distinct from text stutter.
-pub const STOP_DUMP: &str = "budget:repeat:dump";
+/// A repeated visible answer plus scratch-file/cleanup activity is usually a
+/// sign that the trajectory is wandering. Give that observation back to the
+/// model and let it choose; the placeholder-write tool guard still prevents a
+/// bogus answer file from landing in the workspace.
+pub const DUMP_NOTE: &str = "[trajectory] 可见答案正在重复，同时出现了低信息量的暂存或清理动作。\
+若任务已经完成可直接收尾；否则明确还缺哪条证据，并只做能补齐它的下一步。";
 
 /// Consecutive identical short lines ≥4, or a ≥16-char block repeated ≥5 times.
 pub fn is_stutter(content: &str, reasoning: &str) -> bool {

@@ -194,31 +194,56 @@ pub fn edit_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
             );
         }
     };
-    let count = content.matches(&old).count();
-    match count {
-        0 => {
-            return ToolResponse::text(
-                &call.id,
-                format!("Error: The text to replace was not found in {raw}."),
-                ToolState::Error,
-            );
+    let (updated, normalized_newlines) = if old.contains('\r') || old.contains('\n') {
+        match replace_unique_newline_agnostic(&content, &old, &new) {
+            Ok(result) => result,
+            Err(0) => {
+                return ToolResponse::text(
+                    &call.id,
+                    format!("Error: The text to replace was not found in {raw}."),
+                    ToolState::Error,
+                );
+            }
+            Err(n) => {
+                return ToolResponse::text(
+                    &call.id,
+                    format!(
+                        "Error: `old_string` matched {n} times in {raw}; provide a longer, more unique `old_string` so the edit targets exactly one location."
+                    ),
+                    ToolState::Error,
+                );
+            }
         }
-        1 => {}
-        n => {
-            return ToolResponse::text(
-                &call.id,
-                format!(
-                    "Error: `old_string` matched {n} times in {raw}; provide a longer, more unique `old_string` so the edit targets exactly one location."
-                ),
-                ToolState::Error,
-            );
+    } else {
+        let count = content.matches(&old).count();
+        match count {
+            0 => {
+                return ToolResponse::text(
+                    &call.id,
+                    format!("Error: The text to replace was not found in {raw}."),
+                    ToolState::Error,
+                );
+            }
+            1 => (content.replacen(&old, &new, 1), false),
+            n => {
+                return ToolResponse::text(
+                    &call.id,
+                    format!(
+                        "Error: `old_string` matched {n} times in {raw}; provide a longer, more unique `old_string` so the edit targets exactly one location."
+                    ),
+                    ToolState::Error,
+                );
+            }
         }
-    }
-    let updated = content.replacen(&old, &new, 1);
+    };
     match write_atomic(&path, &updated) {
         Ok(()) => ToolResponse::text(
             &call.id,
-            format!("Successfully replaced text in {raw}."),
+            if normalized_newlines {
+                format!("Successfully replaced text in {raw} (preserved file line endings).")
+            } else {
+                format!("Successfully replaced text in {raw}.")
+            },
             ToolState::Success,
         ),
         Err(e) => ToolResponse::text(
@@ -227,6 +252,102 @@ pub fn edit_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
             ToolState::Error,
         ),
     }
+}
+
+/// Match a multiline edit after treating LF, CRLF and lone CR as the same
+/// logical newline, then splice only the matched byte range in the original
+/// string. This keeps every byte outside the edit unchanged and writes the new
+/// fragment using the matched file region's line-ending style.
+fn replace_unique_newline_agnostic(
+    content: &str,
+    old: &str,
+    new: &str,
+) -> std::result::Result<(String, bool), usize> {
+    let (normalized_content, boundaries) = normalize_newlines_with_boundaries(content);
+    let normalized_old = normalize_newlines(old);
+    let mut matches = normalized_content.match_indices(&normalized_old);
+    let Some((start, _)) = matches.next() else {
+        return Err(0);
+    };
+    if matches.next().is_some() {
+        return Err(normalized_content.matches(&normalized_old).count());
+    }
+    let end = start + normalized_old.len();
+    let original_start = boundaries[start];
+    let original_end = boundaries[end];
+    let original_fragment = &content[original_start..original_end];
+    let style = dominant_newline_style(original_fragment)
+        .or_else(|| dominant_newline_style(content))
+        .unwrap_or("\n");
+    let replacement = normalize_newlines(new).replace('\n', style);
+    let mut updated =
+        String::with_capacity(content.len() - (original_end - original_start) + replacement.len());
+    updated.push_str(&content[..original_start]);
+    updated.push_str(&replacement);
+    updated.push_str(&content[original_end..]);
+    Ok((updated, original_fragment != old || replacement != new))
+}
+
+fn normalize_newlines(text: &str) -> String {
+    normalize_newlines_with_boundaries(text).0
+}
+
+/// `boundaries[n]` is the original byte offset after `n` normalized bytes.
+/// Newline conversion is ASCII-only, so UTF-8 byte boundaries remain stable.
+fn normalize_newlines_with_boundaries(text: &str) -> (String, Vec<usize>) {
+    let bytes = text.as_bytes();
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut boundaries = Vec::with_capacity(bytes.len() + 1);
+    boundaries.push(0);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' {
+            normalized.push(b'\n');
+            i += if bytes.get(i + 1) == Some(&b'\n') {
+                2
+            } else {
+                1
+            };
+        } else {
+            normalized.push(bytes[i]);
+            i += 1;
+        }
+        boundaries.push(i);
+    }
+    // Replacing CR/CRLF with LF cannot produce invalid UTF-8 from valid input.
+    (
+        String::from_utf8(normalized).expect("normalized UTF-8"),
+        boundaries,
+    )
+}
+
+fn dominant_newline_style(text: &str) -> Option<&'static str> {
+    let bytes = text.as_bytes();
+    let mut crlf = 0usize;
+    let mut lf = 0usize;
+    let mut cr = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' if bytes.get(i + 1) == Some(&b'\n') => {
+                crlf += 1;
+                i += 2;
+            }
+            b'\r' => {
+                cr += 1;
+                i += 1;
+            }
+            b'\n' => {
+                lf += 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    [(crlf, "\r\n"), (lf, "\n"), (cr, "\r")]
+        .into_iter()
+        .max_by_key(|(count, _)| *count)
+        .and_then(|(count, style)| (count > 0).then_some(style))
 }
 
 /// Unique temp next to the target, fsync, rename. Concurrent writers do not
@@ -361,6 +482,81 @@ mod tests {
         assert_eq!(e.state, ToolState::Error, "{t}");
         assert!(t.contains("old_string"), "{t}");
         assert_eq!(fs::read_to_string(dir.join("empty.txt")).unwrap(), "");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lf_request_preserves_crlf_file() {
+        let (ws, dir) = workspace();
+        let path = dir.join("windows.py");
+        fs::write(
+            &path,
+            b"def value():\r\n    return 1\r\n\r\nkeep = True\r\n",
+        )
+        .unwrap();
+        let result = edit_file(
+            &ws,
+            &call(
+                "edit",
+                json!({
+                    "path": "windows.py",
+                    "old_string": "def value():\n    return 1",
+                    "new_string": "def value():\n    return 2"
+                }),
+            ),
+        );
+        assert_eq!(result.state, ToolState::Success, "{}", result.joined_text());
+        assert!(result.joined_text().contains("preserved file line endings"));
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"def value():\r\n    return 2\r\n\r\nkeep = True\r\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_crlf_request_preserves_lf_file() {
+        let (ws, dir) = workspace();
+        let path = dir.join("unix.py");
+        fs::write(&path, b"def value():\n    return 1\nkeep = True\n").unwrap();
+        let result = edit_file(
+            &ws,
+            &call(
+                "edit",
+                json!({
+                    "path": "unix.py",
+                    "old_string": "def value():\r\n    return 1",
+                    "new_string": "def value():\r\n    return 2"
+                }),
+            ),
+        );
+        assert_eq!(result.state, ToolState::Success, "{}", result.joined_text());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"def value():\n    return 2\nkeep = True\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_newline_normalization_keeps_uniqueness_guard() {
+        let (ws, dir) = workspace();
+        let path = dir.join("mixed.txt");
+        fs::write(&path, b"a\r\nb\n--\na\nb\n").unwrap();
+        let result = edit_file(
+            &ws,
+            &call(
+                "edit",
+                json!({
+                    "path": "mixed.txt",
+                    "old_string": "a\nb",
+                    "new_string": "A\nB"
+                }),
+            ),
+        );
+        assert_eq!(result.state, ToolState::Error, "{}", result.joined_text());
+        assert!(result.joined_text().contains("matched 2 times"));
+        assert_eq!(fs::read(&path).unwrap(), b"a\r\nb\n--\na\nb\n");
         let _ = fs::remove_dir_all(&dir);
     }
 

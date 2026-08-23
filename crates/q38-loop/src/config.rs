@@ -180,7 +180,8 @@ impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
             default_mode: "agent".into(),
-            default_effort: "medium".into(),
+            // `auto` maps to neutral official `medium`: no depth instruction.
+            default_effort: "auto".into(),
             max_think_tokens_low: 512,
             max_think_tokens_medium: 2048,
             max_think_tokens_xhigh: 4096,

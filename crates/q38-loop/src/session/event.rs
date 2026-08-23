@@ -29,7 +29,7 @@ impl SessionMode {
     }
 
     /// Default ThinkPolicy for a fresh start in this mode.
-    /// Daily modes preserve=false; `/mode think` preserve=true.
+    /// Thinking modes preserve historical thinking by default.
     pub fn default_policy(self) -> ThinkPolicy {
         self.default_policy_with(&PolicyConfig::default())
     }

@@ -1264,8 +1264,19 @@ def _check(pid: str, ws: Path) -> list[str]:
             if m.put_u32(1) != b"\x00\x00\x00\x01":
                 bad.append("not big-endian")
         elif pid == "c17":
-            src = (ws / "needle/emailish.py").read_text().replace(" ", "")
-            if "+)+" in src or ")+)+" in src:
+            # Inspect the active pattern, not explanatory comments. An agent
+            # may correctly remove the nested quantifier and quote the old bad
+            # regex in a comment; scanning the whole source marks that valid
+            # patch as a false failure.
+            pattern = next(
+                (
+                    line
+                    for line in (ws / "needle/emailish.py").read_text().splitlines()
+                    if line.strip().startswith("_EMAIL")
+                ),
+                "",
+            ).replace(" ", "")
+            if "+)+" in pattern or ")+)+" in pattern:
                 bad.append("nested quantifier remains")
         elif pid == "c18":
             m = _load(ws, "needle.tags")
@@ -1395,5 +1406,4 @@ def grade(pid: str, ws: Path) -> dict:
         "notes": notes,
         "test_tail": tout[-1500:],
     }
-
 

@@ -1,7 +1,8 @@
 //! `bash`. QwenPaw `execute_shell_command`: fresh subprocess, workspace cwd, formatted output.
 
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -14,6 +15,85 @@ const OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 /// shell 退出后管道的收尾读窗口：孙进程（`sleep 30 & echo hi`）继承了
 /// stdout/stderr 写端，EOF 可能永远不来，超时就放弃。
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Debug)]
+enum ShellKind {
+    Bash,
+    Posix,
+    PowerShell,
+}
+
+#[derive(Clone, Debug)]
+struct ShellSpec {
+    exe: PathBuf,
+    kind: ShellKind,
+}
+
+static SHELL: OnceLock<ShellSpec> = OnceLock::new();
+
+#[cfg(windows)]
+struct WindowsJob(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl WindowsJob {
+    fn attach(pid: u32) -> std::io::Result<Self> {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() || job == INVALID_HANDLE_VALUE {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) == 0
+            {
+                let e = std::io::Error::last_os_error();
+                CloseHandle(job);
+                return Err(e);
+            }
+            let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if process.is_null() || process == INVALID_HANDLE_VALUE {
+                let e = std::io::Error::last_os_error();
+                CloseHandle(job);
+                return Err(e);
+            }
+            let assigned = AssignProcessToJobObject(job, process);
+            CloseHandle(process);
+            if assigned == 0 {
+                let e = std::io::Error::last_os_error();
+                CloseHandle(job);
+                return Err(e);
+            }
+            Ok(Self(job))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe impl Send for WindowsJob {}
 
 pub async fn bash(
     ws: &Workspace,
@@ -40,6 +120,11 @@ pub async fn bash(
             );
         }
     };
+    // A per-call Windows Job gives cancellation/drop the same descendant-tree
+    // semantics as the Unix process group. Failure is non-fatal on restricted
+    // hosts; direct-child cancellation still works.
+    #[cfg(windows)]
+    let _job = child.id().and_then(|pid| WindowsJob::attach(pid).ok());
 
     // 缓冲共享给读取任务：收尾读超时被 abort 时，已读到的部分不丢。
     let out_buf: Arc<Mutex<Vec<u8>>> = Arc::default();
@@ -86,16 +171,28 @@ pub async fn bash(
     }
 }
 
-fn spawn_shell(command: &str, cwd: &std::path::Path) -> std::io::Result<tokio::process::Child> {
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(command);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(command);
-        c
-    };
+fn spawn_shell(command: &str, cwd: &Path) -> std::io::Result<tokio::process::Child> {
+    let shell = SHELL.get_or_init(detect_shell);
+    let mut cmd = Command::new(&shell.exe);
+    match shell.kind {
+        ShellKind::Bash => {
+            // Keep one command dialect on macOS, Linux, and Windows/Git Bash.
+            // Skipping profiles makes every tool call deterministic and cheap.
+            cmd.args(["--noprofile", "--norc", "-c", command]);
+        }
+        ShellKind::Posix => {
+            cmd.args(["-c", command]);
+        }
+        ShellKind::PowerShell => {
+            cmd.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                command,
+            ]);
+        }
+    }
     cmd.current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -112,6 +209,99 @@ fn spawn_shell(command: &str, cwd: &std::path::Path) -> std::io::Result<tokio::p
     cmd.spawn()
 }
 
+fn detect_shell() -> ShellSpec {
+    if let Some(exe) = std::env::var_os("Q38_SHELL").filter(|s| !s.is_empty()) {
+        let exe = PathBuf::from(exe);
+        let name = exe
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        return ShellSpec {
+            exe,
+            kind: if name.contains("powershell") || name.starts_with("pwsh") {
+                ShellKind::PowerShell
+            } else if name.starts_with("bash") {
+                ShellKind::Bash
+            } else {
+                ShellKind::Posix
+            },
+        };
+    }
+
+    #[cfg(windows)]
+    {
+        // Git for Windows is already present on most developer machines and
+        // gives the model the same learned command language as macOS/Linux.
+        let mut candidates = Vec::new();
+        for key in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+            if let Some(base) = std::env::var_os(key) {
+                let base = PathBuf::from(base);
+                candidates.push(base.join("Git/bin/bash.exe"));
+                candidates.push(base.join("Programs/Git/bin/bash.exe"));
+            }
+        }
+        if let Some(path_bash) = find_in_path("bash.exe", true) {
+            candidates.push(path_bash);
+        }
+        if let Some(exe) = candidates.into_iter().find(|p| p.is_file()) {
+            return ShellSpec {
+                exe,
+                kind: ShellKind::Bash,
+            };
+        }
+        for name in ["pwsh.exe", "powershell.exe"] {
+            if let Some(exe) = find_in_path(name, false) {
+                return ShellSpec {
+                    exe,
+                    kind: ShellKind::PowerShell,
+                };
+            }
+        }
+        ShellSpec {
+            exe: PathBuf::from("powershell.exe"),
+            kind: ShellKind::PowerShell,
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        for exe in [PathBuf::from("/bin/bash"), PathBuf::from("/usr/bin/bash")] {
+            if exe.is_file() {
+                return ShellSpec {
+                    exe,
+                    kind: ShellKind::Bash,
+                };
+            }
+        }
+        if let Some(exe) = [PathBuf::from("/bin/sh"), PathBuf::from("/usr/bin/sh")]
+            .into_iter()
+            .find(|p| p.is_file())
+        {
+            ShellSpec {
+                exe,
+                kind: ShellKind::Posix,
+            }
+        } else {
+            ShellSpec {
+                exe: PathBuf::from("bash"),
+                kind: ShellKind::Bash,
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn find_in_path(name: &str, git_only: bool) -> Option<PathBuf> {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .map(|dir| dir.join(name))
+        .find(|p| {
+            p.is_file() && (!git_only || p.to_string_lossy().to_ascii_lowercase().contains("git"))
+        })
+}
+
 /// 取消路径的整组击杀。`setpgid(0,0)` 保证 pgid 就是子 shell 的 pid。
 fn kill_group(child: &tokio::process::Child) {
     #[cfg(unix)]
@@ -120,8 +310,15 @@ fn kill_group(child: &tokio::process::Child) {
             libc::kill(-(pid as i32), libc::SIGKILL);
         }
     }
-    #[cfg(not(unix))]
-    let _ = child;
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 /// 限时收尾读：正常等 EOF，超时（孙进程仍握着写端）就 abort 放弃，
@@ -135,6 +332,10 @@ async fn drain(task: Option<tokio::task::JoinHandle<()>>) {
         .is_err()
     {
         task.abort();
+        // Await cancellation so the pipe handle is actually closed before
+        // returning; otherwise a Windows grandchild can keep the test/process
+        // alive until its own timeout even though the tool call already ended.
+        let _ = task.await;
     }
 }
 

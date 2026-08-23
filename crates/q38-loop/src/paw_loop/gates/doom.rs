@@ -5,11 +5,11 @@ use std::collections::{HashSet, VecDeque};
 use crate::paw_loop::store::SessionMap;
 use crate::paw_loop::{GateCtx, GateDecision, ToolFingerprint};
 
-/// Fact, not lecture: same tool + same args twice in a row. One hop of warning
-/// before the halt stage stops the turn. bash 这类有状态命令（git status、
-/// tail 日志）同参重放结果可变，文案不下绝对断言。
+/// A low-information trajectory observation, not an order. It is intentionally
+/// delayed: polling, flaky processes and changing files can make identical
+/// calls useful for a few rounds.
 pub const REPEAT_NOTE: &str =
-    "[guard] 同一工具、同一参数已连续调用两次，通常不会有新信息。读上一次的输出，换参数/换方法，或直接收尾。";
+    "[trajectory] 同一工具和参数已连续出现三次，信息增量可能已经很低。检查上一结果；需要新证据就换目标或参数，否则按当前证据继续或收尾。";
 
 #[derive(Clone, Debug)]
 pub struct DoomStage {
@@ -61,18 +61,19 @@ impl DoomLoopGate {
         }
     }
 
-    /// Warn once at the 2nd identical call, halt at the 3rd (dsh-style repeat
-    /// reminder ahead of the QwenPaw halt). The warn text is delivered as a
-    /// hidden tool-note fact — the same call twice cannot yield new output —
-    /// giving the model exactly one hop to change course before the harness
-    /// stops the turn.
+    /// Let the model lead. A third identical call gets one factual nudge; only
+    /// six consecutive identical calls count as a genuine no-progress loop.
+    /// Stateful shell calls get one additional round before the hard stop.
     pub fn qwen_default() -> Self {
         Self::new(
             2,
             1.0,
             vec![
-                DoomStage::warn(2, REPEAT_NOTE),
-                DoomStage::halt(3, "Doom loop: repeated the same tool"),
+                DoomStage::warn(3, REPEAT_NOTE),
+                DoomStage::halt(
+                    6,
+                    "Doom loop: six identical tool calls without a course change",
+                ),
             ],
         )
     }
@@ -135,7 +136,7 @@ impl DoomLoopGate {
                 }
 
                 // bash 是有状态命令（git status、tail 日志），同参重放结果
-                // 可变：halt 阈值放宽一步（3→4），warn 仍在 2。
+                // 可变：只把 hard halt 再放宽一步，soft note 阈值不变。
                 let stateful = state.history.back().is_some_and(|fp| fp.name == "bash");
                 let Some(stage) = self.stages.iter().rev().find(|s| {
                     let after = if stateful && s.stop {
@@ -242,41 +243,57 @@ mod tests {
     }
 
     #[test]
-    fn second_repeat_warns_third_halts() {
+    fn third_repeat_warns_sixth_halts() {
         let gate = DoomLoopGate::qwen_default();
         let a = ToolFingerprint::new("read", r#"{"path":"a.rs"}"#);
         assert!(matches!(hop(&gate, 1, &[a.clone()]), GateDecision::Bypass));
-        match hop(&gate, 2, &[a.clone()]) {
+        assert!(matches!(hop(&gate, 2, &[a.clone()]), GateDecision::Bypass));
+        assert_eq!(gate.continuation("s"), "");
+        match hop(&gate, 3, &[a.clone()]) {
             GateDecision::Continue { .. } => {
                 assert_eq!(gate.continuation("s"), REPEAT_NOTE);
             }
-            other => panic!("expected warn at 2nd repeat: {other:?}"),
+            other => panic!("expected warn at 3rd repeat: {other:?}"),
         }
-        match hop(&gate, 3, &[a]) {
+        for iter in 4..=5 {
+            assert!(matches!(
+                hop(&gate, iter, &[a.clone()]),
+                GateDecision::Continue { .. }
+            ));
+            assert_eq!(gate.continuation("s"), "");
+        }
+        match hop(&gate, 6, &[a]) {
             GateDecision::Stop { reason } => assert!(reason.contains("Doom loop"), "{reason}"),
             other => panic!("{other:?}"),
         }
     }
 
     #[test]
-    fn bash_repeat_warns_at_two_halts_at_four() {
-        // 有状态命令放宽：第 2 次警告，第 3 次沉默放行，第 4 次才 halt。
+    fn bash_repeat_warns_at_three_halts_at_seven() {
+        // 有状态命令只多放宽一次 hard-stop：第 3 次提醒，第 7 次才 halt。
         let gate = DoomLoopGate::qwen_default();
         let b = ToolFingerprint::new("bash", r#"{"command":"git status"}"#);
         assert!(matches!(hop(&gate, 1, &[b.clone()]), GateDecision::Bypass));
-        match hop(&gate, 2, &[b.clone()]) {
+        assert!(matches!(hop(&gate, 2, &[b.clone()]), GateDecision::Bypass));
+        assert_eq!(gate.continuation("s"), "");
+        match hop(&gate, 3, &[b.clone()]) {
             GateDecision::Continue { .. } => {
                 assert_eq!(gate.continuation("s"), REPEAT_NOTE);
             }
-            other => panic!("expected warn at 2nd repeat: {other:?}"),
+            other => panic!("expected warn at 3rd repeat: {other:?}"),
         }
-        match hop(&gate, 3, &[b.clone()]) {
-            GateDecision::Continue { .. } => {
-                assert_eq!(gate.continuation("s"), "", "no second note at hits=3");
-            }
-            other => panic!("expected silent continue at 3rd repeat: {other:?}"),
+        for iter in 4..=6 {
+            assert!(matches!(
+                hop(&gate, iter, &[b.clone()]),
+                GateDecision::Continue { .. }
+            ));
+            assert_eq!(
+                gate.continuation("s"),
+                "",
+                "no repeated note at hits={iter}"
+            );
         }
-        match hop(&gate, 4, &[b]) {
+        match hop(&gate, 7, &[b]) {
             GateDecision::Stop { reason } => assert!(reason.contains("Doom loop"), "{reason}"),
             other => panic!("{other:?}"),
         }
@@ -288,7 +305,7 @@ mod tests {
         let a = ToolFingerprint::new("read", r#"{"path":"a.rs"}"#);
         let b = ToolFingerprint::new("edit", r#"{"path":"a.rs","old_string":"x"}"#);
         assert!(matches!(hop(&gate, 1, &[a.clone()]), GateDecision::Bypass));
-        assert!(matches!(hop(&gate, 2, &[a]), GateDecision::Continue { .. }));
+        assert!(matches!(hop(&gate, 2, &[a]), GateDecision::Bypass));
         assert!(matches!(hop(&gate, 3, &[b]), GateDecision::Bypass));
     }
 
@@ -327,17 +344,24 @@ mod tests {
         let gate = DoomLoopGate::qwen_default();
         let a = ToolFingerprint::new("read", r#"{"path":"a.rs"}"#);
         assert!(matches!(hop(&gate, 1, &[a.clone()]), GateDecision::Bypass));
-        assert!(matches!(
-            hop(&gate, 2, &[a.clone()]),
-            GateDecision::Continue { .. }
-        ));
+        assert!(matches!(hop(&gate, 2, &[a.clone()]), GateDecision::Bypass));
         gate.reset_turn("s");
         assert!(matches!(hop(&gate, 3, &[a.clone()]), GateDecision::Bypass));
+        assert!(matches!(hop(&gate, 4, &[a.clone()]), GateDecision::Bypass));
         assert!(matches!(
-            hop(&gate, 4, &[a.clone()]),
+            hop(&gate, 5, &[a.clone()]),
             GateDecision::Continue { .. }
         ));
-        match hop(&gate, 5, &[a]) {
+        assert_eq!(gate.continuation("s"), REPEAT_NOTE);
+        assert!(matches!(
+            hop(&gate, 6, &[a.clone()]),
+            GateDecision::Continue { .. }
+        ));
+        assert!(matches!(
+            hop(&gate, 7, &[a.clone()]),
+            GateDecision::Continue { .. }
+        ));
+        match hop(&gate, 8, &[a]) {
             GateDecision::Stop { reason } => assert!(reason.contains("Doom loop"), "{reason}"),
             other => panic!("{other:?}"),
         }

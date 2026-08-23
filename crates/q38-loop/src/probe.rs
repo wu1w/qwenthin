@@ -622,13 +622,11 @@ async fn probe_one_cross_turn(
         (true, CrossTurnClass::Partial) => yellow.push(format!(
             "thinking-off cross-turn partial hit {pct_s} (cached={cached} hist={hist_n} stripped={stripped_n})"
         )),
-        (false, CrossTurnClass::Stripped) => notes.push(
-            "thinking-on cross-turn first hop at pre-assistant prefix is expected with preserve=false"
-                .into(),
+        (false, CrossTurnClass::Stripped) => yellow.push(
+            "thinking-on cross-turn lost historical think despite preserve_thinking=true".into(),
         ),
         (false, CrossTurnClass::Warm) => notes.push(
-            "thinking-on cross-turn stayed warm (server likely kept historical think)"
-                .into(),
+            "thinking-on cross-turn stayed warm with preserved historical think".into(),
         ),
         (false, CrossTurnClass::Cold) => notes.push(
             "thinking-on cross-turn cache miss (same engine as thinking-off, or slot replaced between turns)"

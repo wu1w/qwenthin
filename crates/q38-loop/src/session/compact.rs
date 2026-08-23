@@ -6,9 +6,8 @@
 //! tries PreviousTurns compact when prefix is over soft **or** above 120k, so a
 //! finished 160k audit is not replayed cold on the follow-up.
 //!
-//! The live box (`llama-server --no-reasoning-preserve`) already
-//! drops historical think before `last_query_index`; compact only rewrites the
-//! *shape* of the live prefix (one cache miss, `cache_invalidated=compact`).
+//! Compaction rewrites the *shape* of the live prefix (one cache miss,
+//! `cache_invalidated=compact`) while normal turns preserve historical think.
 //! Appending `recall` after that miss is `cache_invalidated=tools` on the same hop.
 //!
 //! Official Qwen3.8 Jinja (and the Unsloth copy on the reference box):

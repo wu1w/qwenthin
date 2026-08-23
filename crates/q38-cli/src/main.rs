@@ -127,6 +127,9 @@ enum Command {
     Web {
         #[arg(long, default_value = "127.0.0.1:3848")]
         bind: String,
+        /// Explicitly allow a non-loopback bind (trusted local network only).
+        #[arg(long)]
+        allow_lan: bool,
         /// Do not open a browser.
         #[arg(long)]
         no_open: bool,
@@ -214,11 +217,16 @@ async fn real_main() -> Result<ExitCode> {
             skip_dsh,
             dry_run,
         }),
-        Some(Command::Web { bind, no_open }) => {
+        Some(Command::Web {
+            bind,
+            allow_lan,
+            no_open,
+        }) => {
             // Empty = q38-web uses [console] workspace from config.toml, else cwd.
             let workspace = cli.workspace.clone().unwrap_or_default();
             q38_web::run(q38_web::WebOpts {
                 bind,
+                allow_lan,
                 workspace,
                 session_id: cli.session.clone().unwrap_or_default(),
                 open_browser: !no_open,
@@ -633,8 +641,13 @@ mod clap_tests {
         let cli = Cli::try_parse_from(["q38", "web", "--no-open", "--bind", "127.0.0.1:0"])
             .expect("parse");
         match cli.command {
-            Some(Command::Web { bind, no_open }) => {
+            Some(Command::Web {
+                bind,
+                allow_lan,
+                no_open,
+            }) => {
                 assert!(no_open);
+                assert!(!allow_lan);
                 assert_eq!(bind, "127.0.0.1:0");
             }
             other => panic!("expected Web, got {other:?}"),

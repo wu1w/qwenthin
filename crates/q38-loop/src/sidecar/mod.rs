@@ -413,7 +413,7 @@ mod tests {
         assert_eq!(snap.policy.effort, Some(Effort::Xhigh));
         assert_eq!(snap.policy.max_think_tokens, 4096);
         assert_eq!(snap.policy.max_tokens, 16384);
-        assert!(!snap.policy.preserve);
+        assert!(snap.policy.preserve);
         assert!(snap.effort_locked);
     }
 

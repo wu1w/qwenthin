@@ -77,18 +77,63 @@ def write(path, content):
     return f"Wrote {len(content)} bytes to {path}."
 
 
+def _normalize_newlines_with_boundaries(text):
+    out = []
+    boundaries = [0]
+    i = 0
+    while i < len(text):
+        if text[i] == "\r":
+            out.append("\n")
+            i += 2 if i + 1 < len(text) and text[i + 1] == "\n" else 1
+        else:
+            out.append(text[i])
+            i += 1
+        boundaries.append(i)
+    return "".join(out), boundaries
+
+
+def _newline_style(text):
+    crlf = text.count("\r\n")
+    lf = text.count("\n") - crlf
+    cr = text.count("\r") - crlf
+    count, style = max((crlf, "\r\n"), (lf, "\n"), (cr, "\r"))
+    return style if count else None
+
+
 def edit(path, old, new):
     p = _resolve(path)
-    text = p.read_text()
-    n = text.count(old)
+    with p.open("r", encoding="utf-8", newline="") as handle:
+        text = handle.read()
+    normalized = "\r" in old or "\n" in old
+    if normalized:
+        normalized_text, boundaries = _normalize_newlines_with_boundaries(text)
+        normalized_old, _ = _normalize_newlines_with_boundaries(old)
+        n = normalized_text.count(normalized_old)
+    else:
+        n = text.count(old)
     if n == 0:
         raise ValueError(f"Error: The text to replace was not found in {path}.")
     if n > 1:
         raise ValueError(
             f"Error: `old_string` matched {n} times in {path}; provide a longer, more unique `old_string` so the edit targets exactly one location."
         )
-    p.write_text(text.replace(old, new, 1))
-    return f"Successfully replaced text in {path}."
+    if normalized:
+        start = normalized_text.index(normalized_old)
+        end = start + len(normalized_old)
+        original_start, original_end = boundaries[start], boundaries[end]
+        fragment = text[original_start:original_end]
+        style = _newline_style(fragment) or _newline_style(text) or "\n"
+        normalized_new, _ = _normalize_newlines_with_boundaries(new)
+        replacement = normalized_new.replace("\n", style)
+        updated = text[:original_start] + replacement + text[original_end:]
+        preserved = fragment != old or replacement != new
+    else:
+        updated = text.replace(old, new, 1)
+        preserved = False
+    with p.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(updated)
+    suffix = " (preserved file line endings)" if preserved else ""
+    return f"Successfully replaced text in {path}{suffix}."
 
 
 def bash(command):

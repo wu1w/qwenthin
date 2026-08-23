@@ -462,7 +462,13 @@ pub fn is_http_url(path: &str) -> bool {
 }
 
 pub fn path_ext(path: &str) -> String {
-    let cut = path.split('?').next().unwrap_or(path);
+    // Only URLs have query strings here. Windows canonical paths start with
+    // `\\?\`; splitting every path at `?` erased their extension.
+    let cut = if path.starts_with("http://") || path.starts_with("https://") {
+        path.split('?').next().unwrap_or(path)
+    } else {
+        path
+    };
     std::path::Path::new(cut)
         .extension()
         .and_then(|e| e.to_str())

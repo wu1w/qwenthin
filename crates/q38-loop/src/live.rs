@@ -848,7 +848,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "live llama.cpp reference box"]
-    async fn live_watchdog_oneshot_on_long_think() {
+    async fn live_watchdog_soft_nudge_on_long_think() {
         let cfg = live_cfg();
         let dir =
             std::env::temp_dir().join(format!("q38-live-wd-{}", uuid::Uuid::new_v4().simple()));
@@ -887,7 +887,7 @@ mod tests {
         // 800-char think on a single step means the box returned JSON, not SSE.
         assert!(
             max_think < 800 || out.steps >= 2 || out.stop_reason.as_deref() == Some("budget:think"),
-            "think ran past the cap without oneshot: think_chars={max_think} text={} reason={:?}",
+            "think ran past the cap without a bounded retry: think_chars={max_think} text={} reason={:?}",
             out.text,
             out.stop_reason
         );
@@ -895,7 +895,7 @@ mod tests {
             out.text.to_lowercase().contains("done")
                 || out.stop_reason.as_deref() == Some("budget:think")
                 || out.steps >= 2,
-            "watchdog path produced neither oneshot nor budget:think: text={} reason={:?}",
+            "watchdog path produced neither a model retry nor budget:think: text={} reason={:?}",
             out.text,
             out.stop_reason
         );
@@ -945,7 +945,7 @@ mod tests {
             .unwrap_or("")
             .to_ascii_lowercase()
             .contains("doom");
-        if reads >= 3 {
+        if reads >= 6 {
             assert!(
                 halted,
                 "repeated the same read {reads} times without doom halt: hidden={hidden:?} reason={:?} text={}",

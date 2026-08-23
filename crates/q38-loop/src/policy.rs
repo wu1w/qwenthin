@@ -22,7 +22,9 @@ impl Effort {
     pub fn from_config(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "low" => Some(Self::Low),
-            "medium" => Some(Self::Medium),
+            // Official Qwen3.8 `medium` adds no steering sentence, so `auto`
+            // is an honest user-facing alias: the model chooses the depth.
+            "auto" | "medium" => Some(Self::Medium),
             "xhigh" | "high" => Some(Self::Xhigh),
             _ => None,
         }
@@ -78,7 +80,7 @@ impl ThinkPolicy {
             enabled: true,
             effort: Some(Effort::Low),
             max_think_tokens: 512,
-            preserve: false,
+            preserve: true,
             max_tokens: 2048,
         }
     }
@@ -126,12 +128,12 @@ impl ThinkPolicy {
             enabled: true,
             effort: Some(Effort::Medium),
             max_think_tokens,
-            preserve: false,
+            preserve: true,
             max_tokens: b.max_tokens,
         }
     }
 
-    /// `/think LEVEL` and `--think LEVEL`. preserve=false.
+    /// `/think LEVEL` and `--think LEVEL`. Historical thinking is preserved.
     /// xhigh uses `think_mode_max_tokens` so generation is not clipped at 8k.
     pub fn effort_with(b: &ThinkBudget, effort: Effort) -> Self {
         let (max_think_tokens, max_tokens) = match effort {
@@ -143,7 +145,7 @@ impl ThinkPolicy {
             enabled: true,
             effort: Some(effort),
             max_think_tokens,
-            preserve: false,
+            preserve: true,
             max_tokens,
         }
     }
@@ -480,7 +482,7 @@ mod tests {
         assert_eq!(c.policy().effort, Some(Effort::Medium));
         assert_eq!(c.policy().max_think_tokens, 2048);
         assert!(c.policy().enabled);
-        assert!(!c.policy().preserve);
+        assert!(c.policy().preserve);
         assert_eq!(c.policy().max_tokens, 4096);
         assert_ne!(c.policy().effort, Some(Effort::Xhigh));
         assert!(c.auto_upgraded());
@@ -494,7 +496,7 @@ mod tests {
         c.note_parse_fail();
         c.note_parse_fail();
         assert_eq!(c.policy().max_tokens, 8192);
-        assert!(!c.policy().preserve);
+        assert!(c.policy().preserve);
     }
 
     #[test]
@@ -569,7 +571,7 @@ mod tests {
         assert_eq!(xhigh, ThinkPolicy::effort_with(&b, Effort::Xhigh));
         assert_eq!(xhigh.max_think_tokens, 4096);
         assert_eq!(xhigh.max_tokens, 16384);
-        assert!(!xhigh.preserve);
+        assert!(xhigh.preserve);
 
         let fast = ThinkPolicy::from_cli(&b, true, Some("xhigh"), Some("think"));
         assert!(!fast.enabled);
@@ -595,7 +597,7 @@ mod tests {
         assert_eq!(clamped.effort, Some(Effort::Medium));
         assert_eq!(clamped.max_think_tokens, 4096);
         assert_eq!(clamped.max_tokens, 8192);
-        assert!(!clamped.preserve);
+        assert!(clamped.preserve);
     }
 
     #[test]
@@ -606,6 +608,7 @@ mod tests {
         assert_eq!(p.effort, Some(Effort::Medium));
         assert_eq!(p.max_think_tokens, 4096);
         assert_eq!(p.max_tokens, 8192);
+        assert!(p.preserve);
     }
 
     #[test]
@@ -617,7 +620,7 @@ mod tests {
         assert_eq!(p.effort, Some(Effort::Medium));
         assert_ne!(p.effort, Some(Effort::Low));
         assert_eq!(p.max_think_tokens, b.max_think_low);
-        assert!(!p.preserve);
+        assert!(p.preserve);
     }
 
     #[test]

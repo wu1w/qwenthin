@@ -2,8 +2,8 @@
 //!
 //! llama.cpp prompt cache, vLLM automatic prefix caching, and SGLang radix
 //! all match **token ids** of the rendered prompt. A new user turn with
-//! `preserve_thinking=false` drops historical `<think>` blocks, so the
-//! longest reusable prefix ends at the first historical assistant.
+//! Endpoints may drop historical `<think>` blocks when preservation is
+//! disabled; q38 keeps it enabled by default so completed turns remain warm.
 //!
 //! Cached counts are block-aligned on vLLM (16/32). Comparisons use slack
 //! instead of a hard-coded token length.

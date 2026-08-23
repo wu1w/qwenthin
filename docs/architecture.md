@@ -63,6 +63,10 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 
 `code` 模式是另一组：`run_code`、`read`、`bash`。
 
+`search` 使用函数级 SQLite FTS 索引，只把命中的有限代码片段交给模型。Git 工作区的索引缓存在 `~/.q38-agent/code-index/`，再次打开时按文件大小和纳秒 mtime 增量刷新；项目目录里不生成索引文件。工具写文件后会即时刷新对应条目。
+
+`bash` 对模型保持一个名字和一种常用语法：macOS/Linux 走无 profile Bash，Windows 优先自动发现 Git Bash，没有时才退到无 profile PowerShell。可用 `Q38_SHELL` 显式覆盖，但正常安装无需给模型增加操作系统判断提示。
+
 模型若发 Qwen 风格的 XML `<tool_call>`，和 OpenAI `tool_calls` 走同一套解析合并。
 
 工作区路径用 `Workspace` 做相对解析。控制台换根目录等于换这个 `Workspace`，并 `refresh_surface` 重载该目录下的技能 / MCP overlay。
@@ -75,7 +79,9 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 4. 工具调用按审批模式停或放行；结果写回 messages，直到模型停或打到 `max_steps`。
 5. 事件追加到会话 JSONL；`stop` 结束本轮。控制台会重放本轮前半段，避免 WS 丢包后画面残缺。
 
-思考策略：q35模型全家，尤其是qwen3.8都有雷霆大思考的问题，有时还会把自己思考死了。所以`/think`、`--think`、`/fast` 改 `ThinkPolicy`。`low_precision` 。这一块只收紧本机围栏，模型看不见。同时也做了策略，agent的高强度任务会自适应开启高档位的thinking。
+q35 架构模型，尤其是 Qwen3.8，偶尔会出现“雷霆大思考”甚至把思考预算耗尽。默认 `auto` 映射到官方中性的 `medium`，模板不注入深浅指令，由模型按任务自行分配思考强度；最大思考 token 只作失控上限。历史思考默认保留。`/think`、`--think`、`/fast` 仍可人工覆盖。thinking 采样固定对齐官方 `temperature=1.0, top_p=0.95, top_k=20`；`low_precision` 只收紧本机围栏，模型看不见。
+
+轨迹控制遵循“模型主导、harness 软干预”：测试转红、修改测试期望和编辑摇摆只作为隐藏事实反馈，不替模型决定停止或回退；同参工具连续 3 次才提醒，连续 6 次完全不换路才停止（有状态 shell 为 7 次）。思考触及上限时保留模型选择的思考模式，追加一次简短收敛提示并给更宽的一次重试；只有再次触顶、时间、步数或上下文硬上限才终止。重复答案伴随暂存/清理动作时先延后该批工具，把选择权交还模型，避免在提醒送达前执行低信息量写入或删除。
 
 上下文窗口默认 **262144**。超过 `working_window * compact_ratio` 才 compact；建议用的话还是尽量128K以上，低了体验不太好。
 
@@ -99,7 +105,7 @@ Web 启动时：若 CLI 没传 `--workspace`，用配置里的路径；路径不
 - `GET/POST /api/workspace` 切换根目录；`POST /api/workspace/pick` 系统选文件夹；`GET /api/workspace/ls` 列子目录
 - skills / mcp / channels / jobs / heartbeat / permit / usage
 
-绑定默认 `127.0.0.1`。本机控制台优先好用，不做远程多租户安全模型。换工作区可以指向本机任意文件夹。
+绑定默认 `127.0.0.1`，跨域响应只放行 loopback 开发页，WebSocket 校验同源。本机控制台优先好用，不做远程多租户安全模型。非 loopback 绑定必须显式传 `--allow-lan`，含义是“我信任这个局域网”；换工作区仍可指向本机任意文件夹。
 
 ## 前端
 
@@ -120,4 +126,3 @@ Web 启动时：若 CLI 没传 `--workspace`，用配置里的路径；路径不
 - 我平时习惯用Hermes接本地模型，这次qwen3.8 27B的体验很不好， 超长 system + 全量 tool 动物园扣在 27B 上，加上模型爱思考，难用的一匹。
 - dsh和pi agent的思路我很喜欢，但pi太简陋了，dsh折腾，原版agent给DS优化的。
 - 阿里的几个agent难用，尤其是qoder，是史。我还试了qwenpaw接qwen3.8 27B，超过80轮工具的大会话harness会挂掉，再起不能，明显没对他家自己的本地模型做过优化适配。
-

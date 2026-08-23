@@ -481,7 +481,7 @@ mod tests {
         }
         let report = json!({
             "model": cfg.server.model,
-            "note": "AGENT.md frozen in system; compact keeps system; MEMORY.md not auto-injected; preserve_thinking=false",
+            "note": "AGENT.md frozen in system; compact keeps system; MEMORY.md not auto-injected; preserve_thinking=true",
             "sessions": sessions,
         });
         std::fs::write(REPORT, serde_json::to_string_pretty(&report).unwrap()).unwrap();

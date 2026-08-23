@@ -2,6 +2,8 @@
 **/*.rs.bk
 .DS_Store
 *.swp
+**/__pycache__/
+*.py[cod]
 .env
 .env.*
 # Local QwenPaw clone used as the wash baseline (pin in third_party/qwenpaw.pin)

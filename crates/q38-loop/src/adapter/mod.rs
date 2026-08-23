@@ -219,10 +219,11 @@ mod tests {
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(true));
         assert_eq!(
             body["chat_template_kwargs"]["preserve_thinking"],
-            json!(false)
+            json!(true)
         );
         assert!(body.get("extra_body").is_none());
         assert_eq!(body["temperature"], json!(1.0));
+        assert_eq!(body["top_p"], json!(0.95));
         assert_eq!(body["top_k"], json!(20));
         assert_eq!(body["repetition_penalty"], json!(1.0));
     }
@@ -257,6 +258,7 @@ mod tests {
         );
         assert!(find_key(&body, "reasoning_effort").is_none(), "{body}");
         assert_eq!(body["temperature"], json!(0.7));
+        assert_eq!(body["top_p"], json!(0.8));
         assert_eq!(body["presence_penalty"], json!(1.5));
     }
 

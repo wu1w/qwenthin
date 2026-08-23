@@ -266,7 +266,11 @@ end try"#,
             .output()
     } else {
         let zenity = Command::new("zenity")
-            .args(["--file-selection", "--directory", "--title=选择工作区文件夹"])
+            .args([
+                "--file-selection",
+                "--directory",
+                "--title=选择工作区文件夹",
+            ])
             .output();
         match zenity {
             Ok(o) if o.status.success() || o.status.code() == Some(1) => Ok(o),

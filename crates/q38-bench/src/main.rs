@@ -1,7 +1,7 @@
 //! Three-task quality gate for q-harness.
 //!
 //! Default: validate fixtures and print the checklist (no model).
-//! `--live`: run each task with thinking off (`q38 --print --fast`, or the
+//! `--live`: run each task with q38's default adaptive thinking policy (or the
 //! q38-loop Agent if the `q38` binary is missing).
 //!
 //! Wall-clock calibration (design Targets; numbers from probe.json when present):
@@ -50,7 +50,7 @@ Native coding window is 262144. Do not compact. Do not lock UD-Q8; read quant_la
     after_help = AFTER_HELP
 )]
 struct Cli {
-    /// Run tasks against the configured endpoint (`q38 --print --fast`).
+    /// Run tasks against the configured endpoint with adaptive thinking.
     #[arg(long)]
     live: bool,
 
@@ -159,7 +159,7 @@ fn print_offline(lines: &[String], probe: Option<&ProbeReport>) {
     println!("  - report family / profile / quant_label from probe.json (not locked to UD-Q8)");
     println!("  - three tasks: file diff / content (03 optionally cargo test on --live)");
     println!("  - fat Hermes contrast is --fat-prefix (same endpoint, same 262k window)");
-    println!("  - default harness depth is low; this bench live uses --fast (thinking off)");
+    println!("  - live uses default adaptive thinking and official Qwen3.8 sampling");
     println!();
     print_calibration(probe);
 }
@@ -348,7 +348,6 @@ async fn run_via_q38(
     let mut cmd = tokio::process::Command::new(bin);
     cmd.kill_on_drop(true)
         .arg("--print")
-        .arg("--fast")
         .arg("--new")
         .arg("--no-agents-md")
         .arg("--workspace")
@@ -458,8 +457,7 @@ async fn run_via_agent(
     workspace: &Path,
     fat_agents_md: bool,
 ) -> Result<TaskResult> {
-    let mut policy = ThinkPolicy::off();
-    policy.max_tokens = cfg.policy.max_tokens;
+    let policy = ThinkPolicy::native_with(&cfg.policy.think_budget());
     let completer = HttpCompleter::connect(cfg, policy.clone())
         .await
         .context("connect")?;
@@ -473,7 +471,7 @@ async fn run_via_agent(
     opts.working_window = CODING_CTX_TOKENS;
     opts.generation_reserve = policy.max_tokens.saturating_add(policy.max_think_tokens);
     opts.max_steps = cfg.policy.max_steps.min(24);
-    opts.effort_locked = true; // `--fast`: do not auto-raise effort
+    opts.effort_locked = false;
     opts.session_id = format!("bench-{}-{}", task.name, unix_stamp());
 
     let t0 = Instant::now();

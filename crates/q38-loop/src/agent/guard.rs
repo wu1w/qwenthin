@@ -10,24 +10,20 @@
 
 use crate::paw_loop::{fs_tool_path, hash_args};
 
-/// Injected at most once per session.
-pub const TEST_EXPECTATION_NOTE: &str = "[guard] 你在修改测试的期望值。测试即规格：\
-若用户描述的 bug 与现有测试/文档一致，这可能是设计行为——先向用户指出矛盾并等确认，\
-不要静默改期望。用户明确要求改测试时忽略本条。";
+/// Injected at most once per session. This is evidence for the model, not a
+/// harness verdict: tests can be either executable specifications or stale.
+pub const TEST_EXPECTATION_NOTE: &str = "[trajectory] 检测到已有测试期望被修改。\
+现有测试可能是规格，也可能需要随需求更新；核对用户要求、文档和实现证据后，\
+自行决定继续修改、换路，或说明冲突。";
 
 /// Injected on a detected revert pair, at most twice per session.
-pub const THRASH_NOTE: &str = "[guard] 你撤销了自己刚才的修改（同一位置改了又改回）。\
-停下：先用一句话说明选定的方案和理由，再按它执行，不要继续来回改。";
+pub const THRASH_NOTE: &str = "[trajectory] 同一位置刚被改回，轨迹可能正在摇摆。\
+先归纳已有证据和当前方向；证据不足就换一个观察点，足够则继续或收尾。";
 
 /// Injected at most once per session. Notices a test runner (model-invoked or
 /// `--print` oracle) going red after a production-only edit.
-pub const TEST_RED_NOTE: &str = "[guard] 代码改了、测试红了、测试文件没动。\
-这通常是指令和规格打架——先向用户指出矛盾并等确认，不要继续改代码或改期望把测试改绿。";
-
-/// `--print` / cron stop reason. 27B will narrate the note then keep editing.
-pub const STOP_TEST_EXPECTATION: &str = "guard:test-expectation";
-/// `--print` / cron stop reason after prod edit + red tests.
-pub const STOP_TEST_RED: &str = "guard:test-red";
+pub const TEST_RED_NOTE: &str = "[trajectory] 生产代码修改后测试由绿转红，且测试文件未改。\
+这是新的反证；核对实现、规格和失败信息，自行决定继续修复、回退，或向用户说明冲突。";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuardNote {
@@ -50,15 +46,6 @@ impl GuardNote {
             Self::TestExpectation => "test-expectation",
             Self::Thrash => "edit-thrash",
             Self::TestRed => "test-red",
-        }
-    }
-
-    /// Unattended channels halt the loop; TUI keeps the hidden note only.
-    pub fn unattended_stop(self) -> Option<&'static str> {
-        match self {
-            Self::TestExpectation => Some(STOP_TEST_EXPECTATION),
-            Self::TestRed => Some(STOP_TEST_RED),
-            Self::Thrash => None,
         }
     }
 }
@@ -104,12 +91,6 @@ impl EditGuard {
     /// `tests_seen_this_turn`: the post-edit run is what S7 judges.
     pub fn set_baseline(&mut self, red: bool) {
         self.baseline_red = Some(red);
-    }
-
-    /// A red suite only proves a regression when it was green before the edits.
-    /// Without a baseline there is no proof, so an unattended halt is not earned.
-    pub fn red_is_proven_regression(&self) -> bool {
-        self.baseline_red == Some(false)
     }
 
     /// `--print` should run tests itself: production changed, tests file not
@@ -585,11 +566,10 @@ mod tests {
         assert!(g
             .observe_tool_output("bash", "Ran 1 test in 0.001s\n\nFAILED (failures=1)")
             .is_none());
-        assert!(!g.red_is_proven_regression());
     }
 
     #[test]
-    fn green_baseline_makes_red_a_proven_regression() {
+    fn green_baseline_makes_red_a_new_trajectory_fact() {
         let mut g = EditGuard::new();
         g.set_baseline(false);
         obs(&mut g, "edit", edit("src/a.py", "x = 1", "x = 2"));
@@ -597,7 +577,6 @@ mod tests {
             g.observe_tool_output("bash", "Ran 1 test in 0.001s\n\nFAILED (failures=1)"),
             Some(GuardNote::TestRed)
         );
-        assert!(g.red_is_proven_regression());
     }
 
     #[test]

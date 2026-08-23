@@ -1,4 +1,8 @@
-"""Domain pads: unique-looking documents used to inflate prefix tokens."""
+"""Legacy synthetic text helper kept for explicit tokenizer calibration only.
+
+Long-horizon agent evaluations use the concise domain notes directly; they no
+longer manufacture compactions with repeated filler.
+"""
 from __future__ import annotations
 
 from random import Random
@@ -24,7 +28,7 @@ DOMAINS = [
     "农业",
 ]
 
-_SEEDS = {
+DOMAIN_NOTES = {
     "史学": "贞观十三年冬，李靖自碛口还。史官记其粮道：每屯粟十二斛，马料八石，斥候三人轮值。",
     "烹饪": "水温到 82°C 再投茶。蛋白打发至中性发泡，糖分三次加入，否则油脂会压泡。",
     "音乐": "此处从属七和弦解决到主和弦时，内声部避免平行五度；低音可走 4-5 而不是 4-3。",
@@ -48,7 +52,7 @@ _SEEDS = {
 
 def pad(domain: str, nchars: int, seed: int) -> str:
     rng = Random(seed)
-    base = _SEEDS.get(domain, _SEEDS["史学"])
+    base = DOMAIN_NOTES.get(domain, DOMAIN_NOTES["史学"])
     chunks = [f"【{domain}材料 {seed}】"]
     n = 0
     k = 0

@@ -19,7 +19,7 @@ use q38_loop::slash::UsageRecap;
 use q38_loop::tools_schema::{agent_tools, mcp_tool, skill_tool, view_tool, web_tool};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::cron::{
@@ -62,7 +62,12 @@ pub fn router(state: AppState, dist: PathBuf) -> Router {
         .layer(DefaultBodyLimit::max(12 * 1024 * 1024));
 
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        // The console is same-origin in production. Cross-origin access is
+        // only needed by a localhost dev server; arbitrary websites do not
+        // receive readable API responses.
+        .allow_origin(AllowOrigin::predicate(|origin, _| {
+            is_loopback_origin(origin)
+        }))
         .allow_methods(Any)
         .allow_headers(Any);
 
@@ -152,8 +157,60 @@ async fn model_ping(State(st): State<AppState>) -> Json<Value> {
     }
 }
 
-async fn ws_upgrade(ws: WebSocketUpgrade, State(st): State<AppState>) -> impl IntoResponse {
+async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    State(st): State<AppState>,
+) -> Response {
+    if !trusted_ws_origin(&headers) {
+        return (StatusCode::FORBIDDEN, "untrusted websocket origin").into_response();
+    }
     ws.on_upgrade(move |socket| client_ws(socket, st))
+        .into_response()
+}
+
+fn is_loopback_origin(origin: &axum::http::HeaderValue) -> bool {
+    let Ok(raw) = origin.to_str() else {
+        return false;
+    };
+    let Some(authority) = raw
+        .strip_prefix("http://")
+        .or_else(|| raw.strip_prefix("https://"))
+        .and_then(|s| s.split('/').next())
+    else {
+        return false;
+    };
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority)
+        .to_ascii_lowercase();
+    host == "localhost"
+        || host.starts_with("localhost:")
+        || host == "127.0.0.1"
+        || host.starts_with("127.0.0.1:")
+        || host == "[::1]"
+        || host.starts_with("[::1]:")
+}
+
+fn trusted_ws_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        // Native clients and local diagnostics do not send Origin.
+        return true;
+    };
+    if is_loopback_origin(origin) {
+        return true;
+    }
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let Ok(raw) = origin.to_str() else {
+        return false;
+    };
+    raw.strip_prefix("http://")
+        .or_else(|| raw.strip_prefix("https://"))
+        .and_then(|s| s.split('/').next())
+        .is_some_and(|authority| authority.eq_ignore_ascii_case(host))
 }
 
 async fn client_ws(mut socket: WebSocket, st: AppState) {
@@ -294,8 +351,8 @@ async fn files_get(
 async fn tree_get(State(st): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
     let g = st.inner.lock().await;
     let root = g.session.workspace();
-    let rows = list_tree(root, 2000)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rows =
+        list_tree(root, 2000).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({
         "ok": true,
         "root": root.display().to_string(),
@@ -372,9 +429,7 @@ async fn workspace_post(
     Ok(Json(apply_workspace(&mut g, path)?))
 }
 
-async fn workspace_pick(
-    State(st): State<AppState>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+async fn workspace_pick(State(st): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
     {
         let g = st.inner.lock().await;
         if g.session.turn_in_flight() || g.live.is_some() {
@@ -776,9 +831,7 @@ struct McpTestBody {
 
 /// 拉起命令跑一次 initialize + tools/list(超时 10s),不落盘不进注册表。
 /// 复用 q38-loop 的 MCP 客户端(run_mcp),spawn 环境与真实运行一致。
-async fn mcp_test(
-    Json(body): Json<McpTestBody>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn mcp_test(Json(body): Json<McpTestBody>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if body.command.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1040,11 +1093,11 @@ fn web_provider(cfg: &Config, workspace: &std::path::Path) -> &'static str {
     }
     let home = Config::home_dir().ok();
     let reg = McpRegistry::load(home.as_deref(), workspace, &cfg.mcp);
-    if reg
-        .servers
-        .iter()
-        .any(|s| s.env.get("TAVILY_API_KEY").is_some_and(|k| !k.trim().is_empty()))
-    {
+    if reg.servers.iter().any(|s| {
+        s.env
+            .get("TAVILY_API_KEY")
+            .is_some_and(|k| !k.trim().is_empty())
+    }) {
         return "tavily";
     }
     "builtin"
@@ -1158,6 +1211,21 @@ async fn heartbeat_post(
 mod tests {
     use super::*;
 
+    #[test]
+    fn browser_origins_are_local_or_same_host() {
+        let local = axum::http::HeaderValue::from_static("http://127.0.0.1:5173");
+        let remote = axum::http::HeaderValue::from_static("https://evil.example");
+        assert!(is_loopback_origin(&local));
+        assert!(!is_loopback_origin(&remote));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, "http://192.168.5.10:3848".parse().unwrap());
+        headers.insert(header::HOST, "192.168.5.10:3848".parse().unwrap());
+        assert!(trusted_ws_origin(&headers));
+        headers.insert(header::ORIGIN, remote);
+        assert!(!trusted_ws_origin(&headers));
+    }
+
     const ECHO_MCP_PY: &str = r#"
 import json, sys, os
 
@@ -1205,9 +1273,13 @@ while True:
         std::fs::create_dir_all(&dir).unwrap();
         let py = dir.join("echo_mcp.py");
         std::fs::write(&py, ECHO_MCP_PY).unwrap();
+        let mut args = Vec::new();
+        #[cfg(windows)]
+        args.push("-3".to_string());
+        args.push(py.to_string_lossy().into_owned());
         let body = McpTestBody {
-            command: "python3".into(),
-            args: vec![py.to_string_lossy().into_owned()],
+            command: if cfg!(windows) { "py" } else { "python3" }.into(),
+            args,
             env: [("TOOL_NAME".to_string(), "search".to_string())].into(),
         };
         let out = mcp_test(Json(body)).await.unwrap().0;

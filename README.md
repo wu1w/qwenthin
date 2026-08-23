@@ -29,6 +29,8 @@ q38 web
 
 `q38 web --bind 127.0.0.1:3848 --no-open` 只起服务、不弹浏览器。
 
+macOS、Linux 和 Windows 使用同一套模型工具契约。Windows 会优先使用 Git Bash，找不到时退到 PowerShell；一般不需要在系统提示里教模型判断平台。确实要在可信局域网访问控制台时，显式使用 `q38 web --bind 0.0.0.0:3848 --allow-lan`。
+
 ## 控制台怎么用
 
 侧栏三组：
@@ -88,9 +90,14 @@ q38 --sidecar                   # stdio JSON-RPC（给可选 dsh 插件用）
 
 - `[server]` 端点、key、模型、引擎 profile、家族
 - `[context] working_window` 默认 262144，不要压成 16k
+- `[policy] default_effort = "auto"` 由模型自行决定思考深度，历史思考默认保留
 - `[console] workspace` 控制台上次选的文件夹
 - `[web]` 搜索工具（无 key 也能用；有 Tavily key 自动升级）
 - `[mcp]` / 技能目录 overlay
+
+## 最近一次实测
+
+- [2026-08-23：同一 Qwen3.8-27B 下 qwenthin、OpenCode、Claude Code 横向比较](docs/benchmark-2026-08-23.md)
 
 工作区还可以放 `AGENT.md`（人设）、`.q38/skills`、`.q38/mcp.toml`。
 

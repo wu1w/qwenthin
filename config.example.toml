@@ -28,7 +28,7 @@ narrate = true                 # TUI/web: one-line 中文 progress narration per
 
 [policy]
 default_mode = "agent"
-default_effort = "medium"      # unused for daily path (native / no effort sentence). /think and --think still steer.
+default_effort = "auto"        # neutral official medium: model chooses depth. /think still provides an override.
 max_think_tokens_low = 512
 max_think_tokens_medium = 2048
 max_think_tokens_xhigh = 4096

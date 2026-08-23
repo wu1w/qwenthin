@@ -572,7 +572,13 @@ fn mcp_child_env(
         out.extend(host);
     } else {
         for key in MCP_ENV_WHITELIST {
-            if let Some(v) = host.get(*key) {
+            let value = host.get(*key).or_else(|| {
+                cfg!(windows)
+                    .then(|| host.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)))
+                    .flatten()
+                    .map(|(_, v)| v)
+            });
+            if let Some(v) = value {
                 out.insert((*key).to_string(), v.clone());
             }
         }
@@ -730,6 +736,19 @@ async fn read_rpc<R: AsyncBufReadExt + Unpin>(r: &mut R) -> Result<Value> {
 mod tests {
     use super::*;
 
+    fn python_server(name: &str, script: &Path) -> McpServer {
+        let mut args = Vec::new();
+        #[cfg(windows)]
+        args.push("-3".to_string());
+        args.push(script.to_string_lossy().into_owned());
+        McpServer {
+            name: name.into(),
+            command: if cfg!(windows) { "py" } else { "python3" }.into(),
+            args,
+            ..McpServer::default()
+        }
+    }
+
     #[tokio::test]
     async fn fake_stdio_server_tools_call() {
         let dir = std::env::temp_dir().join(format!("q38-mcp-{}", uuid::Uuid::new_v4().simple()));
@@ -790,14 +809,7 @@ while True:
         )
         .unwrap();
         let registry = McpRegistry {
-            servers: vec![McpServer {
-                name: "echo".into(),
-                command: "python3".into(),
-                args: vec![py.to_string_lossy().into_owned()],
-                env: BTreeMap::new(),
-                cwd: String::new(),
-                ..McpServer::default()
-            }],
+            servers: vec![python_server("echo", &py)],
             timeout: Duration::from_secs(8),
             ..McpRegistry::default()
         };
@@ -1050,14 +1062,7 @@ while True:
         )
         .unwrap();
         let registry = McpRegistry {
-            servers: vec![McpServer {
-                name: "flood".into(),
-                command: "python3".into(),
-                args: vec![py.to_string_lossy().into_owned()],
-                env: BTreeMap::new(),
-                cwd: String::new(),
-                ..McpServer::default()
-            }],
+            servers: vec![python_server("flood", &py)],
             timeout: Duration::from_secs(8),
             ..McpRegistry::default()
         };
@@ -1094,14 +1099,7 @@ time.sleep(60)
         )
         .unwrap();
         let registry = McpRegistry {
-            servers: vec![McpServer {
-                name: "hang".into(),
-                command: "python3".into(),
-                args: vec![py.to_string_lossy().into_owned()],
-                env: BTreeMap::new(),
-                cwd: String::new(),
-                ..McpServer::default()
-            }],
+            servers: vec![python_server("hang", &py)],
             timeout: Duration::from_millis(800),
             ..McpRegistry::default()
         };
@@ -1136,12 +1134,7 @@ time.sleep(60)
         let py = dir.join("hang_mcp.py");
         std::fs::write(&py, "import time\ntime.sleep(60)\n").unwrap();
         let registry = McpRegistry {
-            servers: vec![McpServer {
-                name: "hang".into(),
-                command: "python3".into(),
-                args: vec![py.to_string_lossy().into_owned()],
-                ..McpServer::default()
-            }],
+            servers: vec![python_server("hang", &py)],
             timeout: Duration::from_millis(400),
             ..McpRegistry::default()
         };

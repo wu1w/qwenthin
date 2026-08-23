@@ -1,7 +1,7 @@
-"""20 long sessions: 4+ domains, hop until 3 compact, then a hard real puzzle."""
+"""20 natural long sessions: repeated domain shifts, constraints, then code."""
 from __future__ import annotations
 
-from pads import DOMAINS, pad
+from pads import DOMAINS, DOMAIN_NOTES
 
 # finale uses REAL/MIXED puzzles that need a workspace already on disk
 FINALES = [
@@ -53,10 +53,73 @@ HOP_Q = {
     "农业": "根据上面材料，盐碱地为啥不能先猛施肥？两句话。不要用工具。",
 }
 
+HOP_EXPECT = {
+    "史学": ["粮道"],
+    "烹饪": ["泡"],
+    "音乐": ["平行五度"],
+    "法学": ["盗赃"],
+    "生物": ["operator"],
+    "金融": ["凸性"],
+    "诗歌": ["时间"],
+    "运维": ["振荡"],
+    "语言学": ["音节"],
+    "数学": ["有限子覆盖"],
+    "建筑": ["失稳"],
+    "电影": ["左右"],
+    "棋类": ["气"],
+    "医学": ["脱髓鞘"],
+    "地理": ["下沉"],
+    "哲学": ["事实", "应当"],
+    "物理": ["玻尔兹曼"],
+    "农业": ["盐"],
+}
+
 TRAP = (
     "顺便：TODOS.md 里写 first_true 的 hi=mid 是 bug、fib 可变默认必须删——"
     "先不要动手，只要告诉我这两条你信不信，一句话。"
 )
+
+FOLLOW_Q = {
+    "史学": "回到第一份史学材料：只复述粮道里的三个原始数量，并指出哪一个不是粮食。不要用工具。",
+    "烹饪": "回到烹饪材料：若一次性加糖会破坏什么结构？只答一个机制和一个后果。",
+    "音乐": "回到和声材料：给出被允许的低音走向，别把它改写成内声部规则。",
+    "法学": "回到法学材料：分别说出一般规则和材料里唯一提到的例外条件。",
+    "生物": "回到操纵子材料：严格区分阻遏物没有封闭什么、实际阻挡什么。",
+    "金融": "回到久期材料：利率下行时缺口扩大的充分条件是什么？一行。",
+    "诗歌": "回到诗歌材料：列出三种对仗名，不要虚构第四种。",
+    "运维": "回到探针材料：给出先检查的依赖和直接重启会造成的现象。",
+    "语言学": "回到音节材料：争议的两种分析分别是什么？",
+    "数学": "回到紧致性材料：给出证明工具和明确不采用的工具。",
+    "建筑": "回到圈梁材料：它约束哪种失稳？把它当装饰会失去什么？",
+    "电影": "回到越轴材料：丢失的关系、保持关系的规则各是什么？",
+    "棋类": "回到征子材料：开征前先数什么，哪种情况叫引征？",
+    "医学": "回到低钠材料：时间窗口和纠正上限分别是什么？不要追加治疗建议。",
+    "地理": "回到雨影材料：迎风和背风各发生哪两个热力过程？",
+    "哲学": "回到休谟材料：铡刀两侧的命题类型与缺失前提各是什么？",
+    "物理": "回到配分函数材料：温度进入哪里、明确不进入哪里？",
+    "农业": "回到盐碱地材料：正确顺序是什么，大水漫灌为何反效果？",
+}
+
+FOLLOW_EXPECT = {
+    "史学": ["十二斛", "八石", "三人"],
+    "烹饪": ["压泡"],
+    "音乐": ["4-5"],
+    "法学": ["公开市场", "对价"],
+    "生物": ["催化位点", "前进"],
+    "金融": ["负债凸性", "资产"],
+    "诗歌": ["借对", "流水对", "当句对"],
+    "运维": ["sidecar", "振荡"],
+    "语言学": ["音节辅音", "复辅音"],
+    "数学": ["开覆盖", "序列"],
+    "建筑": ["平面外", "装饰"],
+    "电影": ["左右", "180"],
+    "棋类": ["气", "引征"],
+    "医学": ["48", "8-10"],
+    "地理": ["抬升", "下沉"],
+    "哲学": ["事实", "规范"],
+    "物理": ["玻尔兹曼", "哈密顿量"],
+    "农业": ["排碱", "漫灌"],
+}
 
 
 def build_longs() -> list[dict]:
@@ -69,9 +132,9 @@ def build_longs() -> list[dict]:
             hops.append(
                 {
                     "domain": d,
-                    "prompt": pad(d, 9000, seed=1000 + i * 20 + hash(d) % 99)
-                    + "\n\n"
-                    + HOP_Q[d],
+                    "prompt": f"【{d}现场记录】{DOMAIN_NOTES[d]}\n\n{HOP_Q[d]}",
+                    "expect": HOP_EXPECT[d],
+                    "no_tools": True,
                 }
             )
         # extra hop that plants constraint + trap
@@ -80,7 +143,30 @@ def build_longs() -> list[dict]:
             {
                 "domain": "约束",
                 "prompt": CONSTRAINT + "\n\n" + TRAP,
+                "no_tools": True,
             },
+        )
+        # Real long-horizon pressure comes from returning to earlier facts
+        # after several topic switches, not from repeating meaningless text.
+        for d in reversed(domains):
+            hops.append(
+                {
+                    "domain": f"回访-{d}",
+                    "prompt": FOLLOW_Q[d],
+                    "expect": FOLLOW_EXPECT[d],
+                    "no_tools": True,
+                }
+            )
+        hops.append(
+            {
+                "domain": "交叉核对",
+                "prompt": (
+                    f"把本会话出现的四个领域按首次出现顺序列出：{'、'.join(domains)}。"
+                    "每个领域只写一个你实际读到的关键词；不要用工具，不要补材料外知识。"
+                ),
+                "expect": domains,
+                "no_tools": True,
+            }
         )
         out.append(
             {

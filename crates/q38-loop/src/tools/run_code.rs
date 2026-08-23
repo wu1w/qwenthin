@@ -360,6 +360,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sdk_edit_preserves_crlf_for_lf_request() {
+        let (ws, dir) = scratch();
+        std::fs::write(dir.join("a.txt"), b"def f():\r\n    return 1\r\nkeep\r\n").unwrap();
+        let out = run_code(
+            &ws,
+            &call(json!({
+                "code": "print(edit('a.txt', 'def f():\\n    return 1', 'def f():\\n    return 2'))"
+            })),
+            CancelFlag::new(),
+            ToolLimits::default(),
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(out.state, ToolState::Success, "{}", out.joined_text());
+        assert!(
+            out.joined_text().contains("preserved file line endings"),
+            "{}",
+            out.joined_text()
+        );
+        assert_eq!(
+            std::fs::read(dir.join("a.txt")).unwrap(),
+            b"def f():\r\n    return 2\r\nkeep\r\n"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn read_capped_drains_past_cap_to_eof() {
         use tokio::io::AsyncWriteExt;
         let (mut writer, reader) = tokio::io::duplex(8192);

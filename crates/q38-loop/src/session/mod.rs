@@ -470,13 +470,13 @@ mod tests {
         assert_eq!(med.effort, Some(Effort::Medium));
         assert_eq!(med.max_think_tokens, 2048);
         assert_eq!(med.max_tokens, 8192);
-        assert!(!med.preserve);
+        assert!(med.preserve);
 
         let xhigh = parse_slash("/think xhigh").unwrap().policy().unwrap();
         assert_eq!(xhigh.effort, Some(Effort::Xhigh));
         assert_eq!(xhigh.max_think_tokens, 4096);
         assert_eq!(xhigh.max_tokens, 16384);
-        assert!(!xhigh.preserve);
+        assert!(xhigh.preserve);
 
         let think_mode = SessionMode::Think.default_policy();
         assert!(think_mode.preserve);

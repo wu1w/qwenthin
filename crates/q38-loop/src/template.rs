@@ -464,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_continue_keeps_current_turn_think() {
+    fn preserve_default_keeps_think_across_followups() {
         let policy = ThinkPolicy::agent_default();
         let mut asst = ChatMessage::assistant("working");
         asst.reasoning_content = Some("plan".into());
@@ -483,7 +483,7 @@ mod tests {
             "{hidden_text}"
         );
         assert!(
-            !plain_text.contains("<think>\nplan\n</think>"),
+            plain_text.contains("<think>\nplan\n</think>"),
             "{plain_text}"
         );
         let prefix = without_gen(&before_text);
@@ -492,8 +492,8 @@ mod tests {
             "CONTINUE wrap must extend the suffix only"
         );
         assert!(
-            !plain_text.starts_with(prefix),
-            "a real user CONTINUE must rewrite earlier assistants"
+            plain_text.starts_with(prefix),
+            "preserved history stays warm"
         );
     }
 
@@ -511,14 +511,16 @@ mod tests {
     }
 
     #[test]
-    fn thinking_on_new_user_drops_historical_think() {
+    fn thinking_on_preserve_switch_controls_historical_think() {
         let mut asst = ChatMessage::assistant("ok");
         asst.reasoning_content = Some("secret-plan".into());
         let t2 = vec![ChatMessage::user("ping"), asst, ChatMessage::user("pong")];
-        let stripped = qwen38(&t2, None, ThinkPolicy::agent_default());
-        assert!(!stripped.contains("secret-plan"), "{stripped}");
-        let kept = qwen38(&t2, None, ThinkPolicy::think_mode());
+        let kept = qwen38(&t2, None, ThinkPolicy::agent_default());
         assert!(kept.contains("secret-plan"), "{kept}");
+        let mut no_preserve = ThinkPolicy::agent_default();
+        no_preserve.preserve = false;
+        let stripped = qwen38(&t2, None, no_preserve);
+        assert!(!stripped.contains("secret-plan"), "{stripped}");
     }
 
     #[test]

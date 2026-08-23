@@ -370,7 +370,10 @@ mod tests {
         );
         assert_eq!(out.state, ToolState::Error);
         assert!(out.joined_text().contains("invalid path"));
-        assert!(!dir.join("...").exists());
+        assert!(!std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name() == "..."));
         let _ = std::fs::remove_dir_all(dir);
     }
 

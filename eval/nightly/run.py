@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import traceback
@@ -23,20 +24,29 @@ sys.path.insert(0, str(HERE))
 import philosophy as phil
 import puzzles
 from longs import LONGS
-from pads import pad
 
-Q38 = Path("/Users/william/q-harness/target/release/q38")
+
+def q38_binary() -> Path:
+    override = os.environ.get("Q38_BIN")
+    if override:
+        return Path(override).expanduser()
+    installed = shutil.which("q38")
+    if installed:
+        return Path(installed)
+    suffix = ".exe" if os.name == "nt" else ""
+    return HERE.parents[1] / "target" / "release" / f"q38{suffix}"
+
+
+Q38 = q38_binary()
 SESS = Path.home() / ".q38-agent" / "sessions"
 CFG = Path.home() / ".q38-agent" / "config.toml"
 RUNS = HERE / "runs"
 WORK = HERE / "work"
 STATE_PATH = RUNS / "state.json"
-LONG_WINDOW = "16384"
 HOP_TIMEOUT = 240
 CODE_TIMEOUT = 420
 PHIL_TIMEOUT = 180
 FINALE_TIMEOUT = 540
-MAX_HOPS = 16
 
 
 def log(msg: str) -> None:
@@ -192,7 +202,11 @@ def bare_chat(messages: list[dict], max_tokens: int = 2048, thinking: bool = Tru
         "top_k": 20,
         "min_p": 0.0,
         "max_tokens": max_tokens,
-        "chat_template_kwargs": {"enable_thinking": thinking},
+        "chat_template_kwargs": {
+            "enable_thinking": thinking,
+            "reasoning_effort": "medium",
+            "preserve_thinking": True,
+        },
     }
     req = urllib.request.Request(
         "https://llm.ixiaotao.com/v1/chat/completions",
@@ -281,58 +295,70 @@ def run_long(st: dict) -> None:
             continue
         pid = spec["finale_puzzle"]
         log(f"LONG {lid} domains={spec['domains']} finale={pid}")
-        ws = puzzles.materialize(WORK / "long" / lid, pid)
-        # extra blob so a curious agent can also grow context via read
-        (ws / "docs").mkdir(exist_ok=True)
-        (ws / "docs" / "corpus.txt").write_text(pad("史学", 18000, seed=42 + len(lid)))
+        ws_path = WORK / "long" / lid
+        prior = st["long"].get(lid, {})
+        expected_ws = ws_path / pid
+        ws = (
+            expected_ws
+            if prior.get("hops") and expected_ws.is_dir()
+            else puzzles.materialize(ws_path, pid)
+        )
         sid = f"nlong-{lid}"
-        hops_run = []
-        hop_i = 0
-        while compact_n(sid) < 3 and hop_i < MAX_HOPS:
-            hop = spec["hops"][hop_i % len(spec["hops"])]
-            # after first cycle, attach a fresh pad so tokens keep growing
-            prompt = hop["prompt"]
-            if hop_i >= len(spec["hops"]):
-                prompt = pad(spec["domains"][hop_i % 4], 9000, seed=8000 + hop_i) + "\n\n" + hop["prompt"][-400:]
+        hops_run = list(prior.get("hops") or [])
+        for hop_i, hop in enumerate(spec["hops"][len(hops_run):], start=len(hops_run)):
             log(f"  hop {hop_i} compact={compact_n(sid)} domain={hop['domain']}")
             n0 = len(events(sid))
-            raw = q38_run(prompt, ws, sid, HOP_TIMEOUT, window=LONG_WINDOW)
+            raw = q38_run(hop["prompt"], ws, sid, HOP_TIMEOUT)
             stats = turn_stats(sid, n0)
+            answer = stats["text"] or raw["stdout"]
+            recall_ok = all(term.lower() in answer.lower() for term in hop.get("expect", []))
+            tool_ok = not hop.get("no_tools") or stats["tools"] == 0
             hops_run.append(
                 {
                     "i": hop_i,
                     "domain": hop["domain"],
                     "compact_after": compact_n(sid),
                     "seconds": raw["seconds"],
+                    "rc": raw["rc"],
                     "tools": stats["tools"],
+                    "steps": stats["steps"],
+                    "prompt_tokens": stats["prompt_tokens"],
+                    "cached_tokens": stats["cached_tokens"],
+                    "recall_ok": recall_ok,
+                    "tool_ok": tool_ok,
+                    "answer": answer[:600],
                     "timed_out": raw["timed_out"],
                 }
             )
-            hop_i += 1
             save_state({**st, "long": {**st["long"], lid: {"hops": hops_run, "done": False}}})
             st["long"][lid] = {"hops": hops_run, "done": False}
 
         cn = compact_n(sid)
-        log(f"  finale compact={cn} hops={hop_i}")
+        log(f"  finale compact={cn} hops={len(hops_run)}")
         n0 = len(events(sid))
-        raw = q38_run(spec["finale_prompt"], ws, sid, FINALE_TIMEOUT, window=LONG_WINDOW)
+        raw = q38_run(spec["finale_prompt"], ws, sid, FINALE_TIMEOUT)
         stats = turn_stats(sid, n0)
         g = puzzles.grade(pid, ws)
         # constraint: tests/ expected-value edits on pre-existing tests
         tchg = g.get("tests_changed")
+        trajectory_ok = all(not h["timed_out"] and h.get("rc") == 0 for h in hops_run)
+        attention_ok = all(h.get("recall_ok", True) and h.get("tool_ok", True) for h in hops_run)
         st["long"][lid] = {
             "done": True,
             "domains": spec["domains"],
             "finale": pid,
-            "compact": cn,
+            "compact": compact_n(sid),
+            "compact_observed": compact_n(sid) > 0,
             "hops": hops_run,
             "grade": g,
             "tests_changed": tchg,
             "stats": {k: stats[k] for k in stats if k != "text"},
             "answer": (stats["text"] or raw["stdout"])[:1500],
             "raw": {k: raw[k] for k in ("seconds", "rc", "timed_out", "watchdog_stderr")},
-            "ok": g["ok"] and cn >= 3 and not raw["timed_out"],
-            "compact_ok": cn >= 3,
+            "trajectory_ok": trajectory_ok,
+            "attention_ok": attention_ok,
+            "peak_prompt_tokens": max((h.get("prompt_tokens", 0) for h in hops_run), default=0),
+            "ok": g["ok"] and trajectory_ok and attention_ok and raw["rc"] == 0 and not raw["timed_out"],
         }
         save_state(st)
 

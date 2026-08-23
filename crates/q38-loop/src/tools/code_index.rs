@@ -3,12 +3,13 @@
 //! fifth frozen tool JSON — the agent appends `search_tool()` after the frozen
 //! four.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 
 use super::{arg_str, folded_response, ToolLimits, Workspace};
 use crate::tool_calls::{ToolCall, ToolResponse, ToolState};
@@ -16,8 +17,9 @@ use crate::tool_calls::{ToolCall, ToolResponse, ToolState};
 const HIT_CAP: usize = 8;
 const CHUNK_LINES: usize = 80;
 const RENDER_CHARS: usize = 4000;
-const MAX_FILES: usize = 4000;
-const MAX_FILE_BYTES: usize = 256 * 1024;
+const MAX_FILES: usize = 50_000;
+const MAX_FILE_BYTES: usize = 1024 * 1024;
+const INDEX_SCHEMA: i64 = 2;
 
 const SKIP_DIR: &[&str] = &[
     ".git",
@@ -46,8 +48,64 @@ pub(crate) struct Hit {
 
 impl CodeIndex {
     pub fn build(root: &Path) -> Self {
-        let idx = Self::empty();
-        for rel in list_files(root).into_iter().take(MAX_FILES) {
+        let tracked = git_ls_files(root);
+        let files = tracked.clone().unwrap_or_else(|| walk_fallback(root));
+        // Git workspaces get a global cache. Scratch/non-repository folders
+        // stay in memory, so q38 never leaves project-local index artifacts.
+        let idx = if tracked.is_some() {
+            Self::persistent(root).unwrap_or_else(Self::empty)
+        } else {
+            Self::empty()
+        };
+        idx.sync_root(root, files);
+        idx
+    }
+
+    fn empty() -> Self {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        init_schema(&conn).expect("fts5 chunks");
+        Self {
+            conn: Mutex::new(conn),
+        }
+    }
+
+    fn persistent(root: &Path) -> Option<Self> {
+        let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let key = crate::vendor::sha256_hex(canonical.to_string_lossy().as_bytes());
+        let dir = crate::config::Config::home_dir().ok()?.join("code-index");
+        std::fs::create_dir_all(&dir).ok()?;
+        let conn = Connection::open(dir.join(format!("{}.sqlite3", &key[..24]))).ok()?;
+        conn.busy_timeout(std::time::Duration::from_secs(5)).ok()?;
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        init_schema(&conn).ok()?;
+        Some(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn sync_root(&self, root: &Path, files: Vec<PathBuf>) {
+        let known = {
+            let conn = crate::lock_unpoison(&self.conn);
+            let Ok(mut stmt) = conn.prepare("SELECT path, size, mtime_ns FROM files") else {
+                return;
+            };
+            let Ok(rows) = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            }) else {
+                return;
+            };
+            rows.flatten()
+                .map(|(p, size, mtime)| (p, (size, mtime)))
+                .collect::<HashMap<_, _>>()
+        };
+
+        let mut seen = HashSet::new();
+        let mut updates = Vec::new();
+        for rel in files.into_iter().take(MAX_FILES) {
             if !should_index(&rel) {
                 continue;
             }
@@ -58,34 +116,38 @@ impl CodeIndex {
             if !meta.is_file() || meta.len() as usize > MAX_FILE_BYTES {
                 continue;
             }
-            let Ok(content) = std::fs::read_to_string(&abs) else {
-                continue;
-            };
-            if content.contains('\0') {
+            let rel_s = rel.to_string_lossy().replace('\\', "/");
+            let stamp = file_stamp(&meta);
+            seen.insert(rel_s.clone());
+            if known.get(&rel_s) == Some(&stamp) {
                 continue;
             }
-            let rel_s = rel.to_string_lossy().replace('\\', "/");
-            idx.upsert_file(&rel_s, &content);
+            let content = std::fs::read_to_string(&abs)
+                .ok()
+                .filter(|s| !s.contains('\0') && s.len() <= MAX_FILE_BYTES);
+            updates.push((rel_s, stamp, content));
         }
-        idx
-    }
 
-    fn empty() -> Self {
-        let conn = Connection::open_in_memory().expect("in-memory sqlite");
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE chunks USING fts5(
-               path,
-               start UNINDEXED,
-               end UNINDEXED,
-               symbol,
-               body,
-               tokenize = \"unicode61 tokenchars '_'\"
-             );",
-        )
-        .expect("fts5 chunks");
-        Self {
-            conn: Mutex::new(conn),
+        let stale: Vec<String> = known
+            .keys()
+            .filter(|path| !seen.contains(*path))
+            .cloned()
+            .collect();
+        let mut conn = crate::lock_unpoison(&self.conn);
+        let Ok(tx) = conn.transaction() else {
+            return;
+        };
+        for path in stale {
+            drop_path_tx(&tx, &path);
         }
+        for (path, stamp, content) in updates {
+            if let Some(content) = content {
+                upsert_file_tx(&tx, &path, &content, stamp);
+            } else {
+                drop_path_tx(&tx, &path);
+            }
+        }
+        let _ = tx.commit();
     }
 
     pub fn refresh(&self, ws: &Workspace, raw_path: &str) {
@@ -100,7 +162,10 @@ impl CodeIndex {
         }
         match std::fs::read_to_string(&abs) {
             Ok(content) if !content.contains('\0') && content.len() <= MAX_FILE_BYTES => {
-                self.upsert_file(&shown, &content);
+                let stamp = std::fs::metadata(&abs)
+                    .map(|m| file_stamp(&m))
+                    .unwrap_or((content.len() as i64, 0));
+                self.upsert_file(&shown, &content, stamp);
             }
             _ => self.drop_path(&shown),
         }
@@ -109,17 +174,15 @@ impl CodeIndex {
     fn drop_path(&self, path: &str) {
         let conn = crate::lock_unpoison(&self.conn);
         let _ = conn.execute("DELETE FROM chunks WHERE path = ?1", params![path]);
+        let _ = conn.execute("DELETE FROM files WHERE path = ?1", params![path]);
     }
 
-    fn upsert_file(&self, path: &str, content: &str) {
-        let conn = crate::lock_unpoison(&self.conn);
-        let _ = conn.execute("DELETE FROM chunks WHERE path = ?1", params![path]);
-        for ch in chunk_file(content) {
-            let _ = conn.execute(
-                "INSERT INTO chunks (path, start, end, symbol, body) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![path, ch.start as i64, ch.end as i64, ch.symbol, ch.body],
-            );
-        }
+    fn upsert_file(&self, path: &str, content: &str, stamp: (i64, i64)) {
+        let mut conn = crate::lock_unpoison(&self.conn);
+        if let Ok(tx) = conn.transaction() {
+            upsert_file_tx(&tx, path, content, stamp);
+            let _ = tx.commit();
+        };
     }
 
     pub(crate) fn search(&self, query: &str, path_filter: Option<&str>, limit: usize) -> Vec<Hit> {
@@ -138,12 +201,33 @@ impl CodeIndex {
             if let Ok(hits) = self.search_filename(query, path_filter, cap as i64) {
                 merge_hits(&mut out, &mut seen, cap, hits);
             }
+            if !out.is_empty() {
+                return out;
+            }
         }
 
-        for ident in ident_tokens(query) {
+        let idents = ident_tokens(query);
+        let mut exact_idents = Vec::new();
+        for ident in &idents {
             if let Ok(hits) = self.search_symbol(&ident, path_filter, cap as i64) {
+                if !hits.is_empty() {
+                    exact_idents.push(ident.clone());
+                }
                 merge_hits(&mut out, &mut seen, cap, hits);
             }
+        }
+        // An explicit identifier is a much stronger signal than surrounding
+        // prose. Add reference chunks for that identifier, then converge;
+        // never fill the result with unrelated matches for words like
+        // "Windows", "bug", or "where".
+        if !exact_idents.is_empty() {
+            for ident in &exact_idents {
+                let exact = format!("\"{}\"", ident.replace('"', ""));
+                if let Ok(hits) = self.search_fts(&exact, path_filter, cap as i64) {
+                    merge_hits(&mut out, &mut seen, cap, hits);
+                }
+            }
+            return out;
         }
 
         let fts = fts_query(query);
@@ -378,18 +462,74 @@ fn row_to_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<Hit> {
 }
 
 fn render_hits(hits: &[Hit], cap: usize) -> String {
-    let mut out = String::new();
+    // This tiny result-local hint replaces a standing prompt lecture. Exact,
+    // bounded spans should normally be consumed before another grep round.
+    let mut out = String::from("[index] bounded spans; grep only if evidence is missing.\n");
+    let mut wrote_hit = false;
     for h in hits {
         let block = format_hit(h);
-        if !out.is_empty() && out.chars().count() + block.chars().count() > cap {
+        if wrote_hit && out.chars().count() + block.chars().count() > cap {
             break;
         }
-        if !out.is_empty() {
-            out.push('\n');
-        }
+        out.push('\n');
         out.push_str(&block);
+        wrote_hit = true;
     }
     out
+}
+
+fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 0 && version != INDEX_SCHEMA {
+        conn.execute_batch("DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS chunks;")?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS files(
+           path TEXT PRIMARY KEY,
+           size INTEGER NOT NULL,
+           mtime_ns INTEGER NOT NULL
+         );
+         CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
+           path,
+           start UNINDEXED,
+           end UNINDEXED,
+           symbol,
+           body,
+           tokenize = \"unicode61 tokenchars '_'\"
+         );",
+    )?;
+    conn.pragma_update(None, "user_version", INDEX_SCHEMA)?;
+    Ok(())
+}
+
+fn file_stamp(meta: &std::fs::Metadata) -> (i64, i64) {
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+    (meta.len().min(i64::MAX as u64) as i64, modified)
+}
+
+fn drop_path_tx(tx: &Transaction<'_>, path: &str) {
+    let _ = tx.execute("DELETE FROM chunks WHERE path = ?1", params![path]);
+    let _ = tx.execute("DELETE FROM files WHERE path = ?1", params![path]);
+}
+
+fn upsert_file_tx(tx: &Transaction<'_>, path: &str, content: &str, stamp: (i64, i64)) {
+    let _ = tx.execute("DELETE FROM chunks WHERE path = ?1", params![path]);
+    for ch in chunk_file(content) {
+        let _ = tx.execute(
+            "INSERT INTO chunks (path, start, end, symbol, body) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![path, ch.start as i64, ch.end as i64, ch.symbol, ch.body],
+        );
+    }
+    let _ = tx.execute(
+        "INSERT INTO files(path, size, mtime_ns) VALUES (?1, ?2, ?3)
+         ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns",
+        params![path, stamp.0, stamp.1],
+    );
 }
 
 fn format_hit(h: &Hit) -> String {
@@ -591,10 +731,6 @@ fn skip_rel(rel: &Path) -> bool {
         return true;
     }
     s.split('/').any(|c| SKIP_DIR.contains(&c))
-}
-
-fn list_files(root: &Path) -> Vec<PathBuf> {
-    git_ls_files(root).unwrap_or_else(|| walk_fallback(root))
 }
 
 fn git_ls_files(root: &Path) -> Option<Vec<PathBuf>> {
@@ -955,6 +1091,42 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_sync_reuses_unchanged_chunks() {
+        let (dir, ws) = scratch();
+        let db = dir.join("index.sqlite3");
+        let conn = Connection::open(&db).unwrap();
+        init_schema(&conn).unwrap();
+        let idx = CodeIndex {
+            conn: Mutex::new(conn),
+        };
+        idx.sync_root(ws.root(), walk_fallback(ws.root()));
+        let before: Vec<i64> = {
+            let conn = crate::lock_unpoison(&idx.conn);
+            let mut stmt = conn
+                .prepare("SELECT rowid FROM chunks ORDER BY rowid")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        idx.sync_root(ws.root(), walk_fallback(ws.root()));
+        let after: Vec<i64> = {
+            let conn = crate::lock_unpoison(&idx.conn);
+            let mut stmt = conn
+                .prepare("SELECT rowid FROM chunks ORDER BY rowid")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(before, after, "unchanged files should not be re-indexed");
+        drop(idx);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn path_filter_narrows() {
         let (dir, ws) = scratch();
         std::fs::create_dir_all(dir.join("other")).unwrap();
@@ -1016,6 +1188,24 @@ mod tests {
             hits[0].body.contains("fn upgrade_medium"),
             "definition should lead: {}",
             hits[0].body
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn exact_identifier_does_not_fill_with_background_words() {
+        let (dir, ws) = scratch();
+        std::fs::write(
+            dir.join("README.md"),
+            "Windows PATH setup and general troubleshooting notes.\n",
+        )
+        .unwrap();
+        let idx = CodeIndex::build(ws.root());
+        let hits = idx.search("upgrade_medium on Windows PATH", None, 8);
+        assert!(!hits.is_empty());
+        assert!(
+            hits.iter().all(|h| h.body.contains("upgrade_medium")),
+            "background prose leaked into exact-symbol results: {hits:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

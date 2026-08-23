@@ -594,6 +594,7 @@ impl<C: Completer> Agent<C> {
         self.inject_window_overlay_note();
         self.inject_locate(&text);
         self.inject_web_hint(&text);
+        self.inject_numeric_check_hint(&text);
         self.drive().await
     }
 
@@ -614,9 +615,6 @@ impl<C: Completer> Agent<C> {
         let mut prompt_tokens = 0u64;
         let mut completion_tokens = 0u64;
         let mut parse_retries = 0u32;
-        // 本用户轮是否已经调过工具：纯推理轮（M002 类）watchdog 命中后
-        // 才走升档重试，有工具的轮次保持原 oneshot 降级行为。
-        let mut used_tools = false;
 
         loop {
             self.drain_background();
@@ -650,45 +648,25 @@ impl<C: Completer> Agent<C> {
             completion_tokens += turn.completion_tokens;
 
             if turn.watchdog_hit {
-                // M002 复发防线：无工具轮的推理长度高方差，低 cap 命中后先按
-                // NO_TOOL_THINK_FLOOR 升档重跑一次；再次超限才降级到关思考 oneshot。
-                let widened = if used_tools {
-                    None
-                } else {
-                    self.retry_with_think_floor(tools).await
-                };
+                // A cap hit is evidence of a runaway trajectory, not evidence
+                // that thinking itself should be disabled. Give the model one
+                // concise side observation and more room to choose a course.
+                self.note("[watchdog] think cap; soft nudge and one roomy retry");
+                self.push_hidden_user(THINK_DIVERGENCE_NOTE);
+                let widened = self.retry_with_runaway_room(tools).await;
                 if self.cancel.is_cancelled() {
                     return self.finish(String::new(), Some("aborted".into()), steps);
                 }
                 match widened {
                     Some(t) => {
-                        self.note("[watchdog] think cap; retry with widened thinking");
                         steps += 1;
                         prompt_tokens += t.prompt_tokens;
                         completion_tokens += t.completion_tokens;
                         turn = t;
                     }
                     None => {
-                        self.note("[watchdog] think cap; oneshot with thinking off");
-                        match self.retry_without_thinking(tools).await {
-                            Some(t) => {
-                                steps += 1;
-                                prompt_tokens += t.prompt_tokens;
-                                completion_tokens += t.completion_tokens;
-                                turn = t;
-                            }
-                            None if self.cancel.is_cancelled() => {
-                                return self.finish(String::new(), Some("aborted".into()), steps);
-                            }
-                            None => {
-                                self.note("budget:think");
-                                return self.finish(
-                                    String::new(),
-                                    Some("budget:think".into()),
-                                    steps,
-                                );
-                            }
-                        }
+                        self.note("budget:think");
+                        return self.finish(String::new(), Some("budget:think".into()), steps);
                     }
                 }
             }
@@ -721,11 +699,17 @@ impl<C: Completer> Agent<C> {
             if let Some(body) = Self::promote_write_reply(&turn) {
                 turn.content = body;
             }
+            let mut trajectory_note = None;
             if let Some(prev) = self.last_spoken.clone() {
                 if self.is_answer_dump_hop(&prev, &turn) {
-                    // Same visible answer again: keep the first bubble.
-                    // Do not write/rm a scratch copy of that answer.
-                    return self.finish(prev, Some(crate::stutter::STOP_DUMP.into()), steps);
+                    if turn.tool_calls.is_empty() {
+                        // No tools means the model chose to stop. Keep the first
+                        // identical bubble without labelling that choice a
+                        // harness failure.
+                        self.mark_clean();
+                        return self.finish(prev, None, steps);
+                    }
+                    trajectory_note = Some(crate::stutter::DUMP_NOTE);
                 }
             }
             self.push_assistant(&turn);
@@ -735,7 +719,6 @@ impl<C: Completer> Agent<C> {
             let decision = self.gate_decision(&turn, steps, prompt_tokens, completion_tokens);
 
             if !turn.tool_calls.is_empty() {
-                used_tools = true;
                 // Defer TERMINATE until after this tool batch. A gate Continue
                 // with text is the doom warn stage: one hidden fact after the
                 // batch's results, one hop before the halt stage stops the turn.
@@ -749,9 +732,19 @@ impl<C: Completer> Agent<C> {
                     }
                     _ => {}
                 }
-                self.execute_tools(std::mem::take(&mut turn.tool_calls))
-                    .await;
+                let calls = std::mem::take(&mut turn.tool_calls);
+                if trajectory_note.is_some() {
+                    // Do not execute a cleanup/write batch before the model has
+                    // seen the divergence observation. Record well-formed tool
+                    // results, then give control straight back to the model.
+                    self.defer_divergent_tools(calls);
+                } else {
+                    self.execute_tools(calls).await;
+                }
                 if let Some(note) = gate_note {
+                    self.push_hidden_user(note);
+                }
+                if let Some(note) = trajectory_note {
                     self.push_hidden_user(note);
                 }
                 self.flush_steer();
@@ -1064,25 +1057,23 @@ impl<C: Completer> Agent<C> {
         self.inject_skill_from_tools(&fail_blob);
     }
 
+    fn defer_divergent_tools(&mut self, calls: Vec<ToolCall>) {
+        for call in calls {
+            self.note(&format!("[{}] deferred low-information batch", call.name));
+            self.commit_tool(
+                &call.name,
+                ToolResponse::text(
+                    &call.id,
+                    "Deferred: this batch repeated the visible answer or only staged/cleaned a scratch copy. Reassess using the trajectory observation, then choose the next step.",
+                    ToolState::Error,
+                ),
+            );
+        }
+    }
+
     fn apply_guard_note(&mut self, note: guard::GuardNote) {
         self.note(&format!("[guard] {}", note.label()));
         self.push_hidden_user(note.text());
-        if !self.print {
-            return;
-        }
-        let Some(reason) = note.unattended_stop() else {
-            return;
-        };
-        // A red suite is only worth halting on when it was green before the
-        // edits. Red-to-red is a fix in progress; halting there would cut off
-        // iteration the model was entitled to.
-        if note == guard::GuardNote::TestRed && !self.edit_guard.red_is_proven_regression() {
-            return;
-        }
-        if self.last_spoken.as_deref().unwrap_or("").trim().is_empty() {
-            self.last_spoken = Some(note.text().to_string());
-        }
-        self.pending_stop = Some(reason.to_string());
     }
 
     /// Sample the suite before any edit so a later red run can be told apart
@@ -1138,28 +1129,18 @@ impl<C: Completer> Agent<C> {
         }
     }
 
-    /// Each run compiles into its own throwaway bytecode cache. Sharing one
-    /// would let a stale `.pyc` survive a same-second, same-length source edit,
-    /// and the oracle would then report a green suite that is actually red —
-    /// a false fact is worse than no oracle at all.
+    /// The oracle uses Python's portable `-B` switch. Avoiding bytecode is both
+    /// cheaper than managing a throwaway cache and works unchanged in Bash on
+    /// macOS/Linux/Git Bash and in the PowerShell fallback.
     async fn run_oracle(&mut self, cmd: &str) -> String {
-        let cache = std::env::temp_dir().join(format!(
-            "q38-pyc-{}-{}",
-            std::process::id(),
-            self.oracle_runs
-        ));
         self.note(&format!("[oracle] {cmd}"));
         let call = ToolCall {
             id: format!("oracle-{}", self.oracle_runs),
             name: "bash".into(),
-            arguments: json!({
-                "command": format!("PYTHONPYCACHEPREFIX='{}' {cmd}", cache.display()),
-            }),
+            arguments: json!({"command": cmd}),
         };
         self.oracle_runs += 1;
-        let out = self.dispatch_one(&call).await.joined_text();
-        let _ = std::fs::remove_dir_all(&cache);
-        out
+        self.dispatch_one(&call).await.joined_text()
     }
 
     fn snapshot_write_priors(&self, calls: &[ToolCall]) -> HashMap<String, String> {
@@ -1287,6 +1268,15 @@ impl<C: Completer> Agent<C> {
             return;
         }
         self.push_hidden_user(WEB_HINT);
+    }
+
+    /// Quantitative reasoning gets one short, task-local self-check cue. It is
+    /// absent from ordinary chat and coding turns, and does not force another
+    /// model hop: the model keeps control over when its answer is ready.
+    fn inject_numeric_check_hint(&mut self, user: &str) {
+        if wants_numeric_check(user) {
+            self.push_hidden_user(NUMERIC_CHECK_HINT);
+        }
     }
 
     fn inject_locate(&mut self, user: &str) {
@@ -1584,23 +1574,28 @@ impl<C: Completer> Agent<C> {
         );
     }
 
-    /// M002 防线：watchdog 在低 think cap 命中、且本轮还没用过工具时，按
-    /// `NO_TOOL_THINK_FLOOR` 升档重跑一次。仍失控（或不适用）返回 None，
-    /// 由调用侧降级到 oneshot。显式禁工具短语已在原补全按 floor 跑过
-    /// （`widen_no_tool_think`），不再重复升档。
-    async fn retry_with_think_floor(&self, tools: Option<&[Value]>) -> Option<ModelTurn> {
-        if self.effort.user_locked || forbids_tools(self.last_real_user()) {
-            return None;
-        }
-        let prev = self.completer.policy()?;
-        if !prev.enabled || prev.max_think_tokens >= NO_TOOL_THINK_FLOOR {
+    /// After a true think-cap hit, preserve the model's selected reasoning mode
+    /// and give it one wider retry. The hidden trajectory note is injected by
+    /// the caller; a second cap hit is a hard resource exhaustion, not a signal
+    /// to replace the model's choice with a thinking-off answer.
+    async fn retry_with_runaway_room(&self, tools: Option<&[Value]>) -> Option<ModelTurn> {
+        let Some(prev) = self.completer.policy() else {
+            self.arm_sink();
+            let retry = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => None,
+                turn = self.completer.complete(&self.messages, tools) => turn.ok(),
+            };
+            return retry.filter(|t| !t.watchdog_hit && !t.parse_fail);
+        };
+        if !prev.enabled {
             return None;
         }
         let mut raised = prev.clone();
-        raised.max_think_tokens = NO_TOOL_THINK_FLOOR;
+        raised.max_think_tokens = raised.max_think_tokens.max(NO_TOOL_THINK_FLOOR);
         raised.max_tokens = raised
             .max_tokens
-            .max(NO_TOOL_THINK_FLOOR + NO_TOOL_ANSWER_RESERVE);
+            .max(raised.max_think_tokens + NO_TOOL_ANSWER_RESERVE);
         self.completer.set_policy(raised);
         self.arm_sink();
         let retry = tokio::select! {
@@ -1610,40 +1605,6 @@ impl<C: Completer> Agent<C> {
         };
         self.completer.set_policy(prev);
         retry.filter(|t| !t.watchdog_hit && !t.parse_fail)
-    }
-
-    async fn retry_without_thinking(&self, tools: Option<&[Value]>) -> Option<ModelTurn> {
-        let prev = self.completer.policy();
-        if let Some(p) = prev.clone() {
-            let mut off = ThinkPolicy::off();
-            // Keep the turn's generation budget. The design table's 512 was the
-            // think cap; reusing it as max_tokens clips real answers (office
-            // briefings stopped at 512 tokens mid-sentence).
-            off.max_tokens = p.max_tokens.max(512);
-            self.completer.set_policy(off);
-            self.arm_sink();
-            let retry = tokio::select! {
-                biased;
-                _ = self.cancel.cancelled() => None,
-                turn = self.completer.complete(&self.messages, tools) => turn.ok(),
-            };
-            self.completer.set_policy(p);
-            match retry {
-                Some(t) if !oneshot_disaster(&t) => Some(t),
-                _ => None,
-            }
-        } else {
-            self.arm_sink();
-            let retry = tokio::select! {
-                biased;
-                _ = self.cancel.cancelled() => None,
-                turn = self.completer.complete(&self.messages, tools) => turn.ok(),
-            };
-            match retry {
-                Some(t) if !oneshot_disaster(&t) => Some(t),
-                _ => None,
-            }
-        }
     }
 
     fn last_real_user(&self) -> &str {
@@ -2157,10 +2118,6 @@ fn empty_to_none(s: &str) -> Option<String> {
     }
 }
 
-fn oneshot_disaster(t: &ModelTurn) -> bool {
-    t.watchdog_hit || t.parse_fail || (t.tool_calls.is_empty() && t.content.trim().is_empty())
-}
-
 fn parallel_safe_batch(calls: &[ToolCall]) -> bool {
     calls.len() > 1
         && calls
@@ -2191,17 +2148,20 @@ fn is_harness_fail(response: &ToolResponse) -> bool {
 }
 
 /// Live failure at 2048 (M002, 7^222 mod 1000): the derivation overran the cap
-/// at temp 1.0, the watchdog dropped it, and the thinking-off oneshot answered
-/// wrong then refused. dsh on the same weights finished uncapped (~7.7k chars)
-/// and was correct. A no-tool turn's think length is high-variance; the cap's
-/// only job here is stopping true runaways (bare-arm medians hit 44k chars and
-/// emptied content), so give room to finish and keep the oneshot as last
-/// resort. `widen_no_tool_think` also raises `max_tokens` so the visible
-/// answer is not squeezed by its own thinking.
+/// at temp 1.0. dsh on the same weights finished with more room (~7.7k chars)
+/// and was correct. A turn's think length is high-variance; the cap's job is to
+/// catch true runaways, then give the model one observed, roomy retry rather
+/// than silently replacing its reasoning policy.
 const NO_TOOL_THINK_FLOOR: u32 = 8192;
 
 /// Generation room reserved past the think floor for the visible answer.
 const NO_TOOL_ANSWER_RESERVE: u32 = 4096;
+
+/// Only injected after the streaming watchdog has actually fired. This keeps
+/// the common path free of process rules and lets the model decide how to
+/// converge once it has one concrete observation about its trajectory.
+const THINK_DIVERGENCE_NOTE: &str = "[trajectory] 本轮思考已触及长度预算，可能开始发散。\
+先压缩当前已知事实和未决问题；若证据已足够就作答或执行，若仍缺关键证据只补最小的一步。";
 
 /// Real ripgrep hits kept live when the dump is also folded into index spans.
 const SEARCH_HEAD_LINES: usize = 12;
@@ -2246,6 +2206,88 @@ fn tail_chars(s: &str, n: usize) -> String {
 /// One line, task-scoped, only when the trigger fires. Names the exact call
 /// shape so a 27B does not have to invent it.
 const WEB_HINT: &str = "[web] 这个问题可能涉及时效信息，训练记忆可能过时。先用 web(query=…) 搜索或 web(url=…) 抓正文核实，回答附来源链接。";
+
+/// One-line arithmetic hygiene for the small subset of prompts whose answer
+/// depends on a derived probability, percentage or threshold. This stays out
+/// of the frozen system prompt and asks for no extra prose or forced turn.
+const NUMERIC_CHECK_HINT: &str = "[verify:numeric] 若结论含由题面推导的概率、百分比或阈值，定稿前内部回代一次，区分百分比、百分点和被求变量；一致就直接作答，不新增复核章节。";
+
+fn wants_numeric_check(user: &str) -> bool {
+    let lower = user.to_lowercase();
+    const CODE_MARKS: &[&str] = &[
+        "代码",
+        "函数",
+        "源码",
+        "编译",
+        "单测",
+        "测试用例",
+        "正则",
+        ".py",
+        ".rs",
+        ".js",
+        ".ts",
+        " code",
+        "function",
+        "compile",
+        "unit test",
+        "regex",
+        " bug",
+    ];
+    if CODE_MARKS.iter().any(|mark| lower.contains(mark)) || has_call_ident(user) {
+        return false;
+    }
+    const QUANTITY_MARKS: &[&str] = &[
+        "%",
+        "％",
+        "概率",
+        "准确率",
+        "百分",
+        "百分点",
+        "阈值",
+        "临界",
+        "期望值",
+        "赔率",
+        "比率",
+        "比例",
+        "方差",
+        "置信区间",
+        "probability",
+        "accuracy",
+        "percent",
+        "percentage point",
+        "threshold",
+        "expected value",
+        "odds",
+        "variance",
+        "confidence interval",
+    ];
+    const REASONING_MARKS: &[&str] = &[
+        "求",
+        "计算",
+        "比较",
+        "推导",
+        "证明",
+        "估计",
+        "判断",
+        "讨论",
+        "边界",
+        "阈值",
+        "临界",
+        "期望",
+        "calculate",
+        "compare",
+        "derive",
+        "prove",
+        "estimate",
+        "evaluate",
+        "discuss",
+        "boundary",
+        "threshold",
+        "expected",
+    ];
+    QUANTITY_MARKS.iter().any(|mark| lower.contains(mark))
+        && REASONING_MARKS.iter().any(|mark| lower.contains(mark))
+}
 
 /// Freshness smell: explicit recency words, a 2025+ year, or a pasted URL.
 /// Deliberately narrow — a false fire costs one useless hidden line, a missed
@@ -2395,8 +2437,9 @@ fn wants_test_baseline(user: &str) -> bool {
 }
 
 fn oracle_unittest_cmd(root: &Path) -> Option<String> {
+    let python = python_launcher();
     if root.join("tests").is_dir() {
-        return Some("python3 -m unittest discover -s tests -v".into());
+        return Some(format!("{python} -B -m unittest discover -s tests -v"));
     }
     let has_root = std::fs::read_dir(root).ok()?.any(|e| {
         let Ok(e) = e else { return false };
@@ -2404,7 +2447,28 @@ fn oracle_unittest_cmd(root: &Path) -> Option<String> {
         let s = n.to_string_lossy();
         s.starts_with("test_") && s.ends_with(".py")
     });
-    has_root.then(|| "python3 -m unittest discover -s . -p 'test*.py' -v".into())
+    has_root.then(|| format!("{python} -B -m unittest discover -s . -p \"test*.py\" -v"))
+}
+
+fn python_launcher() -> &'static str {
+    #[cfg(windows)]
+    {
+        if std::process::Command::new("py")
+            .args(["-3", "--version"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            "py -3"
+        } else {
+            "python"
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        "python3"
+    }
 }
 
 enum AgentsMd {
@@ -2906,7 +2970,7 @@ mod tests {
                     && m.content
                         .as_deref()
                         .unwrap_or("")
-                        .contains("[guard] 你撤销了")
+                        .contains("[trajectory] 同一位置刚被改回")
             })
             .collect();
         assert_eq!(guard_notes.len(), 1, "exactly one thrash note");
@@ -2954,7 +3018,7 @@ mod tests {
                     && m.content
                         .as_deref()
                         .unwrap_or("")
-                        .contains("[guard] 你在修改测试")
+                        .contains("[trajectory] 检测到已有测试期望被修改")
             })
             .count();
         assert_eq!(notes, 1, "one-shot per session");
@@ -2983,7 +3047,7 @@ mod tests {
                     (
                         "b1",
                         "bash",
-                        json!({"command": "python3 -m unittest test_app"}),
+                        json!({"command": format!("{} -B -m unittest test_app", python_launcher())}),
                     ),
                 ]),
                 turn_text("done"),
@@ -3001,7 +3065,7 @@ mod tests {
                     && m.content
                         .as_deref()
                         .unwrap_or("")
-                        .contains("[guard] 代码改了、测试红了")
+                        .contains("[trajectory] 生产代码修改后测试由绿转红")
             })
             .count();
         assert_eq!(notes, 1, "one-shot test-red note");
@@ -3009,7 +3073,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn print_mode_hard_stops_on_test_red() {
+    async fn print_mode_test_red_is_advisory() {
         let dir = std::env::temp_dir().join(format!("q38-tredp-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("app.py"), "x = 1\n").unwrap();
@@ -3030,7 +3094,7 @@ mod tests {
                     (
                         "b1",
                         "bash",
-                        json!({"command": "python3 -m unittest test_app"}),
+                        json!({"command": format!("{} -B -m unittest test_app", python_launcher())}),
                     ),
                 ]),
                 turn_text("should not run"),
@@ -3041,22 +3105,20 @@ mod tests {
         o.print = true;
         let mut agent = Agent::new(scripted, o).unwrap();
         let out = agent.run("fix app.py").await.unwrap();
-        assert_eq!(
-            out.stop_reason.as_deref(),
-            Some(guard::STOP_TEST_RED),
-            "{:?}",
-            out.stop_reason
-        );
-        assert!(
-            out.text.contains("测试红了"),
-            "unattended stop should speak the note, got {:?}",
-            out.text
-        );
+        assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
+        assert_eq!(out.text, "should not run");
+        assert!(agent.messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("[trajectory] 生产代码修改后测试由绿转红")
+        }));
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn print_mode_oracle_stops_when_model_skips_tests() {
+    async fn print_mode_oracle_reports_and_model_continues() {
         let dir = std::env::temp_dir().join(format!("q38-torc-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("app.py"), "x = 1\n").unwrap();
@@ -3080,12 +3142,15 @@ mod tests {
         o.print = true;
         let mut agent = Agent::new(scripted, o).unwrap();
         let out = agent.run("fix app.py").await.unwrap();
-        assert_eq!(
-            out.stop_reason.as_deref(),
-            Some(guard::STOP_TEST_RED),
-            "{:?}",
-            out.stop_reason
-        );
+        assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
+        assert_eq!(out.text, "should not run");
+        assert!(agent.messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("[trajectory] 生产代码修改后测试由绿转红")
+        }));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3118,7 +3183,7 @@ mod tests {
                     && m.content
                         .as_deref()
                         .unwrap_or("")
-                        .contains("[guard] 你在修改测试")
+                        .contains("[trajectory] 检测到已有测试期望被修改")
             })
             .count();
         assert_eq!(notes, 1);
@@ -3611,7 +3676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watchdog_oneshot_recovers() {
+    async fn watchdog_soft_nudge_recovers_without_policy_control() {
         let dir = std::env::temp_dir().join(format!("q38-agent-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let scripted = Scripted {
@@ -3625,31 +3690,29 @@ mod tests {
         let out = agent.run("hi").await.unwrap();
         assert_eq!(out.text, "recovered");
         assert_eq!(out.steps, 2);
-        assert!(
-            !agent.messages.iter().any(|m| {
-                m.role == "user"
-                    && m.content.as_deref().is_some_and(|c| {
-                        c.contains("Thinking hit the cap") || c.contains("scratchpad")
-                    })
-            }),
-            "watchdog oneshot must retry the same messages"
-        );
+        assert!(agent.messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains(THINK_DIVERGENCE_NOTE))
+        }));
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn watchdog_oneshot_keeps_generation_budget() {
+    async fn watchdog_second_cap_stops_without_disabling_thinking() {
         let dir = std::env::temp_dir().join(format!("q38-agent-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let start = ThinkPolicy::effort_with(&crate::policy::ThinkBudget::default(), Effort::Low);
         assert_eq!(start.max_tokens, 8192);
-        // 两连 watchdog：升档重试也超限，才落到 oneshot。
+        // 两连 watchdog：已经提醒并给过空间，按硬资源上限停止，不再用
+        // thinking-off 答案替换模型自己的推理策略。
         let watch = PolicyWatch {
             inner: Scripted {
                 turns: Mutex::new(VecDeque::from([
                     ModelTurn::watchdog(),
                     ModelTurn::watchdog(),
-                    turn_text("recovered"),
+                    turn_text("should-not-run"),
                 ])),
                 meter: false,
             },
@@ -3659,21 +3722,27 @@ mod tests {
         let seen = watch.seen.clone();
         let mut agent = Agent::new(watch, opts(&dir)).unwrap();
         let out = agent.run("hi").await.unwrap();
-        assert_eq!(out.text, "recovered");
+        assert_eq!(out.text, "");
+        assert_eq!(out.stop_reason.as_deref(), Some("budget:think"));
         let seen = seen.lock().expect("seen").clone();
-        let oneshot = seen
-            .iter()
-            .find(|p| !p.enabled)
-            .expect("oneshot off policy");
         assert_eq!(
-            oneshot.max_tokens, 8192,
-            "oneshot must keep generation budget, not the 512 think cap: {seen:?}"
+            seen.iter().filter(|p| !p.enabled).count(),
+            0,
+            "watchdog must not replace model policy with thinking-off: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|p| {
+                p.enabled
+                    && p.max_think_tokens == NO_TOOL_THINK_FLOOR
+                    && p.max_tokens >= NO_TOOL_THINK_FLOOR + NO_TOOL_ANSWER_RESERVE
+            }),
+            "roomy retry must retain answer reserve: {seen:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn watchdog_widens_thinking_before_oneshot() {
+    async fn watchdog_widens_thinking_and_keeps_it_enabled() {
         // M002 类：无工具轮 watchdog 命中，先按 NO_TOOL_THINK_FLOOR 升档重试，
         // 成功则全程不关思考。
         let dir = std::env::temp_dir().join(format!("q38-agent-{}", uuid::Uuid::new_v4().simple()));
@@ -3703,14 +3772,14 @@ mod tests {
         );
         assert!(
             seen.iter().all(|p| p.enabled),
-            "successful widened retry must not fall to thinking-off oneshot: {seen:?}"
+            "successful widened retry must keep the model-selected thinking mode: {seen:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn watchdog_after_tool_round_keeps_oneshot() {
-        // 有工具的轮次保持原行为：watchdog 命中直接 oneshot，不升档。
+    async fn watchdog_after_tool_round_also_keeps_model_policy() {
+        // 用过工具也不改变原则：事实提醒 + 原推理模式下的一次宽预算重试。
         let dir = std::env::temp_dir().join(format!("q38-agent-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
@@ -3735,14 +3804,13 @@ mod tests {
         assert_eq!(out.text, "recovered");
         let seen = seen.lock().expect("seen").clone();
         assert!(
-            seen.iter().any(|p| !p.enabled),
-            "tool-using turn must keep the thinking-off oneshot: {seen:?}"
+            seen.iter().all(|p| p.enabled),
+            "tool-using retry must not disable the model's thinking: {seen:?}"
         );
         assert!(
-            !seen
-                .iter()
+            seen.iter()
                 .any(|p| p.enabled && p.max_think_tokens == NO_TOOL_THINK_FLOOR),
-            "tool-using turn must not take the widened retry: {seen:?}"
+            "tool-using turn should get the same roomy retry: {seen:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3779,6 +3847,9 @@ mod tests {
                 turn_tool("read", ping.clone()),
                 turn_tool("read", ping.clone()),
                 turn_tool("read", ping.clone()),
+                turn_tool("read", ping.clone()),
+                turn_tool("read", ping.clone()),
+                turn_tool("read", ping.clone()),
                 turn_text("should-not-run"),
             ])),
             meter: false,
@@ -3803,7 +3874,7 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("Doom loop"),
-            "halt after 3 repeats: text={} reason={:?}",
+            "halt after 6 identical calls: text={} reason={:?}",
             out.text,
             out.stop_reason
         );
@@ -3834,6 +3905,7 @@ mod tests {
             turns: Mutex::new(VecDeque::from([
                 turn_tool("read", json!({"path": "ping.txt"})),
                 turn_tool("read", json!({"path": "ping.txt"})),
+                turn_tool("read", json!({"path": "ping.txt"})),
                 turn_tool("read", json!({"path": "pong.txt"})),
                 turn_text("pivoted"),
             ])),
@@ -3853,7 +3925,7 @@ mod tests {
             .filter(|m| m.role == "user")
             .filter_map(|m| m.content.as_deref())
             .any(|c| c.contains(crate::paw_loop::REPEAT_NOTE));
-        assert!(warned, "warn fact must land at the 2nd identical call");
+        assert!(warned, "warn fact must land at the 3rd identical call");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4063,6 +4135,48 @@ mod tests {
         assert!(!wants_web_check("订单号 2026110234 查一下状态"));
     }
 
+    #[test]
+    fn numeric_check_trigger_is_quantitative_and_non_code() {
+        assert!(wants_numeric_check(
+            "预测者准确率为 99%。比较两种决策论，并讨论错误率是否消除争议。"
+        ));
+        assert!(wants_numeric_check(
+            "Calculate the probability threshold and distinguish percent from percentage points."
+        ));
+        assert!(!wants_numeric_check("这个模型准确率 99%，挺不错。"));
+        assert!(!wants_numeric_check(
+            "修复 accuracy.py 中把 99% 写成 0.99 的函数和测试用例。"
+        ));
+        assert!(!wants_numeric_check("比较两个哲学家的自由意志观点。"));
+    }
+
+    #[tokio::test]
+    async fn numeric_check_hint_is_one_short_task_local_card() {
+        let dir = std::env::temp_dir().join(format!("q38-agent-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([turn_text("one box"), turn_text("hello")])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        agent
+            .run("预测者准确率为 99%。比较两种理论，并讨论概率错误。")
+            .await
+            .unwrap();
+        agent.run("你好").await.unwrap();
+        let hints = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .filter_map(|m| m.content.as_deref())
+            .filter(|c| c.contains("[verify:numeric]"))
+            .count();
+        assert_eq!(hints, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn web_hint_lands_only_on_fresh_questions() {
         let dir = std::env::temp_dir().join(format!("q38-agent-{}", uuid::Uuid::new_v4().simple()));
@@ -4177,7 +4291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restated_dump_keeps_write_skips_next_hop() {
+    async fn restated_dump_is_deferred_then_model_decides() {
         let dir =
             std::env::temp_dir().join(format!("q38-restate-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4200,12 +4314,12 @@ is byte-stable and tools stay frozen.";
         };
         let mut agent = Agent::new(scripted, o).unwrap();
         let out = agent.run("how well does this fit the model").await.unwrap();
-        assert_eq!(out.stop_reason.as_deref(), Some(crate::stutter::STOP_DUMP));
-        assert_eq!(out.text, essay);
+        assert_eq!(out.stop_reason, None);
+        assert_eq!(out.text, "should-not-run");
         assert!(dir.join("a.md").is_file(), "first write should run");
         assert!(
             !dir.join("b.md").is_file(),
-            "restated dump write must not run"
+            "restated dump write is deferred until the model reassesses"
         );
         let hidden: Vec<_> = agent
             .messages
@@ -4214,17 +4328,19 @@ is byte-stable and tools stay frozen.";
             .map(|m| m.content.clone().unwrap_or_default())
             .filter(|c| crate::template::is_hidden_user_text(c))
             .collect();
-        assert!(
+        assert_eq!(
             hidden
                 .iter()
-                .all(|c| !c.contains("Repetitive") && !c.contains("different approach")),
-            "must not lecture: {hidden:?}"
+                .filter(|c| c.contains(crate::stutter::DUMP_NOTE))
+                .count(),
+            1,
+            "one concise side observation: {hidden:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn spoken_then_rm_keeps_the_file() {
+    async fn spoken_then_cleanup_is_deferred_not_hard_stopped() {
         let dir =
             std::env::temp_dir().join(format!("q38-keeprm-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4250,8 +4366,18 @@ is byte-stable and tools stay frozen.";
         };
         let mut agent = Agent::new(scripted, o).unwrap();
         let out = agent.run("write a report").await.unwrap();
-        assert_eq!(out.stop_reason.as_deref(), Some(crate::stutter::STOP_DUMP));
-        assert!(dir.join("report.md").is_file(), "cleanup rm must not run");
+        assert_eq!(out.stop_reason, None);
+        assert_eq!(out.text, "should-not-run");
+        assert!(
+            dir.join("report.md").is_file(),
+            "cleanup waits for reassessment"
+        );
+        assert!(agent.messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains(crate::stutter::DUMP_NOTE))
+        }));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4354,7 +4480,7 @@ is byte-stable and tools stay frozen.";
     }
 
     #[tokio::test]
-    async fn placeholder_write_then_ls_rm_halts() {
+    async fn placeholder_write_then_cleanup_gets_soft_reassessment() {
         let dir =
             std::env::temp_dir().join(format!("q38-ellipsis-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4397,9 +4523,21 @@ is byte-stable and tools stay frozen.";
         };
         let mut agent = Agent::new(scripted, o).unwrap();
         let out = agent.run("look at the core loop").await.unwrap();
-        assert_eq!(out.stop_reason.as_deref(), Some(crate::stutter::STOP_DUMP));
-        assert_eq!(out.text, essay);
-        assert!(!dir.join("...").exists(), "placeholder write must not land");
+        assert_eq!(out.stop_reason, None);
+        assert_eq!(out.text, "should-not-run");
+        assert!(
+            !std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name() == "..."),
+            "placeholder write must not land"
+        );
+        assert!(agent.messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains(crate::stutter::DUMP_NOTE))
+        }));
         let _ = std::fs::remove_dir_all(dir);
     }
 

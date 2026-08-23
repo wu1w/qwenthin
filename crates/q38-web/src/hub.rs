@@ -271,7 +271,14 @@ fn endpoint_runnable(ep: &q38_loop::ChannelEndpoint) -> bool {
 fn endpoint_in_process(kind: &str) -> bool {
     matches!(
         kind.to_ascii_lowercase().as_str(),
-        "telegram" | "webhook" | "http" | "console" | "qq" | "wechat" | "wecom" | "dingtalk"
+        "telegram"
+            | "webhook"
+            | "http"
+            | "console"
+            | "qq"
+            | "wechat"
+            | "wecom"
+            | "dingtalk"
             | "feishu"
     )
 }
@@ -356,15 +363,14 @@ fn spawn_channel_watch(inner: Arc<Mutex<Inner>>) {
                     jobs.push(tokio::spawn(async move {
                         let id = ep.id.clone();
                         // serve 正常返回或报错都算停摆,同步进 runtime 状态
-                        let detail = match q38_loop::channel::serve_endpoint(cfg, workspace, ep)
-                            .await
-                        {
-                            Ok(()) => "客户端已退出(无错误信息)".to_string(),
-                            Err(e) => {
-                                eprintln!("q38 channel: {e}");
-                                e.to_string()
-                            }
-                        };
+                        let detail =
+                            match q38_loop::channel::serve_endpoint(cfg, workspace, ep).await {
+                                Ok(()) => "客户端已退出(无错误信息)".to_string(),
+                                Err(e) => {
+                                    eprintln!("q38 channel: {e}");
+                                    e.to_string()
+                                }
+                            };
                         let mut g = inner_ep.lock().await;
                         if g.channel_gen == gen {
                             g.channel_runtime.insert(
@@ -616,7 +622,11 @@ mod tests {
 
         let mut policy = ep.clone();
         policy.group_policy = "closed".into();
-        assert_ne!(base, channels_fingerprint(&cfg_with(policy)), "group_policy");
+        assert_ne!(
+            base,
+            channels_fingerprint(&cfg_with(policy)),
+            "group_policy"
+        );
     }
 
     #[test]
