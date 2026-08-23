@@ -66,6 +66,7 @@ pub async fn run(opts: WebOpts) -> Result<std::process::ExitCode> {
         channels: cfg.channels.clone(),
         channel: "console".into(),
         low_precision: cfg.policy.low_precision,
+        workspace_confined: cfg.features.workspace_write_only,
         approvals: ApprovalMode::parse(&cfg.features.approvals).unwrap_or(ApprovalMode::Ask),
     });
     let open = q38_loop::sidecar::RpcRequest {

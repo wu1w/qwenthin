@@ -242,6 +242,8 @@ pub struct FeatureConfig {
     pub tui: bool,
     pub skills_auto_catalog: bool,
     pub mcp_auto_catalog: bool,
+    /// Confine file-oriented tools to the selected workspace. Shell/code use
+    /// it as cwd but are not an operating-system sandbox.
     pub workspace_write_only: bool,
     /// TUI permission mode: ask | auto | yolo. `--print` never prompts.
     pub approvals: String,
@@ -630,6 +632,7 @@ mod tests {
         assert_eq!(c.tools.result_head_chars, 8_000);
         assert_eq!(c.tools.result_tail_chars, 2_000);
         assert_eq!(c.context.agents_md_max_tokens, 400);
+        assert!(c.features.workspace_write_only);
     }
 
     #[test]

@@ -66,6 +66,7 @@ export type Snap = {
   channel?: string;
   plan_mode?: boolean;
   approvals?: string;
+  agent_scope?: "workspace" | "global";
   low_precision?: boolean;
   busy?: string;
   queued?: number;

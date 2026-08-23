@@ -90,6 +90,7 @@ pub async fn run(opts: TuiOpts) -> Result<ExitCode> {
         channels: opts.cfg.channels.clone(),
         channel: "cli".into(),
         low_precision: opts.cfg.policy.low_precision,
+        workspace_confined: opts.cfg.features.workspace_write_only,
         approvals: ApprovalMode::parse(&opts.cfg.features.approvals).unwrap_or(ApprovalMode::Ask),
     });
     match session.handle(&rpc(

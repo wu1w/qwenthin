@@ -62,6 +62,7 @@ pub struct SidecarSession {
     pub(crate) plan_mode: bool,
     pub(crate) approvals: ApprovalMode,
     pub(crate) low_precision: bool,
+    pub(crate) workspace_confined: bool,
 }
 
 impl SidecarSession {
@@ -90,6 +91,7 @@ impl SidecarSession {
             plan_mode: false,
             approvals: opts.approvals,
             low_precision: opts.low_precision,
+            workspace_confined: opts.workspace_confined,
         }
     }
 
@@ -123,6 +125,10 @@ impl SidecarSession {
 
     pub fn set_low_precision(&mut self, on: bool) {
         self.low_precision = on;
+    }
+
+    pub fn set_workspace_confined(&mut self, confined: bool) {
+        self.workspace_confined = confined;
     }
 
     pub fn workspace(&self) -> &std::path::Path {
@@ -202,6 +208,7 @@ impl SidecarSession {
             "plan_mode": self.plan_mode,
             "approvals": self.approvals.as_str(),
             "low_precision": self.low_precision,
+            "agent_scope": if self.workspace_confined { "workspace" } else { "global" },
             "busy": self.mailbox.busy.as_str(),
             "queued": self.mailbox.queued(),
             "steered": self.mailbox.steered(),
@@ -224,6 +231,7 @@ impl SidecarSession {
             plan_mode: self.plan_mode,
             approvals: self.approvals,
             low_precision: self.low_precision,
+            workspace_confined: self.workspace_confined,
         }
     }
 
@@ -335,6 +343,17 @@ mod tests {
         let session = SidecarSession::new(SidecarOpts::default());
         assert_eq!(session.approvals(), ApprovalMode::Ask);
         assert_eq!(session.state_json()["approvals"], "ask");
+    }
+
+    #[test]
+    fn workspace_scope_is_visible_and_frozen_into_turn_snapshot() {
+        let mut session = SidecarSession::new(SidecarOpts::default());
+        assert_eq!(session.state_json()["agent_scope"], "workspace");
+        assert!(session.snapshot().workspace_confined);
+
+        session.set_workspace_confined(false);
+        assert_eq!(session.state_json()["agent_scope"], "global");
+        assert!(!session.snapshot().workspace_confined);
     }
 
     #[test]

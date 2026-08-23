@@ -492,6 +492,7 @@ export function ChatPage({
   const draft = text.trim();
   const heading = nameFromEvents(events, snap.title);
   const approvals = snap.approvals || "ask";
+  const agentScope = snap.agent_scope || "workspace";
 
   const newChat = async () => {
     setErr("");
@@ -511,6 +512,32 @@ export function ChatPage({
     setErr("");
     try {
       await api("/config", { method: "POST", body: JSON.stringify({ approvals: next }) });
+      if (!busy) await onReload();
+    } catch (e) {
+      setErr(failMsg(e));
+    }
+  };
+
+  const toggleAgentScope = async () => {
+    const toGlobal = agentScope !== "global";
+    if (toGlobal) {
+      const ok = await uiConfirm(
+        "切换到全局作用域？",
+        "文件工具将可以访问工作区以外的绝对路径。终端与 Python 仍从工作区启动，但不是系统沙箱。",
+        { danger: true, okLabel: "切换到全局" },
+      );
+      if (!ok) return;
+    }
+    setErr("");
+    try {
+      const saved = await api<{ agent_scope?: string }>("/config", {
+        method: "POST",
+        body: JSON.stringify({ workspace_write_only: !toGlobal }),
+      });
+      const expected = toGlobal ? "global" : "workspace";
+      if (saved.agent_scope !== expected) {
+        throw new Error("作用域未被后端应用，请重启 Qwenthin 服务后重试");
+      }
       if (!busy) await onReload();
     } catch (e) {
       setErr(failMsg(e));
@@ -821,6 +848,16 @@ export function ChatPage({
                 </button>
                 <button
                   type="button"
+                  className={`pill-btn scope-${agentScope}`}
+                  title={agentScope === "global" ? "Agent 可访问工作区外的路径。点击收回到工作区" : "Agent 文件访问限于当前工作区。点击可切换到全局"}
+                  aria-pressed={agentScope === "global"}
+                  onClick={toggleAgentScope}
+                >
+                  <Icon name="folder" />
+                  {agentScope === "global" ? "全局" : "工作区"}
+                </button>
+                <button
+                  type="button"
                   className={`pill-btn${snap.plan_mode ? " on" : ""}`}
                   title={snap.plan_mode ? "计划模式开启中：只读不改。点击关闭" : "开启计划模式：先勘察再动手，写改类工具被挡"}
                   aria-pressed={!!snap.plan_mode}
@@ -938,6 +975,7 @@ export function ChatPage({
             <div className="cap">当前会话</div>
             <div className="kv"><span>模式</span><b>{snap.mode || "—"}</b></div>
             <div className="kv"><span>审批</span><b>{snap.approvals || "—"}</b></div>
+            <div className="kv"><span>作用域</span><b>{agentScope === "global" ? "全局" : "工作区"}</b></div>
             <div className="kv"><span>计划模式</span><b>{snap.plan_mode ? "on" : "off"}</b></div>
             <div className="kv"><span>忙碌策略</span><b>{snap.busy || "—"}</b></div>
             <div className="kv"><span>运行</span><b>{busy ? PHASE_LABEL[phase] : "空闲"}</b></div>

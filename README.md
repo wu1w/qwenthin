@@ -95,10 +95,6 @@ q38 --sidecar                   # stdio JSON-RPC（给可选 dsh 插件用）
 - `[web]` 搜索工具（无 key 也能用；有 Tavily key 自动升级）
 - `[mcp]` / 技能目录 overlay
 
-## 最近一次实测
-
-- [2026-08-23：同一 Qwen3.8-27B 下 qwenthin、OpenCode、Claude Code 横向比较](docs/benchmark-2026-08-23.md)
-
 工作区还可以放 `AGENT.md`（人设）、`.q38/skills`、`.q38/mcp.toml`。
 
 ## 改控制台前端

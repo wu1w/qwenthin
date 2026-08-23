@@ -1617,13 +1617,15 @@ export function SettingsPage({ active = true }: { active?: boolean }) {
 
 export function SecurityPage({ active = true }: { active?: boolean }) {
   const [mode, setMode] = useState("ask");
+  const [scope, setScope] = useState("workspace");
   const [msg, setMsg] = useState("");
   useEffect(() => {
     if (!active) return;
-    api<{ features: { approvals: string } }>("/config")
+    api<{ features: { approvals: string; workspace_write_only: boolean } }>("/config")
       .then((j) => {
         const next = j.features?.approvals;
         if (next) setMode(next);
+        setScope(j.features?.workspace_write_only === false ? "global" : "workspace");
       })
       .catch(() => {});
   }, [active]);
@@ -1651,21 +1653,51 @@ export function SecurityPage({ active = true }: { active?: boolean }) {
           <div className="sub" style={{ marginTop: 12 }}>
             门控：write · edit · bash · run_code · mcp
           </div>
-          <button
-            className="btn primary"
-            style={{ marginTop: 16 }}
-            onClick={async () => {
-              try {
-                await api("/config", { method: "POST", body: JSON.stringify({ approvals: mode }) });
-                setMsg("已保存");
-              } catch (e) {
-                setMsg(failMsg(e));
-              }
-            }}
-          >
-            保存
-          </button>
-          {msg ? <span className="sub" style={{ marginLeft: 10 }}>{msg}</span> : null}
+          <div className="setting-divider" />
+          <h2>
+            <Icon name="folder" />
+            Agent 作用域
+          </h2>
+          <div className="sub" style={{ margin: "8px 0 12px" }}>
+            工作区仅允许文件工具访问当前文件夹；全局允许使用绝对路径访问其他位置。
+            终端与 Python 始终从工作区启动，但不是操作系统沙箱。
+          </div>
+          <Seg
+            value={scope}
+            options={[
+              { id: "workspace", label: "工作区（推荐）" },
+              { id: "global", label: "全局" },
+            ]}
+            onChange={setScope}
+          />
+          {scope === "global" ? (
+            <div className="scope-warning">全局模式会扩大 Agent 可读取和修改的路径范围。</div>
+          ) : null}
+          <div style={{ display: "flex", alignItems: "center", marginTop: 16 }}>
+            <button
+              className="btn primary"
+              onClick={async () => {
+                try {
+                  const saved = await api<{ agent_scope?: string }>("/config", {
+                    method: "POST",
+                    body: JSON.stringify({
+                      approvals: mode,
+                      workspace_write_only: scope === "workspace",
+                    }),
+                  });
+                  if (saved.agent_scope !== scope) {
+                    throw new Error("作用域未被后端应用，请重启 Qwenthin 服务后重试");
+                  }
+                  setMsg("已保存");
+                } catch (e) {
+                  setMsg(failMsg(e));
+                }
+              }}
+            >
+              保存
+            </button>
+            {msg ? <span className="sub" style={{ marginLeft: 10 }}>{msg}</span> : null}
+          </div>
         </div>
       </div>
     </div>

@@ -632,6 +632,13 @@ tr.sel td { background: var(--brand-soft); }
 .pill-btn.on { background: var(--brand-soft); border-color: transparent; color: var(--brand); }
 .pill-btn.ap-auto { background: var(--warn-soft); border-color: transparent; color: var(--warn); }
 .pill-btn.ap-yolo { background: var(--danger-soft); border-color: transparent; color: var(--danger); }
+.pill-btn.scope-global { background: var(--danger-soft); border-color: transparent; color: var(--danger); }
+
+.setting-divider { height: 1px; background: var(--border-1); margin: 18px 0 14px; }
+.scope-warning {
+  width: fit-content; margin-top: 10px; padding: 6px 9px; border-radius: 7px;
+  background: var(--danger-soft); color: var(--danger); font-size: 11px;
+}
 
 .upl-chip {
   display: inline-flex; align-items: center; gap: 6px;

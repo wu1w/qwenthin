@@ -44,6 +44,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
         channels: cfg.channels.clone(),
         channel: "sidecar".into(),
         low_precision: cfg.policy.low_precision,
+        workspace_confined: cfg.features.workspace_write_only,
         approvals: ApprovalMode::parse(&cfg.features.approvals).unwrap_or(ApprovalMode::Ask),
     });
 

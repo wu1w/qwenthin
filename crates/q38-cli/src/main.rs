@@ -491,6 +491,7 @@ fn intercept_slash(
         channels: cfg.channels.clone(),
         channel: "cli".into(),
         low_precision: cfg.policy.low_precision,
+        workspace_confined: cfg.features.workspace_write_only,
         approvals: ApprovalMode::parse(&cfg.features.approvals).unwrap_or(ApprovalMode::Ask),
     });
     let open = rpc(

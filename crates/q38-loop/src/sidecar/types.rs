@@ -168,6 +168,9 @@ pub struct SidecarOpts {
     pub channels: ChannelsConfig,
     pub channel: String,
     pub low_precision: bool,
+    /// File-tool scope for this session. False allows absolute paths outside
+    /// the selected workspace; shell/code still use the workspace as cwd.
+    pub workspace_confined: bool,
     /// From `config.toml` `[features].approvals`. Default Ask is only for tests.
     pub approvals: crate::permit::ApprovalMode,
 }
@@ -189,6 +192,7 @@ impl Default for SidecarOpts {
             channels: ChannelsConfig::default(),
             channel: "sidecar".into(),
             low_precision: false,
+            workspace_confined: true,
             approvals: crate::permit::ApprovalMode::Ask,
         }
     }
@@ -205,6 +209,7 @@ pub struct TurnSnapshot {
     pub plan_mode: bool,
     pub approvals: crate::permit::ApprovalMode,
     pub low_precision: bool,
+    pub workspace_confined: bool,
 }
 
 pub struct TurnRequest {

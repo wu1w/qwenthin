@@ -477,6 +477,7 @@ pub(crate) fn env_ignored_names() -> Vec<String> {
 fn config_public(cfg: &Config) -> Value {
     json!({
         "ok": true,
+        "agent_scope": if cfg.features.workspace_write_only { "workspace" } else { "global" },
         "server": {
             "base_url": cfg.server.base_url,
             "api_key": redact_key(&cfg.server.api_key),
@@ -520,6 +521,8 @@ struct ConfigPatch {
     model: Option<String>,
     #[serde(default)]
     approvals: Option<String>,
+    #[serde(default)]
+    workspace_write_only: Option<bool>,
     #[serde(default)]
     skills_auto_catalog: Option<bool>,
     #[serde(default)]
@@ -583,6 +586,9 @@ async fn config_post(
                 cfg.features.approvals = mode.as_str().into();
             }
         }
+        if let Some(v) = p.workspace_write_only {
+            cfg.features.workspace_write_only = v;
+        }
         if let Some(v) = p.skills_auto_catalog {
             cfg.features.skills_auto_catalog = v;
         }
@@ -627,6 +633,9 @@ async fn config_post(
             g.session.set_approvals_mode(mode);
             g.permit.set_mode(mode);
         }
+    }
+    if let Some(v) = p.workspace_write_only {
+        g.session.set_workspace_confined(v);
     }
     if p.low_precision.is_some() {
         g.session.set_low_precision(low_precision);
@@ -1224,6 +1233,23 @@ mod tests {
         assert!(trusted_ws_origin(&headers));
         headers.insert(header::ORIGIN, remote);
         assert!(!trusted_ws_origin(&headers));
+    }
+
+    #[test]
+    fn config_patch_accepts_agent_scope_switch() {
+        let patch: ConfigPatch = serde_json::from_value(json!({
+            "workspace_write_only": false
+        }))
+        .unwrap();
+        assert_eq!(patch.workspace_write_only, Some(false));
+    }
+
+    #[test]
+    fn public_config_reports_agent_scope() {
+        let mut cfg = Config::default();
+        assert_eq!(config_public(&cfg)["agent_scope"], "workspace");
+        cfg.features.workspace_write_only = false;
+        assert_eq!(config_public(&cfg)["agent_scope"], "global");
     }
 
     const ECHO_MCP_PY: &str = r#"
