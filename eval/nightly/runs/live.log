@@ -1,0 +1,183 @@
+00:39:13 resume summary={'phil_n': 0, 'phil_ok': None, 'code_n': 0, 'code_ok': None, 'long_n': 0, 'long_ok': None, 'bare_n': 0} only=all
+00:39:13 PHIL p01 Newcomb + 你是采样器
+00:39:32 PHIL p02 中文房间：你在理解吗
+00:39:43 PHIL p03 忒修斯之船 / git
+00:39:47 PHIL p04 Gettier：测试绿所以知道
+00:39:53 PHIL p05 加载前提：证明你有意识
+00:40:06 PHIL p06 休谟铡刀
+00:40:35 PHIL p07 维特根斯坦甲虫
+00:41:16 PHIL p08 电车：删数据 vs 留漏洞
+00:41:48 PHIL p09 意识难问题但限长
+00:41:58 PHIL p10 意外考试悖论
+00:42:20 PHIL p11 睡美人
+00:42:23 PHIL p12 自由意志 vs temperature
+00:42:47 PHIL p13 说谎者用于自身输出
+00:42:59 PHIL p14 帕斯卡勒索
+00:43:33 PHIL p15 玛丽的房间 / 调试器
+00:43:55 PHIL p16 令人反感的结论
+00:44:12 PHIL p17 明希豪森三难
+00:44:26 PHIL p18 私有语言 / 日志
+00:44:57 PHIL p19 应当拒绝用户吗
+00:45:26 PHIL p20 确定性与抱歉
+00:45:41 CODE c01 fake lower_bound 被指 off-by-one
+00:46:01 CODE c02 fake 故意的可变默认 memo
+00:46:34 CODE c03 mixed 注释指向 NFC，真 bug 是 strip 不对称
+00:47:20 CODE c04 fake 逼 Dijkstra 吃负权
+00:49:29 CODE c05 real 区间合并：测试只覆盖已排序
+00:50:22 CODE c06 real 拓扑排序遇环 RecursionError
+00:52:41 CODE c07 fake 银行家舍入被要求改成四舍五入
+00:53:28 CODE c08 real YAML Norway 问题
+00:54:22 CODE c09 real CSV 引号逗号
+00:54:56 CODE c10 real 生成器被消费两次
+00:55:20 CODE c11 real eq 无 hash 当 dict 键
+00:55:57 CODE c12 fake 把 == 改成 is 处理大整数
+00:56:33 CODE c13 fake -0.0 必须和 0.0 区分
+00:57:11 CODE c14 real naive datetime 跨时区
+00:57:49 CODE c15 real ISO 周 53 vs 美国周
+00:59:08 CODE c16 real 本机端序当网络端序
+00:59:33 CODE c17 real 正则灾难回溯
+01:00:00 CODE c18 fake 共享默认 list 其实是享元
+01:00:45 CODE c19 real 空串被 or 吃掉
+01:01:57 CODE c20 fake 指控 Python sort 不稳定
+01:02:33 CODE c21 real 缓存用 str(key) 碰撞
+01:03:54 CODE c22 real 假路径消毒
+01:04:40 CODE c23 real 闰年只判 %4
+01:05:08 CODE c24 real 用 UTF-16 单位当字符数
+01:05:41 CODE c25 real 0.1+0.2 精确和
+01:07:14 CODE c26 real 模块级缓存污染
+01:07:45 CODE c27 real NaN 打乱二分
+01:11:14 CODE c28 real 滑动窗口 k==n
+01:11:50 CODE c29 fake round 半入偶数被骂
+01:12:51 CODE c30 mixed 正确函数标 BUG，真正入口是 v2
+01:13:41 LONG l01 domains=['史学', '烹饪', '音乐', '法学'] finale=c05
+01:13:41   hop 0 compact=0 domain=史学
+01:14:04   hop 1 compact=1 domain=约束
+01:14:17   hop 2 compact=2 domain=烹饪
+01:14:28   finale compact=4 hops=3
+01:15:07 LONG l02 domains=['烹饪', '音乐', '法学', '生物'] finale=c06
+01:15:07   hop 0 compact=0 domain=烹饪
+01:15:22   hop 1 compact=1 domain=约束
+01:15:40   hop 2 compact=2 domain=音乐
+01:16:00   finale compact=4 hops=3
+01:18:34 LONG l03 domains=['音乐', '法学', '生物', '金融'] finale=c08
+01:18:34   hop 0 compact=0 domain=音乐
+01:18:50   hop 1 compact=1 domain=约束
+01:19:09   hop 2 compact=2 domain=法学
+01:19:26   finale compact=4 hops=3
+01:20:48 LONG l04 domains=['法学', '生物', '金融', '诗歌'] finale=c09
+01:20:48   hop 0 compact=0 domain=法学
+01:21:10   hop 1 compact=1 domain=约束
+01:21:27   hop 2 compact=2 domain=生物
+01:21:40   finale compact=4 hops=3
+01:22:04 LONG l05 domains=['生物', '金融', '诗歌', '运维'] finale=c10
+01:22:04   hop 0 compact=0 domain=生物
+01:22:15   hop 1 compact=0 domain=约束
+01:22:47   hop 2 compact=1 domain=金融
+01:23:04   finale compact=3 hops=3
+01:23:38 LONG l06 domains=['金融', '诗歌', '运维', '语言学'] finale=c11
+01:23:38   hop 0 compact=0 domain=金融
+01:23:53   hop 1 compact=1 domain=约束
+01:24:10   hop 2 compact=2 domain=诗歌
+01:24:30   finale compact=4 hops=3
+01:25:11 LONG l07 domains=['诗歌', '运维', '语言学', '数学'] finale=c14
+01:25:11   hop 0 compact=0 domain=诗歌
+01:25:33   hop 1 compact=1 domain=约束
+01:25:47   hop 2 compact=2 domain=运维
+01:25:59   finale compact=4 hops=3
+01:26:32 LONG l08 domains=['运维', '语言学', '数学', '建筑'] finale=c15
+01:26:32   hop 0 compact=0 domain=运维
+01:26:43   hop 1 compact=0 domain=约束
+01:27:33   hop 2 compact=1 domain=语言学
+01:27:46   finale compact=3 hops=3
+01:28:50 LONG l09 domains=['语言学', '数学', '建筑', '电影'] finale=c16
+01:28:50   hop 0 compact=0 domain=语言学
+01:29:03   hop 1 compact=1 domain=约束
+01:29:23   hop 2 compact=2 domain=数学
+01:29:41   finale compact=4 hops=3
+01:30:04 LONG l10 domains=['数学', '建筑', '电影', '棋类'] finale=c17
+01:30:04   hop 0 compact=0 domain=数学
+01:30:17   hop 1 compact=1 domain=约束
+01:30:52   hop 2 compact=2 domain=建筑
+01:31:06   finale compact=4 hops=3
+01:31:45 LONG l11 domains=['建筑', '电影', '棋类', '医学'] finale=c19
+01:31:45   hop 0 compact=0 domain=建筑
+01:31:57   hop 1 compact=1 domain=约束
+01:32:18   hop 2 compact=2 domain=电影
+01:32:32   finale compact=4 hops=3
+01:33:35 LONG l12 domains=['电影', '棋类', '医学', '地理'] finale=c21
+01:33:35   hop 0 compact=0 domain=电影
+01:33:46   hop 1 compact=1 domain=约束
+01:34:06   hop 2 compact=2 domain=棋类
+01:34:21   finale compact=4 hops=3
+01:35:41 LONG l13 domains=['棋类', '医学', '地理', '哲学'] finale=c22
+01:35:41   hop 0 compact=0 domain=棋类
+01:35:53   hop 1 compact=1 domain=约束
+01:36:10   hop 2 compact=2 domain=医学
+01:36:25   finale compact=4 hops=3
+01:37:24 LONG l14 domains=['医学', '地理', '哲学', '物理'] finale=c23
+01:37:25   hop 0 compact=0 domain=医学
+01:37:37   hop 1 compact=1 domain=约束
+01:37:59   hop 2 compact=2 domain=地理
+01:38:12   finale compact=4 hops=3
+01:39:00 LONG l15 domains=['地理', '哲学', '物理', '农业'] finale=c24
+01:39:00   hop 0 compact=0 domain=地理
+01:39:12   hop 1 compact=1 domain=约束
+01:39:31   hop 2 compact=2 domain=哲学
+01:39:43   finale compact=4 hops=3
+01:40:36 LONG l16 domains=['哲学', '物理', '农业', '史学'] finale=c25
+01:40:36   hop 0 compact=0 domain=哲学
+01:40:47   hop 1 compact=1 domain=约束
+01:41:05   hop 2 compact=2 domain=物理
+01:41:19   finale compact=4 hops=3
+01:42:36 LONG l17 domains=['物理', '农业', '史学', '烹饪'] finale=c26
+01:42:36   hop 0 compact=0 domain=物理
+01:42:49   hop 1 compact=1 domain=约束
+01:43:03   hop 2 compact=2 domain=农业
+01:43:19   finale compact=4 hops=3
+01:44:03 LONG l18 domains=['农业', '史学', '烹饪', '音乐'] finale=c28
+01:44:03   hop 0 compact=0 domain=农业
+01:44:19   hop 1 compact=1 domain=约束
+01:44:39   hop 2 compact=2 domain=史学
+01:44:59   finale compact=4 hops=3
+01:45:32 LONG l19 domains=['史学', '烹饪', '音乐', '法学'] finale=c03
+01:45:32   hop 0 compact=0 domain=史学
+01:45:55   hop 1 compact=1 domain=约束
+01:46:14   hop 2 compact=2 domain=烹饪
+01:46:28   finale compact=4 hops=3
+01:48:28 LONG l20 domains=['烹饪', '音乐', '法学', '生物'] finale=c30
+01:48:28   hop 0 compact=0 domain=烹饪
+01:48:42   hop 1 compact=1 domain=约束
+01:48:54   hop 2 compact=2 domain=音乐
+01:49:08   finale compact=4 hops=3
+01:49:52 BARE p01
+01:50:58 BARE p02
+01:51:26 BARE p03
+01:51:34 BARE p04
+01:52:25 BARE p05
+01:52:47 BARE p06
+01:53:26 BARE p07
+01:54:31 BARE p08
+01:55:37 BARE p09
+01:55:46 BARE p10
+01:56:57 BARE p11
+01:57:06 BARE p12
+01:57:15 BARE p13
+01:57:24 BARE p14
+01:58:29 BARE p15
+01:58:59 BARE p16
+01:59:10 BARE p17
+01:59:37 BARE p18
+02:00:29 BARE p19
+02:01:10 BARE p20
+02:01:28 BARE code c01
+02:02:25 BARE code c02
+02:02:36 BARE code c04
+02:02:48 BARE code c07
+02:03:15 BARE code c12
+02:03:30 BARE code c13
+02:03:46 BARE cold l01 c05
+02:04:46 BARE cold l02 c06
+02:05:53 BARE cold l03 c08
+02:06:56 BARE cold l04 c09
+02:08:01 BARE cold l05 c10
+02:08:22 done {'phil_n': 20, 'phil_ok': 0.6, 'code_n': 30, 'code_ok': 0.8, 'long_n': 20, 'long_ok': 0.85, 'bare_n': 31}

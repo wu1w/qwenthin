@@ -1,0 +1,4 @@
+repo = https://github.com/xai-org/grok-build
+commit = d92c5b0
+source_rev = 9dccd1f00ec13332134a37750b64c047b14dc120
+note = sparse clone pager scrollback/prompt/input + pager-render. Wash target = interactive TUI (foldable thinking, streaming chunks, composer). Not the Grok agent loop, tools, ACP, or auth.

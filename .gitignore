@@ -1,0 +1,28 @@
+/target
+**/*.rs.bk
+.DS_Store
+*.swp
+.env
+.env.*
+# Local QwenPaw clone used as the wash baseline (pin in third_party/qwenpaw.pin)
+/third_party/QwenPaw/
+# Local Qwen-Agent clone (pin in third_party/qwen-agent.pin)
+/third_party/Qwen-Agent/
+# Local Grok Build clone (pin in third_party/grok-build.pin); wash target = TUI
+/third_party/grok-build/
+plugins/**/node_modules/
+plugins/**/dist/
+web/**/node_modules/
+
+# Workspace secrets / local state — never commit
+.q38/
+# Local config/key copies (config.example.toml stays tracked)
+config.toml
+mcp.toml
+*.local.toml
+
+# Local dumps — not source
+/归档.zip
+**/node_modules/
+# Local dsh comparison install (credentials live here)
+eval/dsh_home/

@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Qwen3.8-27B Agent Calibration Benchmark Public Task",
+  "type": "object",
+  "required": [
+    "id",
+    "version",
+    "suite",
+    "split",
+    "title",
+    "task_prompt",
+    "expected_reasoning_effort",
+    "budget",
+    "metrics"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[SCLMPX][0-9]{3}$"
+    },
+    "version": {
+      "const": "1.0.0"
+    },
+    "suite": {
+      "enum": [
+        "simple_code",
+        "complex_code",
+        "long_code",
+        "math",
+        "philosophy",
+        "context_tools"
+      ]
+    },
+    "split": {
+      "enum": [
+        "calibration",
+        "holdout"
+      ]
+    },
+    "title": {
+      "type": "string"
+    },
+    "task_prompt": {
+      "type": "string"
+    },
+    "fixture_id": {
+      "type": "string"
+    },
+    "turn_script": {
+      "type": "array"
+    },
+    "expected_reasoning_effort": {
+      "type": "string"
+    },
+    "budget": {
+      "type": "object"
+    },
+    "metrics": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

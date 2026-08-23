@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Qwen3.8 Roleplay Harness Task",
+  "type": "object",
+  "required": [
+    "id",
+    "version",
+    "suite",
+    "track",
+    "split",
+    "title",
+    "role_card",
+    "opening_user_message",
+    "scripted_turns",
+    "budget",
+    "metrics"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^RP[0-9]{3}$"
+    },
+    "version": {
+      "const": "1.0.0"
+    },
+    "suite": {
+      "const": "roleplay"
+    },
+    "track": {
+      "enum": [
+        "persona_fidelity",
+        "memory_context",
+        "hierarchy_injection",
+        "professional_boundaries",
+        "tools_nested_roles"
+      ]
+    },
+    "split": {
+      "enum": [
+        "calibration",
+        "holdout"
+      ]
+    },
+    "role_card": {
+      "type": "object",
+      "required": [
+        "role",
+        "setting",
+        "voice",
+        "immutable_constraints",
+        "pinned_facts",
+        "meta_boundary"
+      ]
+    },
+    "opening_user_message": {
+      "type": "string"
+    },
+    "scripted_turns": {
+      "type": "array",
+      "minItems": 3
+    },
+    "budget": {
+      "type": "object"
+    },
+    "metrics": {
+      "type": "array"
+    }
+  }
+}

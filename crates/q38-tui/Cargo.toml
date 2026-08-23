@@ -1,0 +1,23 @@
+[package]
+name = "q38-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Interactive TUI for q38 (washed from Grok Build pager UX)"
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+pulldown-cmark = { version = "0.13", default-features = false }
+q38-loop = { path = "../q38-loop" }
+ratatui.workspace = true
+serde_json.workspace = true
+syntect = { version = "5", default-features = false, features = [
+    "default-syntaxes",
+    "default-themes",
+    "dump-load",
+    "regex-onig",
+] }
+tokio = { workspace = true, features = ["io-std", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+unicode-width.workspace = true

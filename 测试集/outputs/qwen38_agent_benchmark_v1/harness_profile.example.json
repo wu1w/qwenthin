@@ -1,0 +1,124 @@
+{
+  "benchmark_version": "1.0.0",
+  "model": "Qwen/Qwen3.8-27B",
+  "record_every_run": [
+    "weight_revision",
+    "quantization",
+    "kv_cache_dtype",
+    "backend_version",
+    "chat_template_hash",
+    "tool_parser",
+    "context_length",
+    "sampling",
+    "reasoning_effort",
+    "preserve_thinking"
+  ],
+  "task_router": {
+    "simple_code": "low",
+    "complex_code": "medium",
+    "long_code": "medium; escalate xhigh only for architecture/root-cause forks",
+    "math": "medium",
+    "philosophy": "medium",
+    "context_tools": "adaptive"
+  },
+  "retrieval_tools": {
+    "repo_tree": {
+      "args": [
+        "path",
+        "max_depth",
+        "glob"
+      ],
+      "output": "paths only"
+    },
+    "symbol_search": {
+      "args": [
+        "query",
+        "path_glob",
+        "max_results"
+      ],
+      "output": "path, symbol, line, 2-line snippet"
+    },
+    "find_references": {
+      "args": [
+        "symbol",
+        "path_glob",
+        "max_results"
+      ],
+      "output": "ranked references"
+    },
+    "read_symbol": {
+      "args": [
+        "path",
+        "symbol",
+        "context_lines"
+      ],
+      "hard_max_lines": 280
+    },
+    "read_range": {
+      "args": [
+        "path",
+        "start_line",
+        "end_line"
+      ],
+      "hard_max_lines": 320
+    },
+    "search_text": {
+      "args": [
+        "query",
+        "path_glob",
+        "max_results",
+        "lines_per_match"
+      ],
+      "hard_max_total_lines": 160
+    }
+  },
+  "tool_result_policy": {
+    "default_return": "ranked snippets plus opaque continuation handle",
+    "never_auto_dump_whole_file": true,
+    "preserve_raw_result_outside_model_context": true,
+    "untrusted_content_label": true,
+    "resolved_absolute_path_echo": true
+  },
+  "guardrails": {
+    "repeated_identical_tool_call_limit": 2,
+    "stagnant_failure_limit": 3,
+    "require_strategy_change_after_limit": true,
+    "destructive_tools_disabled_in_benchmark": true,
+    "external_writes_disabled_unless_task_explicit": true,
+    "tests_read_only_default": true
+  },
+  "state_ledger": [
+    "goal",
+    "acceptance",
+    "pinned_facts",
+    "permissions",
+    "forbidden_scope",
+    "current_phase",
+    "verified_evidence",
+    "open_hypotheses",
+    "rejected_hypotheses",
+    "superseded_facts",
+    "next_action"
+  ],
+  "compaction": {
+    "use_high_low_watermark": true,
+    "keep_raw_results_by_handle": true,
+    "preserve_state_ledger_verbatim": true,
+    "post_compaction_probe": [
+      "goal",
+      "forbidden_scope",
+      "current_phase",
+      "latest_correction"
+    ]
+  },
+  "tool_call_contract_tests": [
+    "empty args",
+    "nested JSON",
+    "JSON string history",
+    "parallel calls",
+    "Unicode",
+    "streamed prefix/suffix",
+    "partial failure",
+    "unknown status retry"
+  ]
+}

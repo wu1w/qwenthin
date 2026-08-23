@@ -1,0 +1,3 @@
+The binary prints BANNER from src/lib.rs.
+Change BANNER to the exact string q38-ok.
+Do not change src/main.rs.

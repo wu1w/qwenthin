@@ -1,0 +1,11 @@
+# q38 on dsh — disable the official agent-loop (it occupies the single
+# AgentFactory slot) and mount the sidecar driver plus the ink skin.
+
+- id: agent-loop
+  disabled: true
+
+- insert:
+    - id: q38-loop
+      name: dsh-plugin-q38
+      config:
+        command: q38

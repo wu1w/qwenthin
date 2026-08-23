@@ -1,0 +1,9 @@
+{
+  "phil_n": 20,
+  "phil_ok": 0.6,
+  "code_n": 30,
+  "code_ok": 0.8,
+  "long_n": 20,
+  "long_ok": 0.85,
+  "bare_n": 31
+}

@@ -1,0 +1,5 @@
+Read this note first.
+
+src/main.rs currently prints old. Change it so the program prints new.
+The println! argument must be exactly new. After the edit, src/main.rs must
+contain println!("new") and must not contain old.

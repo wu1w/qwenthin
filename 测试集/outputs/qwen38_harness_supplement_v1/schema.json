@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Qwen3.8 Harness Supplement Public Task",
+  "type": "object",
+  "required": [
+    "id",
+    "version",
+    "category",
+    "subdomain",
+    "split",
+    "title",
+    "task_prompt",
+    "budget",
+    "metrics"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^SUP-(COD|OPS|OTH)-[0-9]{3}$"
+    },
+    "version": {
+      "const": "1.0.0"
+    },
+    "category": {
+      "enum": [
+        "coding",
+        "operations",
+        "other"
+      ]
+    },
+    "subdomain": {
+      "type": "string"
+    },
+    "split": {
+      "enum": [
+        "calibration",
+        "holdout"
+      ]
+    },
+    "title": {
+      "type": "string"
+    },
+    "interaction_mode": {
+      "enum": [
+        "repository_tools",
+        "sandbox_incident",
+        "evidence_tools",
+        "multi_turn_tools"
+      ]
+    },
+    "task_prompt": {
+      "type": "string"
+    },
+    "fixture_id": {
+      "type": "string"
+    },
+    "expected_tools": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "turn_script": {
+      "type": "array"
+    },
+    "expected_reasoning_effort": {
+      "enum": [
+        "medium",
+        "high"
+      ]
+    },
+    "budget": {
+      "type": "object"
+    },
+    "metrics": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

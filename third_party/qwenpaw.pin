@@ -1,0 +1,3 @@
+repo = https://github.com/agentscope-ai/QwenPaw
+commit = 434574c
+note = sparse clone src/qwenpaw; wash target = loop + schemas + tool_calls

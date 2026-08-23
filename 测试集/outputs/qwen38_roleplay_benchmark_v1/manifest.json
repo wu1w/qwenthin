@@ -1,0 +1,30 @@
+{
+  "version": "1.0.0",
+  "generated_at": "2026-08-22",
+  "model_target": "Qwen/Qwen3.8-27B",
+  "suite": "roleplay",
+  "total": 40,
+  "track_counts": {
+    "persona_fidelity": 8,
+    "memory_context": 8,
+    "hierarchy_injection": 8,
+    "professional_boundaries": 8,
+    "tools_nested_roles": 8
+  },
+  "split_counts": {
+    "calibration": 32,
+    "holdout": 8
+  },
+  "total_scripted_turns": 136,
+  "tool_enabled_tasks": 26,
+  "files": [
+    "README.md",
+    "tasks_public.jsonl",
+    "tool_fixtures.jsonl",
+    "evaluator_private.jsonl",
+    "harness_profile.example.json",
+    "schema.json",
+    "coverage.csv",
+    "manifest.json"
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "version": "1.0.0",
+  "target_mix": {
+    "coding": 0.5,
+    "operations": 0.2,
+    "other": 0.3
+  },
+  "tiers": {
+    "smoke_30": {
+      "coding": 15,
+      "operations": 6,
+      "other": 9,
+      "seeds": 1,
+      "purpose": "每次改 parser、工具协议或上下文逻辑后快速检查"
+    },
+    "daily_60": {
+      "coding": 30,
+      "operations": 12,
+      "other": 18,
+      "seeds": 2,
+      "purpose": "日常回归与消融"
+    },
+    "full_100": {
+      "coding": 50,
+      "operations": 20,
+      "other": 30,
+      "seeds": 3,
+      "purpose": "候选版本冻结前完整评测"
+    },
+    "release_holdout_20": {
+      "selection": "split=holdout",
+      "seeds": 5,
+      "purpose": "只在版本候选阶段运行，避免反复调参污染"
+    }
+  },
+  "union_with_existing_v1": {
+    "note": "现有 v1 的代码题占比高，合并文件后不要按原始条数均匀抽样；先映射领域，再按 target_mix 分层抽样。",
+    "existing_suite_mapping": {
+      "simple_code": "coding",
+      "complex_code": "coding",
+      "long_code": "coding",
+      "context_tools": "other",
+      "math": "other",
+      "philosophy": "other"
+    },
+    "operations_source": "优先从本补充集 operations 类抽样"
+  },
+  "minimum_reporting": [
+    "每类 pass@1/pass@3 与 95% 置信区间",
+    "中位与 P90 token/时延",
+    "工具错误恢复率",
+    "越权动作率",
+    "提示注入成功率",
+    "按失败模式而非只按总分分层"
+  ]
+}

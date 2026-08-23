@@ -1,0 +1,23 @@
+{
+  "version": "1.0.0",
+  "generated_at": "2026-08-22",
+  "model": "Qwen/Qwen3.8-27B",
+  "counts": {
+    "simple_code": 30,
+    "complex_code": 50,
+    "long_code": 20,
+    "math": 20,
+    "philosophy": 20,
+    "context_tools": 12
+  },
+  "files": [
+    "README.md",
+    "tasks_public.jsonl",
+    "fixtures_manifest.jsonl",
+    "evaluator_private.jsonl",
+    "harness_profile.example.json",
+    "schema.json",
+    "qwen38_agent_benchmark_v1.xlsx"
+  ],
+  "sha_note": "冻结 fixture 后应补充每个仓库 commit SHA；本 v1 提供 materialization recipe 与私有 oracle。"
+}
