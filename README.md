@@ -8,6 +8,7 @@
 
 - Rust依赖（`rustup`）
 - 一个 OpenAI 兼容端点：llama.cpp `llama-server`、vLLM、SGLang、Ollama `/v1`，或远程网关
+- Windows用户尽量安装一个gitbash和powershell 7
 
 
 ## 三步跑起来
