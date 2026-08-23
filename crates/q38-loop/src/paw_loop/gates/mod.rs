@@ -9,7 +9,7 @@ mod tool_budget;
 pub use budget::BudgetGate;
 pub use doom::{DoomLoopGate, DoomStage, REPEAT_NOTE};
 pub use iteration::IterationGate;
-pub use lossy::{fs_tool_path, NameStreakGate, PathLoopGate};
+pub use lossy::{fs_tool_path, NameStreakGate, PathLoopGate, NAME_NOTE, PATH_NOTE};
 pub use timeout::TimeoutGate;
 pub use token_budget::TokenBudgetGate;
 pub use tool_budget::{ToolCallBudgetGate, LOSSY_TOOL_BUDGET};
@@ -101,6 +101,8 @@ impl Gate {
     pub fn continuation(&self, session_id: &str) -> String {
         match self {
             Self::DoomLoop(g) => g.continuation(session_id),
+            Self::NameStreak(g) => g.continuation(session_id),
+            Self::PathLoop(g) => g.continuation(session_id),
             _ => String::new(),
         }
     }

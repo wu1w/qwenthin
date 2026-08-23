@@ -886,16 +886,14 @@ mod tests {
         // SSE watchdog should drop the body near 64 tokens (~250 chars). A
         // 800-char think on a single step means the box returned JSON, not SSE.
         assert!(
-            max_think < 800 || out.steps >= 2 || out.stop_reason.as_deref() == Some("budget:think"),
+            max_think < 800 || out.steps >= 2,
             "think ran past the cap without a bounded retry: think_chars={max_think} text={} reason={:?}",
             out.text,
             out.stop_reason
         );
         assert!(
-            out.text.to_lowercase().contains("done")
-                || out.stop_reason.as_deref() == Some("budget:think")
-                || out.steps >= 2,
-            "watchdog path produced neither a model retry nor budget:think: text={} reason={:?}",
+            out.text.to_lowercase().contains("done") || out.steps >= 2,
+            "watchdog path produced neither a model retry nor a quiet finish: text={} reason={:?}",
             out.text,
             out.stop_reason
         );
@@ -945,21 +943,25 @@ mod tests {
             .unwrap_or("")
             .to_ascii_lowercase()
             .contains("doom");
-        if reads >= 6 {
+        if reads >= 3 {
+            let notes = hidden
+                .iter()
+                .filter(|c| c.contains(crate::paw_loop::REPEAT_NOTE))
+                .count();
             assert!(
-                halted,
-                "repeated the same read {reads} times without doom halt: hidden={hidden:?} reason={:?} text={}",
+                notes >= 1,
+                "looped reads={reads} without a repeat observation: hidden={hidden:?} reason={:?} text={}",
                 out.stop_reason,
                 out.text
             );
             assert!(
-                !hidden
-                    .iter()
-                    .any(|c| c.contains("Repetitive pattern") || c.contains("different approach")),
-                "doom must not lecture the model: hidden={hidden:?}"
+                !halted,
+                "repeat detector must not halt: hidden={hidden:?} reason={:?} text={}",
+                out.stop_reason,
+                out.text
             );
         } else {
-            eprintln!("  (27B did not loop; doom path not exercised live. unit covers halt.)");
+            eprintln!("  (27B did not loop; doom path not exercised live. unit covers the note.)");
         }
         let _ = std::fs::remove_dir_all(dir);
     }

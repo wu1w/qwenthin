@@ -1,13 +1,13 @@
 //! Cheap stutter / restatement detectors. The model never sees these.
 //!
-//! JSONL `stop.reason` uses [`STOP_STUTTER`]. Dump-like hops receive a soft
-//! trajectory note instead of a harness stop.
-//! `python3 scripts/stop_reasons.py`.
+//! Lossy stutter and dump-like hops receive a soft trajectory note instead of
+//! a harness stop. `python3 scripts/stop_reasons.py`.
 
 use std::collections::HashSet;
 
-/// Lossy text stutter. Distinct from dump-hop so JSONL can attribute fires.
-pub const STOP_STUTTER: &str = "budget:repeat:stutter";
+/// Lossy text stutter. One hidden observation, then the model decides.
+pub const STUTTER_NOTE: &str = "[trajectory] 可见输出在原地重复。\
+收束成一句结论，或改做能产生新证据的下一步。";
 /// A repeated visible answer plus scratch-file/cleanup activity is usually a
 /// sign that the trajectory is wandering. Give that observation back to the
 /// model and let it choose; the placeholder-write tool guard still prevents a

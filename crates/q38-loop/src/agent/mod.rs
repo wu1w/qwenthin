@@ -9,7 +9,10 @@
 //!    lecture; empty Continue is treated as Stop.
 //!
 //! Parse failures and think-cap hits retry the same messages (kwargs only).
-//! Doom-loop halt is a harness stop, not a hidden user warning.
+//! Trajectory detectors (doom / name / path / stutter / dump) inject one
+//! hidden observation and then stay silent. Step, time, and context budgets
+//! get the same treatment: one wrap-up hop, then a quiet finish that keeps
+//! the last spoken text. User abort is the only user-visible stop reason.
 //! `ThinkPolicy` kwargs stay frozen for the turn except an ephemeral no-tool
 //! think clip, watchdog restore, and a same-session auto-upgrade. A later
 //! clean step drops back to the turn baseline.
@@ -374,6 +377,12 @@ pub struct Agent<C> {
     narrate: bool,
     /// Workspace FTS for `search`. Built at session start; refreshed on write/edit.
     code_index: Option<CodeIndex>,
+    /// Lossy stutter already received one hidden observation this user turn.
+    stutter_nudged: bool,
+    /// Physics cap (steps / wall / context / tool budget) already got a wrap-up hop.
+    physics_nudged: bool,
+    /// Parse-fail cap already got one repair observation.
+    parse_nudged: bool,
 }
 
 impl<C: Completer> Agent<C> {
@@ -537,6 +546,9 @@ impl<C: Completer> Agent<C> {
             edit_guard: guard::EditGuard::new(),
             narrate: opts.narrate && !opts.print && interactive_channel(&opts.channel),
             code_index,
+            stutter_nudged: false,
+            physics_nudged: false,
+            parse_nudged: false,
         })
     }
 
@@ -604,6 +616,9 @@ impl<C: Completer> Agent<C> {
         // Agent each RPC, but in-process reuse (TUI, soak, channels) must not
         // inherit iteration/timeout/doom from the previous prompt.
         self.handler.reset_turn(&self.session_id);
+        self.stutter_nudged = false;
+        self.physics_nudged = false;
+        self.parse_nudged = false;
         self.last_spoken = None;
         self.read_paths.clear();
         self.observed_paths = observed_from_messages(&self.messages, &self.workspace);
@@ -623,14 +638,24 @@ impl<C: Completer> Agent<C> {
             }
             // QwenPaw: pending gate TERMINATE fires before the next model call.
             if let Some(reason) = self.pending_stop.take() {
-                self.note(&reason);
                 let text = self.last_spoken.clone().unwrap_or_default();
+                if reason.is_empty() || is_physics_stop(&reason) {
+                    if !reason.is_empty() {
+                        self.note(&reason);
+                    }
+                    return self.finish(text, None, steps);
+                }
+                self.note(&reason);
                 return self.finish(text, Some(reason), steps);
             }
 
             if let Some(reason) = self.compact_if_needed() {
                 self.note(&reason);
-                return self.finish(String::new(), Some(reason), steps);
+                if self.physics_nudged {
+                    return self.finish(self.last_spoken.clone().unwrap_or_default(), None, steps);
+                }
+                self.physics_nudged = true;
+                self.push_hidden_user(PHYSICS_WRAP_NOTE);
             }
 
             let tools_owned = self.tools.clone();
@@ -662,12 +687,18 @@ impl<C: Completer> Agent<C> {
                         steps += 1;
                         prompt_tokens += t.prompt_tokens;
                         completion_tokens += t.completion_tokens;
-                        turn = t;
+                        if !t.watchdog_hit
+                            || !t.content.is_empty()
+                            || !t.tool_calls.is_empty()
+                        {
+                            turn = t;
+                        }
                     }
-                    None => {
-                        self.note("budget:think");
-                        return self.finish(String::new(), Some("budget:think".into()), steps);
-                    }
+                    None => {}
+                }
+                if turn.watchdog_hit && turn.content.is_empty() && turn.tool_calls.is_empty() {
+                    self.mark_clean();
+                    return self.finish(self.last_spoken.clone().unwrap_or_default(), None, steps);
                 }
             }
 
@@ -681,7 +712,12 @@ impl<C: Completer> Agent<C> {
                 parse_retries += 1;
                 self.note("[parse] retry");
                 if parse_retries >= self.parse_stop_after {
-                    return self.finish(String::new(), Some("parse failed".into()), steps);
+                    if !self.parse_nudged {
+                        self.parse_nudged = true;
+                        self.push_hidden_user(PARSE_REPAIR_NOTE);
+                        continue;
+                    }
+                    return self.finish(self.last_spoken.clone().unwrap_or_default(), None, steps);
                 }
                 continue;
             }
@@ -690,11 +726,11 @@ impl<C: Completer> Agent<C> {
                 turn.content = strip_greeting_echo(self.last_real_user(), &turn.content);
             }
             if self.low_precision && crate::stutter::is_stutter(&turn.content, &turn.reasoning) {
-                return self.finish(
-                    String::new(),
-                    Some(crate::stutter::STOP_STUTTER.into()),
-                    steps,
-                );
+                if !self.stutter_nudged {
+                    self.stutter_nudged = true;
+                    self.push_hidden_user(crate::stutter::STUTTER_NOTE);
+                    continue;
+                }
             }
             if let Some(body) = Self::promote_write_reply(&turn) {
                 turn.content = body;
@@ -720,10 +756,20 @@ impl<C: Completer> Agent<C> {
 
             if !turn.tool_calls.is_empty() {
                 // Defer TERMINATE until after this tool batch. A gate Continue
-                // with text is the doom warn stage: one hidden fact after the
-                // batch's results, one hop before the halt stage stops the turn.
+                // with text is a one-shot trajectory observation after the
+                // batch's results; later repeats stay silent.
                 let mut gate_note = None;
                 match &decision {
+                    GateDecision::Stop { reason } if is_physics_stop(reason) => {
+                        if !self.physics_nudged {
+                            self.physics_nudged = true;
+                            self.note(reason);
+                            gate_note = Some(PHYSICS_WRAP_NOTE.to_string());
+                        } else {
+                            self.note(reason);
+                            self.pending_stop = Some(String::new());
+                        }
+                    }
                     GateDecision::Stop { reason } if !reason.is_empty() => {
                         self.pending_stop = Some(reason.clone());
                     }
@@ -766,6 +812,10 @@ impl<C: Completer> Agent<C> {
                 }
                 GateDecision::Stop { reason } => {
                     self.mark_clean();
+                    if is_physics_stop(&reason) {
+                        self.note(&reason);
+                        return self.finish(turn.content, None, steps);
+                    }
                     let stop_reason = if reason.is_empty() {
                         None
                     } else {
@@ -2163,6 +2213,22 @@ const NO_TOOL_ANSWER_RESERVE: u32 = 4096;
 const THINK_DIVERGENCE_NOTE: &str = "[trajectory] 本轮思考已触及长度预算，可能开始发散。\
 先压缩当前已知事实和未决问题；若证据已足够就作答或执行，若仍缺关键证据只补最小的一步。";
 
+/// One wrap-up hop when a physics cap would otherwise tombstone the turn.
+const PHYSICS_WRAP_NOTE: &str = "[trajectory] 本轮已接近步数、时间或上下文上限。\
+用已有证据收束成对用户可见的结论，不要再开新的工具循环。";
+
+/// One repair hop after the parse-fail retry budget is spent.
+const PARSE_REPAIR_NOTE: &str = "[trajectory] 上一跳工具调用未能解析。\
+改用完整原生 tool call，或直接给出可见结论。";
+
+fn is_physics_stop(reason: &str) -> bool {
+    reason.starts_with("budget:context")
+        || reason.contains("Max iterations")
+        || reason.contains("time limit")
+        || reason.contains("Token budget")
+        || reason.contains("call budget")
+}
+
 /// Real ripgrep hits kept live when the dump is also folded into index spans.
 const SEARCH_HEAD_LINES: usize = 12;
 
@@ -2913,6 +2979,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn physics_step_cap_wraps_then_keeps_spoken_text() {
+        let dir = std::env::temp_dir().join(format!("q38-wrap-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.max_steps = 2;
+        o.peripheral = false;
+        let ping = json!({"path": "ping.txt"});
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("read", ping.clone()),
+                turn_tool("read", ping.clone()),
+                turn_text("wrapped up"),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("read ping.txt").await.unwrap();
+        assert_eq!(out.text, "wrapped up");
+        assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
+        let hidden: Vec<_> = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.clone().unwrap_or_default())
+            .filter(|c| crate::template::is_hidden_user_text(c))
+            .collect();
+        let notes = hidden
+            .iter()
+            .filter(|c| c.contains(PHYSICS_WRAP_NOTE))
+            .count();
+        assert_eq!(notes, 1, "physics wrap lands once: {hidden:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn steer_injects_after_tool_round() {
         let dir = std::env::temp_dir().join(format!("q38-steer-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3478,13 +3580,20 @@ mod tests {
         };
         let mut agent = Agent::new(scripted, o).unwrap();
         let out = agent.run("hi").await.unwrap();
-        assert!(out.stop_reason.unwrap().starts_with("budget:context"));
+        assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
+        assert_eq!(out.text, "should not run");
+        assert!(out.steps >= 1);
+        let hidden: Vec<_> = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.clone().unwrap_or_default())
+            .filter(|c| crate::template::is_hidden_user_text(c))
+            .collect();
         assert!(
-            out.text.is_empty(),
-            "harness stop must not be the reply: {}",
-            out.text
+            hidden.iter().any(|c| c.contains(PHYSICS_WRAP_NOTE)),
+            "context cap should wrap, not tombstone: {hidden:?}"
         );
-        assert_eq!(out.steps, 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3531,11 +3640,9 @@ mod tests {
         };
         let mut agent = Agent::new(scripted, o).unwrap();
         let out = agent.run("hi").await.unwrap();
-        assert!(
-            out.stop_reason.unwrap().starts_with("budget:context"),
-            "hard window is still the fail path when compact cannot shrink"
-        );
-        assert_eq!(out.steps, 0);
+        assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
+        assert_eq!(out.text, "should not run");
+        assert!(out.steps >= 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3722,8 +3829,8 @@ mod tests {
         let seen = watch.seen.clone();
         let mut agent = Agent::new(watch, opts(&dir)).unwrap();
         let out = agent.run("hi").await.unwrap();
-        assert_eq!(out.text, "");
-        assert_eq!(out.stop_reason.as_deref(), Some("budget:think"));
+        assert!(out.text.is_empty(), "{}", out.text);
+        assert_eq!(out.stop_reason, None);
         let seen = seen.lock().expect("seen").clone();
         assert_eq!(
             seen.iter().filter(|p| !p.enabled).count(),
@@ -3816,7 +3923,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watchdog_second_failure_is_budget_think() {
+    async fn watchdog_second_empty_cap_ends_quietly() {
         let dir = std::env::temp_dir().join(format!("q38-agent-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let scripted = Scripted {
@@ -3828,13 +3935,13 @@ mod tests {
         };
         let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
         let out = agent.run("hi").await.unwrap();
-        assert_eq!(out.stop_reason.as_deref(), Some("budget:think"));
+        assert_eq!(out.stop_reason, None);
         assert!(out.text.is_empty(), "{}", out.text);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn doom_halts_on_repeated_tools() {
+    async fn doom_warns_once_then_lets_model_stop() {
         let dir = std::env::temp_dir().join(format!("q38-agent-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
@@ -3850,7 +3957,7 @@ mod tests {
                 turn_tool("read", ping.clone()),
                 turn_tool("read", ping.clone()),
                 turn_tool("read", ping.clone()),
-                turn_text("should-not-run"),
+                turn_text("wrapped up"),
             ])),
             meter: false,
         };
@@ -3863,27 +3970,15 @@ mod tests {
             .map(|m| m.content.clone().unwrap_or_default())
             .filter(|c| crate::template::is_hidden_user_text(c))
             .collect();
+        assert_eq!(out.text, "wrapped up");
         assert!(
-            hidden
-                .iter()
-                .all(|c| !c.contains("Repetitive pattern") && !c.contains("different approach")),
-            "doom must halt in the harness, not lecture the model: {hidden:?}"
-        );
-        assert!(
-            out.stop_reason
+            !out.stop_reason
                 .as_deref()
                 .unwrap_or("")
                 .contains("Doom loop"),
-            "halt after 6 identical calls: text={} reason={:?}",
-            out.text,
+            "{:?}",
             out.stop_reason
         );
-        assert!(
-            !out.text.contains("Doom") && !out.text.contains("budget:"),
-            "doom must not become the assistant reply: {}",
-            out.text
-        );
-        assert_ne!(out.text, "should-not-run");
         let warns = hidden
             .iter()
             .filter(|c| c.contains(crate::paw_loop::REPEAT_NOTE))
@@ -4766,7 +4861,7 @@ is byte-stable and tools stay frozen. Wiring of skills and mcp is a hidden-card 
     }
 
     #[tokio::test]
-    async fn lossy_doom_halts_on_second_repeat() {
+    async fn lossy_doom_notes_once_then_lets_model_stop() {
         let dir = std::env::temp_dir().join(format!("q38-lossy-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
@@ -4779,21 +4874,33 @@ is byte-stable and tools stay frozen. Wiring of skills and mcp is a hidden-card 
             turns: Mutex::new(VecDeque::from([
                 turn_tool("read", ping.clone()),
                 turn_tool("read", ping.clone()),
-                turn_text("should-not-run"),
+                turn_text("wrapped up"),
             ])),
             meter: false,
         };
         let mut agent = Agent::new(scripted, o).unwrap();
         let out = agent.run("read ping.txt").await.unwrap();
+        assert_eq!(out.text, "wrapped up");
         assert!(
-            out.stop_reason
+            !out.stop_reason
                 .as_deref()
                 .unwrap_or("")
                 .contains("Doom loop"),
-            "lossy halt after 2 repeats: {:?}",
+            "{:?}",
             out.stop_reason
         );
-        assert_ne!(out.text, "should-not-run");
+        let hidden: Vec<_> = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.clone().unwrap_or_default())
+            .filter(|c| crate::template::is_hidden_user_text(c))
+            .collect();
+        let warns = hidden
+            .iter()
+            .filter(|c| c.contains(crate::paw_loop::REPEAT_NOTE))
+            .count();
+        assert_eq!(warns, 1, "repeat fact lands exactly once: {hidden:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4901,9 +5008,9 @@ is byte-stable and tools stay frozen. Wiring of skills and mcp is a hidden-card 
     }
 
     #[tokio::test]
-    async fn lossy_same_path_edits_halt_at_three() {
-        // 新语义下 read 分页不再触发 Path loop（一字不差的重读由 doom
-        // halt@2 先接管），Path loop 仍看守同路径连续 edit/write。
+    async fn lossy_same_path_edits_note_once_then_continue() {
+        // 分页 read 不算 Path loop；一字不差的重读由 doom 观察。
+        // 同路径连续 edit/write 只注入一次轨迹观察，然后交给模型。
         let dir = std::env::temp_dir().join(format!("q38-path-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
@@ -4926,21 +5033,33 @@ is byte-stable and tools stay frozen. Wiring of skills and mcp is a hidden-card 
                     "edit",
                     json!({"path": "ping.txt", "old_string": "p2", "new_string": "p3"}),
                 ),
-                turn_text("should-not-run"),
+                turn_text("wrapped up"),
             ])),
             meter: false,
         };
         let mut agent = Agent::new(scripted, o).unwrap();
         let out = agent.run("edit ping").await.unwrap();
+        assert_eq!(out.text, "wrapped up");
         assert!(
-            out.stop_reason
+            !out.stop_reason
                 .as_deref()
                 .unwrap_or("")
                 .contains("Path loop"),
             "{:?}",
             out.stop_reason
         );
-        assert_ne!(out.text, "should-not-run");
+        let hidden: Vec<_> = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.clone().unwrap_or_default())
+            .filter(|c| crate::template::is_hidden_user_text(c))
+            .collect();
+        let notes = hidden
+            .iter()
+            .filter(|c| c.contains(crate::paw_loop::PATH_NOTE))
+            .count();
+        assert_eq!(notes, 1, "path fact lands exactly once: {hidden:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4970,7 +5089,7 @@ is byte-stable and tools stay frozen. Wiring of skills and mcp is a hidden-card 
     }
 
     #[tokio::test]
-    async fn lossy_stutter_stops_before_push() {
+    async fn lossy_stutter_notes_once_then_model_continues() {
         let dir =
             std::env::temp_dir().join(format!("q38-stutter-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4978,24 +5097,28 @@ is byte-stable and tools stay frozen. Wiring of skills and mcp is a hidden-card 
         o.peripheral = false;
         o.low_precision = true;
         let scripted = Scripted {
-            turns: Mutex::new(VecDeque::from([turn_text("x\nx\nx\nx\n")])),
+            turns: Mutex::new(VecDeque::from([
+                turn_text("x\nx\nx\nx\n"),
+                turn_text("ok"),
+            ])),
             meter: false,
         };
         let mut agent = Agent::new(scripted, o).unwrap();
         let out = agent.run("hi").await.unwrap();
-        assert_eq!(
-            out.stop_reason.as_deref(),
-            Some(crate::stutter::STOP_STUTTER)
-        );
-        assert!(out.text.is_empty(), "{}", out.text);
-        assert_eq!(
-            agent
-                .messages
-                .iter()
-                .filter(|m| m.role == "assistant")
-                .count(),
-            0
-        );
+        assert_eq!(out.text, "ok");
+        assert_eq!(out.stop_reason, None);
+        let hidden: Vec<_> = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.clone().unwrap_or_default())
+            .filter(|c| crate::template::is_hidden_user_text(c))
+            .collect();
+        let notes = hidden
+            .iter()
+            .filter(|c| c.contains(crate::stutter::STUTTER_NOTE))
+            .count();
+        assert_eq!(notes, 1, "stutter fact lands exactly once: {hidden:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5016,8 +5139,20 @@ is byte-stable and tools stay frozen. Wiring of skills and mcp is a hidden-card 
         };
         let mut agent = Agent::new(scripted, o).unwrap();
         let out = agent.run("hi").await.unwrap();
-        assert_eq!(out.stop_reason.as_deref(), Some("parse failed"));
-        assert_ne!(out.text, "ok");
+        assert_eq!(out.text, "ok");
+        assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
+        let hidden: Vec<_> = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.clone().unwrap_or_default())
+            .filter(|c| crate::template::is_hidden_user_text(c))
+            .collect();
+        let notes = hidden
+            .iter()
+            .filter(|c| c.contains(PARSE_REPAIR_NOTE))
+            .count();
+        assert_eq!(notes, 1, "parse repair lands once: {hidden:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

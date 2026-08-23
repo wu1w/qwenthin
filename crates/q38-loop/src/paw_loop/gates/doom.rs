@@ -61,30 +61,16 @@ impl DoomLoopGate {
         }
     }
 
-    /// Let the model lead. A third identical call gets one factual nudge; only
-    /// six consecutive identical calls count as a genuine no-progress loop.
-    /// Stateful shell calls get one additional round before the hard stop.
+    /// Let the model lead. A third identical call gets one factual nudge.
+    /// Further repeats stay silent: step/time budgets are the hard edge, not
+    /// this detector.
     pub fn qwen_default() -> Self {
-        Self::new(
-            2,
-            1.0,
-            vec![
-                DoomStage::warn(3, REPEAT_NOTE),
-                DoomStage::halt(
-                    6,
-                    "Doom loop: six identical tool calls without a course change",
-                ),
-            ],
-        )
+        Self::new(2, 1.0, vec![DoomStage::warn(3, REPEAT_NOTE)])
     }
 
-    /// Low-precision overlay: window 2, halt@2. Still no Continue lecture.
+    /// Low-precision overlay: one nudge at the second identical call.
     pub fn lossy() -> Self {
-        Self::new(
-            2,
-            1.0,
-            vec![DoomStage::halt(2, "Doom loop: repeated the same tool")],
-        )
+        Self::new(2, 1.0, vec![DoomStage::warn(2, REPEAT_NOTE)])
     }
 
     pub fn check(&self, ctx: &GateCtx<'_>) -> GateDecision {
@@ -136,7 +122,7 @@ impl DoomLoopGate {
                 }
 
                 // bash 是有状态命令（git status、tail 日志），同参重放结果
-                // 可变：只把 hard halt 再放宽一步，soft note 阈值不变。
+                // 可变：若仍有 halt 阶段，只把 hard 边再放宽一步。
                 let stateful = state.history.back().is_some_and(|fp| fp.name == "bash");
                 let Some(stage) = self.stages.iter().rev().find(|s| {
                     let after = if stateful && s.stop {
@@ -243,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn third_repeat_warns_sixth_halts() {
+    fn third_repeat_warns_later_repeats_stay_silent() {
         let gate = DoomLoopGate::qwen_default();
         let a = ToolFingerprint::new("read", r#"{"path":"a.rs"}"#);
         assert!(matches!(hop(&gate, 1, &[a.clone()]), GateDecision::Bypass));
@@ -255,34 +241,28 @@ mod tests {
             }
             other => panic!("expected warn at 3rd repeat: {other:?}"),
         }
-        for iter in 4..=5 {
+        for iter in 4..=8 {
             assert!(matches!(
                 hop(&gate, iter, &[a.clone()]),
                 GateDecision::Continue { .. }
             ));
-            assert_eq!(gate.continuation("s"), "");
-        }
-        match hop(&gate, 6, &[a]) {
-            GateDecision::Stop { reason } => assert!(reason.contains("Doom loop"), "{reason}"),
-            other => panic!("{other:?}"),
+            assert_eq!(gate.continuation("s"), "", "no repeated note at hits={iter}");
         }
     }
 
     #[test]
-    fn bash_repeat_warns_at_three_halts_at_seven() {
-        // 有状态命令只多放宽一次 hard-stop：第 3 次提醒，第 7 次才 halt。
+    fn bash_repeat_warns_at_three_and_does_not_halt() {
         let gate = DoomLoopGate::qwen_default();
         let b = ToolFingerprint::new("bash", r#"{"command":"git status"}"#);
         assert!(matches!(hop(&gate, 1, &[b.clone()]), GateDecision::Bypass));
         assert!(matches!(hop(&gate, 2, &[b.clone()]), GateDecision::Bypass));
-        assert_eq!(gate.continuation("s"), "");
         match hop(&gate, 3, &[b.clone()]) {
             GateDecision::Continue { .. } => {
                 assert_eq!(gate.continuation("s"), REPEAT_NOTE);
             }
             other => panic!("expected warn at 3rd repeat: {other:?}"),
         }
-        for iter in 4..=6 {
+        for iter in 4..=8 {
             assert!(matches!(
                 hop(&gate, iter, &[b.clone()]),
                 GateDecision::Continue { .. }
@@ -292,10 +272,6 @@ mod tests {
                 "",
                 "no repeated note at hits={iter}"
             );
-        }
-        match hop(&gate, 7, &[b]) {
-            GateDecision::Stop { reason } => assert!(reason.contains("Doom loop"), "{reason}"),
-            other => panic!("{other:?}"),
         }
     }
 
@@ -361,9 +337,10 @@ mod tests {
             hop(&gate, 7, &[a.clone()]),
             GateDecision::Continue { .. }
         ));
-        match hop(&gate, 8, &[a]) {
-            GateDecision::Stop { reason } => assert!(reason.contains("Doom loop"), "{reason}"),
-            other => panic!("{other:?}"),
-        }
+        assert!(matches!(
+            hop(&gate, 8, &[a]),
+            GateDecision::Continue { .. }
+        ));
+        assert_eq!(gate.continuation("s"), "");
     }
 }

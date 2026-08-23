@@ -1197,9 +1197,10 @@ function buildTurns(events: SessionEvent[]): TurnGroup[] {
       }
       case "stop": {
         act = undefined;
-        // 常规收束不值得占一行，只显示有信息量的停机原因（中止、守卫、错误）。
+        // 常规收束不占一行。物理上限（步数/时间/上下文）已改成安静收束，
+        // 只把中止和真正的错误露给用户。
         const reason = (e.reason || "").trim();
-        if (reason && reason !== "stop" && reason !== "done" && reason !== "end_turn") {
+        if (reason && !quietStopReason(reason)) {
           turn().blocks.push({ kind: "sys", text: reason });
         }
         return;
@@ -1365,6 +1366,18 @@ function argPreview(name: string, raw: string): string {
       return clipEnd(firstLine(v || ""), 64);
     }
   }
+}
+
+function quietStopReason(reason: string): boolean {
+  const r = reason.trim();
+  if (!r || r === "stop" || r === "done" || r === "end_turn") return true;
+  if (r === "parse failed") return true;
+  if (r.startsWith("budget:")) return true;
+  if (r.includes("Max iterations")) return true;
+  if (r.includes("time limit")) return true;
+  if (r.includes("Token budget")) return true;
+  if (r.includes("call budget")) return true;
+  return false;
 }
 
 function toolIcon(name: string): string {

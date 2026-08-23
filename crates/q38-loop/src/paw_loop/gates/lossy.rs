@@ -1,15 +1,26 @@
-//! Lossy-quant overlay gates. The model never sees these.
+//! Lossy-quant overlay gates. Trajectory detectors inject one hidden
+//! observation and then stay silent; step/time budgets remain the hard edge.
 
 use serde_json::Value;
 
 use crate::paw_loop::store::SessionMap;
 use crate::paw_loop::{GateCtx, GateDecision};
 
+/// One-shot observation when the same tool+args keep landing.
+pub const NAME_NOTE: &str = "[trajectory] 同一工具和参数已连续多次。\
+上一结果若没有新信息，换参数或换工具，或按已有证据收尾。";
+
+/// One-shot observation when the same path keeps being touched the same way.
+pub const PATH_NOTE: &str = "[trajectory] 同一路径上的同一操作已连续多次。\
+换偏移或目标，或按已读内容继续。";
+
 struct NameState {
     last_name: String,
     last_args: String,
     count: u32,
     last_iter: i64,
+    noted: bool,
+    prompt: String,
 }
 
 pub struct NameStreakGate {
@@ -33,6 +44,8 @@ impl NameStreakGate {
                 last_args: String::new(),
                 count: 0,
                 last_iter: -1,
+                noted: false,
+                prompt: String::new(),
             },
             |state| {
                 if ctx.tool_names.is_empty() && ctx.fingerprints.is_empty() {
@@ -40,35 +53,57 @@ impl NameStreakGate {
                     state.last_args.clear();
                     state.count = 0;
                     state.last_iter = -1;
+                    state.noted = false;
+                    state.prompt.clear();
                     return GateDecision::Bypass;
                 }
                 let iter = i64::from(ctx.iteration);
                 if iter == state.last_iter {
-                    return halt_name(state.count, self.halt_after);
+                    return observe_repeat(
+                        state.count,
+                        self.halt_after,
+                        &mut state.noted,
+                        &mut state.prompt,
+                        NAME_NOTE,
+                    );
                 }
                 state.last_iter = iter;
                 if !ctx.fingerprints.is_empty() {
                     for fp in ctx.fingerprints {
                         bump_name(state, &fp.name, &fp.args_hash);
                         if state.count >= self.halt_after {
-                            return GateDecision::Stop {
-                                reason: "Name streak: repeated the same tool".into(),
-                            };
+                            return observe_repeat(
+                                state.count,
+                                self.halt_after,
+                                &mut state.noted,
+                                &mut state.prompt,
+                                NAME_NOTE,
+                            );
                         }
                     }
                 } else {
                     for name in ctx.tool_names {
                         bump_name(state, name, "");
                         if state.count >= self.halt_after {
-                            return GateDecision::Stop {
-                                reason: "Name streak: repeated the same tool".into(),
-                            };
+                            return observe_repeat(
+                                state.count,
+                                self.halt_after,
+                                &mut state.noted,
+                                &mut state.prompt,
+                                NAME_NOTE,
+                            );
                         }
                     }
                 }
                 GateDecision::Bypass
             },
         )
+    }
+
+    pub fn continuation(&self, session_id: &str) -> String {
+        self.sessions.modify(session_id, |state| {
+            state.map(|s| s.prompt.clone()).unwrap_or_default()
+        })
     }
 
     pub fn reset_turn(&self, session_id: &str) {
@@ -87,16 +122,32 @@ fn bump_name(state: &mut NameState, name: &str, args_hash: &str) {
         state.last_name = name.to_string();
         state.last_args = args_hash.to_string();
         state.count = 1;
+        state.noted = false;
+        state.prompt.clear();
     }
 }
 
-fn halt_name(count: u32, halt_after: u32) -> GateDecision {
-    if count >= halt_after {
-        GateDecision::Stop {
-            reason: "Name streak: repeated the same tool".into(),
-        }
-    } else {
-        GateDecision::Bypass
+fn observe_repeat(
+    count: u32,
+    halt_after: u32,
+    noted: &mut bool,
+    prompt: &mut String,
+    note: &str,
+) -> GateDecision {
+    if count < halt_after {
+        return GateDecision::Bypass;
+    }
+    if *noted {
+        return GateDecision::Bypass;
+    }
+    *noted = true;
+    prompt.clear();
+    prompt.push_str(note);
+    GateDecision::Continue {
+        reason: "repeat observation".into(),
+        reset_peers: false,
+        continuation: String::new(),
+        metadata: None,
     }
 }
 
@@ -106,6 +157,8 @@ struct PathState {
     last_args: String,
     count: u32,
     last_iter: i64,
+    noted: bool,
+    prompt: String,
 }
 
 pub struct PathLoopGate {
@@ -130,6 +183,8 @@ impl PathLoopGate {
                 last_args: String::new(),
                 count: 0,
                 last_iter: -1,
+                noted: false,
+                prompt: String::new(),
             },
             |state| {
                 if ctx.fingerprints.is_empty() {
@@ -138,11 +193,19 @@ impl PathLoopGate {
                     state.last_args.clear();
                     state.count = 0;
                     state.last_iter = -1;
+                    state.noted = false;
+                    state.prompt.clear();
                     return GateDecision::Bypass;
                 }
                 let iter = i64::from(ctx.iteration);
                 if iter == state.last_iter {
-                    return halt_path(state.count, self.halt_after);
+                    return observe_repeat(
+                        state.count,
+                        self.halt_after,
+                        &mut state.noted,
+                        &mut state.prompt,
+                        PATH_NOTE,
+                    );
                 }
                 state.last_iter = iter;
                 for fp in ctx.fingerprints {
@@ -151,6 +214,8 @@ impl PathLoopGate {
                         state.last_path.clear();
                         state.last_args.clear();
                         state.count = 0;
+                        state.noted = false;
+                        state.prompt.clear();
                         continue;
                     };
                     // 只读分页不算循环：压缩注记教模型用 offset/limit 翻页，
@@ -168,17 +233,29 @@ impl PathLoopGate {
                         state.last_name = fp.name.clone();
                         state.last_path = path.to_string();
                         state.count = 1;
+                        state.noted = false;
+                        state.prompt.clear();
                     }
                     state.last_args = fp.args_hash.clone();
                     if state.count >= self.halt_after {
-                        return GateDecision::Stop {
-                            reason: "Path loop: repeated the same tool on the same path".into(),
-                        };
+                        return observe_repeat(
+                            state.count,
+                            self.halt_after,
+                            &mut state.noted,
+                            &mut state.prompt,
+                            PATH_NOTE,
+                        );
                     }
                 }
                 GateDecision::Bypass
             },
         )
+    }
+
+    pub fn continuation(&self, session_id: &str) -> String {
+        self.sessions.modify(session_id, |state| {
+            state.map(|s| s.prompt.clone()).unwrap_or_default()
+        })
     }
 
     pub fn reset_turn(&self, session_id: &str) {
@@ -187,16 +264,6 @@ impl PathLoopGate {
 
     pub fn reset_session(&self, session_id: &str) {
         self.sessions.remove(session_id);
-    }
-}
-
-fn halt_path(count: u32, halt_after: u32) -> GateDecision {
-    if count >= halt_after {
-        GateDecision::Stop {
-            reason: "Path loop: repeated the same tool on the same path".into(),
-        }
-    } else {
-        GateDecision::Bypass
     }
 }
 
@@ -217,19 +284,21 @@ mod tests {
     use super::*;
     use crate::paw_loop::ToolFingerprint;
 
-    fn run_names(gate: &NameStreakGate, names: &[&str]) -> Option<String> {
+    fn run_names(gate: &NameStreakGate, names: &[&str]) -> bool {
         let owned: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
         let mut ctx = GateCtx::new("s");
         ctx.iteration = 1;
         ctx.tool_names = &owned;
-        match gate.check(&ctx) {
-            GateDecision::Stop { reason } => Some(reason),
-            _ => None,
-        }
+        matches!(gate.check(&ctx), GateDecision::Continue { .. })
+            && gate.continuation("s") == NAME_NOTE
+    }
+
+    fn is_path_note(d: &GateDecision, gate: &PathLoopGate) -> bool {
+        matches!(d, GateDecision::Continue { .. }) && gate.continuation("s") == PATH_NOTE
     }
 
     #[test]
-    fn name_streak_halts_at_four_same() {
+    fn name_streak_notes_at_four_same() {
         let gate = NameStreakGate::new(4);
         for (i, name) in ["bash", "bash", "bash"].iter().enumerate() {
             let owned = vec![(*name).to_string()];
@@ -238,7 +307,7 @@ mod tests {
             ctx.tool_names = &owned;
             assert!(matches!(gate.check(&ctx), GateDecision::Bypass));
         }
-        assert!(run_names(&gate, &["bash"]).is_some());
+        assert!(run_names(&gate, &["bash"]));
     }
 
     #[test]
@@ -274,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn name_streak_same_name_and_args_still_halts() {
+    fn name_streak_same_name_and_args_notes_once() {
         let gate = NameStreakGate::new(4);
         let fps = vec![ToolFingerprint::new("bash", r#"{"command":"pwd"}"#)];
         let names = vec!["bash".to_string()];
@@ -290,14 +359,21 @@ mod tests {
         ctx.tool_names = &names;
         ctx.fingerprints = &fps;
         match gate.check(&ctx) {
-            GateDecision::Stop { reason } => assert!(reason.contains("Name streak"), "{reason}"),
+            GateDecision::Continue { .. } => assert_eq!(gate.continuation("s"), NAME_NOTE),
             other => panic!("{other:?}"),
         }
+        let mut ctx = GateCtx::new("s");
+        ctx.iteration = 5;
+        ctx.tool_names = &names;
+        ctx.fingerprints = &fps;
+        assert!(
+            matches!(gate.check(&ctx), GateDecision::Bypass),
+            "second crossing stays silent"
+        );
     }
 
     #[test]
-    fn path_loop_halts_at_three_same_path() {
-        // 一字不差的同路径重读仍在 3 次时 halt。
+    fn path_loop_notes_at_three_same_path() {
         let gate = PathLoopGate::new(3);
         for i in 0..2 {
             let fps = vec![
@@ -313,10 +389,8 @@ mod tests {
         let mut ctx = GateCtx::new("s");
         ctx.iteration = 3;
         ctx.fingerprints = &fps;
-        match gate.check(&ctx) {
-            GateDecision::Stop { reason } => assert!(reason.contains("Path loop"), "{reason}"),
-            other => panic!("{other:?}"),
-        }
+        let d = gate.check(&ctx);
+        assert!(is_path_note(&d, &gate), "{d:?}");
     }
 
     #[test]
@@ -333,7 +407,7 @@ mod tests {
             ctx.fingerprints = &fps;
             assert!(matches!(gate.check(&ctx), GateDecision::Bypass), "i={i}");
         }
-        // 分页后又原地重读同一参数（第 6 轮已算 1 次），第 3 次一字不差时 halt。
+        // 分页后又原地重读同一参数（第 6 轮已算 1 次），第 3 次一字不差时观察一次。
         let fps =
             vec![ToolFingerprint::new("read", r#"{"offset":500}"#).with_path(Some("a.rs".into()))];
         let mut ctx = GateCtx::new("s");
@@ -343,10 +417,8 @@ mod tests {
         let mut ctx = GateCtx::new("s");
         ctx.iteration = 8;
         ctx.fingerprints = &fps;
-        match gate.check(&ctx) {
-            GateDecision::Stop { reason } => assert!(reason.contains("Path loop"), "{reason}"),
-            other => panic!("{other:?}"),
-        }
+        let d = gate.check(&ctx);
+        assert!(is_path_note(&d, &gate), "{d:?}");
     }
 
     #[test]

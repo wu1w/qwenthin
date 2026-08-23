@@ -46,9 +46,8 @@ impl IterationGate {
                 GateDecision::Bypass
             }
         });
-        if matches!(decision, GateDecision::Stop { .. }) {
-            self.sessions.remove(ctx.session_id);
-        }
+        // Keep the cap armed so a wrap-up hop still sees it. The next user
+        // turn calls `reset_turn`, which zeroes the counter.
         decision
     }
 
