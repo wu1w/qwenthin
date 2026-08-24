@@ -206,6 +206,7 @@ where
         steer: session.steer_slot(),
         persist: session.persist,
         permit: None,
+        clarify: None,
     };
     let on_turn = on_turn.clone();
     let join = tokio::spawn(async move { on_turn(req_turn).await });

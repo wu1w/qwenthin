@@ -16,6 +16,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use futures::StreamExt;
+use q38_loop::clarify::ClarifyHub;
 use q38_loop::config::Config;
 use q38_loop::permit::{ApprovalMode, PermitHub};
 use q38_loop::policy::ThinkPolicy;
@@ -129,6 +130,7 @@ pub async fn run(opts: TuiOpts) -> Result<ExitCode> {
     let mut events = EventStream::new();
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
     let (permit, mut permit_rx) = PermitHub::pair(session.approvals());
+    let (clarify, mut clarify_rx) = ClarifyHub::pair();
     let mut overlay: Option<Overlay> = None;
     let mut live: Option<LiveTurn> = None;
     let mut scroll: i32 = 0;
@@ -156,8 +158,11 @@ pub async fn run(opts: TuiOpts) -> Result<ExitCode> {
             Some(event) = ev_rx.recv() => {
                 transcript.apply(&event);
             }
-            Some(req) = permit_rx.recv() => {
+            Some(req) = permit_rx.recv(), if overlay.is_none() => {
                 overlay = Some(Overlay::Permit(req));
+            }
+            Some(req) = clarify_rx.recv(), if overlay.is_none() => {
+                overlay = Some(Overlay::Clarify { req, other: None });
             }
             _ = tick.tick(), if running => {}
             maybe = events.next() => {
@@ -177,6 +182,7 @@ pub async fn run(opts: TuiOpts) -> Result<ExitCode> {
                             &ev_tx,
                             &mut cfg,
                             &permit,
+                            &clarify,
                             agents_md,
                             agents_md_head,
                         )
@@ -222,6 +228,7 @@ pub async fn run(opts: TuiOpts) -> Result<ExitCode> {
                             &ev_tx,
                             cfg.clone(),
                             Some(permit.clone()),
+                            Some(clarify.clone()),
                             agents_md,
                             agents_md_head,
                             next,
@@ -264,6 +271,7 @@ async fn handle_key(
     ev_tx: &tokio::sync::mpsc::UnboundedSender<SessionEvent>,
     cfg: &mut Config,
     permit: &PermitHub,
+    clarify: &ClarifyHub,
     agents_md: bool,
     agents_md_head: bool,
 ) -> Result<bool> {
@@ -305,6 +313,7 @@ async fn handle_key(
                     ev_tx,
                     cfg,
                     permit,
+                    clarify,
                     agents_md,
                     agents_md_head,
                     "/plan go".into(),
@@ -323,6 +332,7 @@ async fn handle_key(
                     ev_tx,
                     cfg,
                     permit,
+                    clarify,
                     agents_md,
                     agents_md_head,
                     "/plan off".into(),
@@ -365,6 +375,7 @@ async fn handle_key(
                 ev_tx,
                 cfg,
                 permit,
+                clarify,
                 agents_md,
                 agents_md_head,
                 text,
@@ -385,6 +396,7 @@ fn submit(
     ev_tx: &tokio::sync::mpsc::UnboundedSender<SessionEvent>,
     cfg: &mut Config,
     permit: &PermitHub,
+    clarify: &ClarifyHub,
     agents_md: bool,
     agents_md_head: bool,
     text: String,
@@ -404,6 +416,7 @@ fn submit(
                     ev_tx,
                     cfg.clone(),
                     Some(permit.clone()),
+                    Some(clarify.clone()),
                     agents_md,
                     agents_md_head,
                     text,
@@ -421,6 +434,7 @@ fn submit(
                     ev_tx,
                     cfg.clone(),
                     Some(permit.clone()),
+                    Some(clarify.clone()),
                     agents_md,
                     agents_md_head,
                     other,
@@ -436,6 +450,7 @@ fn submit(
         ev_tx,
         cfg.clone(),
         Some(permit.clone()),
+        Some(clarify.clone()),
         agents_md,
         agents_md_head,
         text,
@@ -452,6 +467,7 @@ fn apply_dispatch(
     ev_tx: &tokio::sync::mpsc::UnboundedSender<SessionEvent>,
     cfg: Config,
     permit: Option<PermitHub>,
+    clarify: Option<ClarifyHub>,
     agents_md: bool,
     agents_md_head: bool,
     dispatch: Dispatch,
@@ -479,6 +495,7 @@ fn apply_dispatch(
             ev_tx,
             cfg,
             permit,
+            clarify,
             agents_md,
             agents_md_head,
             prompt,
@@ -501,6 +518,7 @@ fn start_turn(
     ev_tx: &tokio::sync::mpsc::UnboundedSender<SessionEvent>,
     cfg: Config,
     permit: Option<PermitHub>,
+    clarify: Option<ClarifyHub>,
     agents_md: bool,
     agents_md_head: bool,
     prompt: String,
@@ -523,6 +541,7 @@ fn start_turn(
                 ev_tx,
                 cfg,
                 permit,
+                clarify,
                 agents_md,
                 agents_md_head,
                 prompt,
@@ -542,6 +561,7 @@ fn start_turn(
             ev_tx,
             cfg,
             permit,
+            clarify,
             agents_md,
             agents_md_head,
             prompt,
@@ -570,6 +590,7 @@ fn start_turn(
             ev_tx,
             cfg,
             permit,
+            clarify,
             agents_md,
             agents_md_head,
             prompt,
@@ -592,6 +613,7 @@ fn start_turn(
             ev_tx,
             cfg,
             permit,
+            clarify,
             agents_md,
             agents_md_head,
             other,
@@ -607,6 +629,7 @@ fn spawn_live(
     ev_tx: &tokio::sync::mpsc::UnboundedSender<SessionEvent>,
     cfg: Config,
     permit: Option<PermitHub>,
+    clarify: Option<ClarifyHub>,
     agents_md: bool,
     agents_md_head: bool,
     prompt: String,
@@ -627,6 +650,7 @@ fn spawn_live(
         steer: session.steer_slot(),
         persist: true,
         permit,
+        clarify,
     };
     let join = tokio::spawn(async move { execute_turn(cfg, agents_md, agents_md_head, req).await });
     *live = Some(LiveTurn { join, cancel });
@@ -692,8 +716,9 @@ fn draw(
     } else {
         snap.mode.as_str()
     };
+    let clarify = if snap.clarify_mode { " · clarify" } else { "" };
     let info = format!(
-        " {plan} · {} · {} · {}{} · /setup /plan /approvals /lossy ",
+        " {plan} · {} · {} · {}{}{clarify} · /setup /plan /clarify /approvals /lossy ",
         snap.approvals.as_str(),
         effort,
         &snap.session_id.chars().take(8).collect::<String>(),

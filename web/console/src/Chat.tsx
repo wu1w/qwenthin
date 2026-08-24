@@ -6,6 +6,7 @@ import {
   rpc,
   sessionName,
   SLASH,
+  type Clarify,
   type Permit,
   type SessionEvent,
   type SessionInfo,
@@ -73,7 +74,7 @@ function compactCount(events: SessionEvent[], snap?: Snap): number {
   return n || snap?.usage?.compacts || 0;
 }
 
-export type RunPhase = "idle" | "waiting" | "thinking" | "writing" | "tool" | "permit" | "stopping";
+export type RunPhase = "idle" | "waiting" | "thinking" | "writing" | "tool" | "permit" | "clarify" | "stopping";
 
 export function runPhase(opts: {
   busy: boolean;
@@ -81,7 +82,9 @@ export function runPhase(opts: {
   live: { think: string; content: string };
   events: SessionEvent[];
   permit?: Permit;
+  clarify?: Clarify;
 }): RunPhase {
+  if (opts.clarify) return "clarify";
   if (opts.permit) return "permit";
   if (opts.aborting) return "stopping";
   const liveOn = !!(opts.live.think || opts.live.content);
@@ -102,6 +105,7 @@ export const PHASE_LABEL: Record<RunPhase, string> = {
   writing: "生成中",
   tool: "调用工具",
   permit: "等待审批",
+  clarify: "等待选择",
   stopping: "正在停止",
 };
 
@@ -149,6 +153,7 @@ export function ChatPage({
   live,
   busy,
   permit,
+  clarify,
   elapsed,
   detailsOpen,
   onToggleDetails,
@@ -159,6 +164,7 @@ export function ChatPage({
   live: { think: string; content: string };
   busy: boolean;
   permit: Permit;
+  clarify: Clarify;
   elapsed: number;
   detailsOpen: boolean;
   onToggleDetails: () => void;
@@ -458,12 +464,12 @@ export function ChatPage({
   const queued = snap.queued ?? 0;
   const steered = snap.steered ?? 0;
   const policy = snap.busy || "interrupt";
-  const phase = runPhase({ busy, aborting, live, events, permit });
+  const phase = runPhase({ busy, aborting, live, events, permit, clarify });
   const waitPrefix =
     phase === "waiting" ? usage?.live_prompt_tokens || usage?.last_prompt_tokens || 0 : 0;
   const waitPrefixBit = waitPrefix > 0 ? ` · ${waitPrefix} tokens` : "";
   const callLabel =
-    phase === "stopping" || phase === "permit"
+    phase === "stopping" || phase === "permit" || phase === "clarify"
       ? PHASE_LABEL[phase]
       : waitPrefix > 0
         ? `正在调用模型 · ${waitPrefix.toLocaleString()} tokens`
@@ -538,6 +544,16 @@ export function ChatPage({
       if (saved.agent_scope !== expected) {
         throw new Error("作用域未被后端应用，请重启 Qwenthin 服务后重试");
       }
+      if (!busy) await onReload();
+    } catch (e) {
+      setErr(failMsg(e));
+    }
+  };
+
+  const toggleClarify = async () => {
+    setErr("");
+    try {
+      await rpc("slash", { text: snap.clarify_mode ? "/clarify off" : "/clarify on" });
       if (!busy) await onReload();
     } catch (e) {
       setErr(failMsg(e));
@@ -866,6 +882,16 @@ export function ChatPage({
                   <Icon name="list" />
                   plan
                 </button>
+                <button
+                  type="button"
+                  className={`pill-btn${snap.clarify_mode ? " on" : ""}`}
+                  title={snap.clarify_mode ? "澄清已开：模型可弹出选择题。点击关闭" : "开启澄清：模型可弹出 2–4 项选择题"}
+                  aria-pressed={!!snap.clarify_mode}
+                  onClick={toggleClarify}
+                >
+                  <Icon name="list" />
+                  {snap.clarify_mode ? "澄清 · 开" : "澄清"}
+                </button>
                 {uploading > 0 ? (
                   <span className="upl-chip">
                     <span className="act-spin" aria-hidden />
@@ -977,6 +1003,7 @@ export function ChatPage({
             <div className="kv"><span>审批</span><b>{snap.approvals || "—"}</b></div>
             <div className="kv"><span>作用域</span><b>{agentScope === "global" ? "全局" : "工作区"}</b></div>
             <div className="kv"><span>计划模式</span><b>{snap.plan_mode ? "on" : "off"}</b></div>
+            <div className="kv"><span>澄清模式</span><b>{snap.clarify_mode ? "on" : "off"}</b></div>
             <div className="kv"><span>忙碌策略</span><b>{snap.busy || "—"}</b></div>
             <div className="kv"><span>运行</span><b>{busy ? PHASE_LABEL[phase] : "空闲"}</b></div>
             <div className="kv"><span>排队</span><b>{queued}</b></div>
@@ -1536,6 +1563,76 @@ function ActivityBlock({
         </div>
       ) : null}
     </div>
+  );
+}
+
+export function ClarifyModal({
+  clarify,
+  onClose,
+}: {
+  clarify: NonNullable<Clarify>;
+  onClose: () => void;
+}) {
+  const [otherOpen, setOtherOpen] = useState(false);
+  const [other, setOther] = useState("");
+  const go = async (body: Record<string, unknown>) => {
+    await api("/clarify", { method: "POST", body: JSON.stringify({ id: clarify.id, ...body }) });
+    onClose();
+  };
+  const submitOther = () => {
+    const text = other.trim();
+    void go(text ? { other: text } : { skip: true });
+  };
+  // 与审批卡相同：点遮罩 / Esc 不动作，只有选项、其他、跳过能结束阻塞。
+  return (
+    <Overlay onClose={() => {}}>
+      <div className="modal" role="dialog" aria-labelledby="clarify-title">
+        <h2 id="clarify-title">
+          <Icon name="list" />
+          {clarify.title || "请选择"}
+        </h2>
+        <div className="m-sub">clarify.ask · id #{clarify.id}</div>
+        {clarify.prompt ? <div className="sub" style={{ marginBottom: 14 }}>{clarify.prompt}</div> : null}
+        {otherOpen ? (
+          <>
+            <input
+              className="input"
+              value={other}
+              onChange={(e) => setOther(e.target.value)}
+              placeholder="输入其他说明"
+              aria-label="其他说明"
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === "Enter") submitOther();
+              }}
+            />
+            <div className="m-actions" style={{ marginTop: 12 }}>
+              <button type="button" className="btn ghost" onClick={() => setOtherOpen(false)}>返回</button>
+              <button type="button" className="btn primary" onClick={submitOther}>提交</button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="m-actions col">
+              {clarify.options.map((o, i) => (
+                <button
+                  key={o.id}
+                  type="button"
+                  className={i === 0 ? "btn primary" : "btn"}
+                  onClick={() => void go({ pick: o.id })}
+                >
+                  {i === 0 ? `${o.label} · 推荐` : o.label}
+                </button>
+              ))}
+            </div>
+            <div className="m-actions">
+              <button type="button" className="btn ghost" onClick={() => void go({ skip: true })}>跳过</button>
+              <button type="button" className="btn ink" onClick={() => setOtherOpen(true)}>其他</button>
+            </div>
+          </>
+        )}
+      </div>
+    </Overlay>
   );
 }
 

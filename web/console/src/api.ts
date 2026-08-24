@@ -56,6 +56,13 @@ export type Usage = {
 
 export type Permit = { id: number; tool: string; preview: string } | null;
 
+export type Clarify = {
+  id: number;
+  title: string;
+  prompt: string;
+  options: Array<{ id: string; label: string }>;
+} | null;
+
 export type Snap = {
   ok?: boolean;
   session?: string;
@@ -65,6 +72,7 @@ export type Snap = {
   mode?: string;
   channel?: string;
   plan_mode?: boolean;
+  clarify_mode?: boolean;
   approvals?: string;
   agent_scope?: "workspace" | "global";
   low_precision?: boolean;
@@ -77,6 +85,7 @@ export type Snap = {
   window?: number;
   usage?: Usage;
   permit?: Permit;
+  clarify?: Clarify;
   jobs?: number;
 };
 
@@ -284,6 +293,7 @@ export const SLASH: Array<[string, string]> = [
   ["/fast", "关思考"],
   ["/mode", "chat | agent | think | code"],
   ["/plan", "on / off / go"],
+  ["/clarify", "on / off"],
   ["/approvals", "ask | auto | yolo"],
   ["/lossy", "低精度模式开关"],
   ["/model", "查看/切换模型"],

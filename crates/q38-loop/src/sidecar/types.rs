@@ -207,6 +207,7 @@ pub struct TurnSnapshot {
     pub effort_locked: bool,
     pub model: String,
     pub plan_mode: bool,
+    pub clarify_mode: bool,
     pub approvals: crate::permit::ApprovalMode,
     pub low_precision: bool,
     pub workspace_confined: bool,
@@ -224,6 +225,8 @@ pub struct TurnRequest {
     pub persist: bool,
     /// TUI permission hub. None for `--print` / sidecar (YOLO).
     pub permit: Option<crate::permit::PermitHub>,
+    /// Blocking ask overlay. None = skip to the recommended option.
+    pub clarify: Option<crate::clarify::ClarifyHub>,
 }
 
 #[derive(Clone, Debug, Default)]

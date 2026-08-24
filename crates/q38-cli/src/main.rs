@@ -462,6 +462,7 @@ fn intercept_slash(
         | SlashCmd::Setup
         | SlashCmd::Approvals { .. }
         | SlashCmd::Plan { .. }
+        | SlashCmd::Clarify { .. }
         | SlashCmd::LowPrecision { .. } => false,
         SlashCmd::Status
         | SlashCmd::Context { .. }

@@ -108,6 +108,12 @@ async fn handle_inbound(
                 };
                 return Ok(reply_text(low_precision_text(flag)));
             }
+            q38_loop::SlashCmd::Clarify { on } => {
+                return Ok(reply_text(q38_loop::slash::clarify_text(
+                    on.unwrap_or(true),
+                    false,
+                )));
+            }
             _ => {}
         }
     }

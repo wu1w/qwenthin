@@ -20,6 +20,7 @@ const MCP: &str = r#"{"type":"function","function":{"name":"mcp","description":"
 const VIEW: &str = r#"{"type":"function","function":{"name":"view","description":"Load image, video stills, or audio.","parameters":{"type":"object","properties":{"path":{"type":"string"},"kind":{"type":"string","enum":["image","audio","video"]}},"required":["path"]}}}"#;
 const SEARCH: &str = r#"{"type":"function","function":{"name":"search","description":"Find code.","parameters":{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"}},"required":["query"]}}}"#;
 const WEB: &str = r#"{"type":"function","function":{"name":"web","description":"Web search (query) or fetch a page (url).","parameters":{"type":"object","properties":{"query":{"type":"string"},"url":{"type":"string"}}}}}"#;
+const ASK: &str = r#"{"type":"function","function":{"name":"ask","description":"Ask the user one multiple-choice question (2-4 options). First option is recommended. Blocks until they pick, skip, or type Other.","parameters":{"type":"object","properties":{"title":{"type":"string"},"prompt":{"type":"string"},"options":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"label":{"type":"string"}},"required":["label"]}}},"required":["prompt","options"]}}}"#;
 
 fn parse(s: &'static str) -> Value {
     serde_json::from_str(s).expect("frozen tool JSON")
@@ -72,6 +73,28 @@ pub fn search_tool() -> Value {
 /// key, so this is on out of the box). Same freeze discipline as `mcp`.
 pub fn web_tool() -> Value {
     parse(WEB)
+}
+
+/// Session-level; append when `/plan` or `/clarify` is on. Do not splice into
+/// [`agent_tools`].
+pub fn ask_tool() -> Value {
+    parse(ASK)
+}
+
+/// Returns true when `tools[]` changed.
+pub fn sync_ask_tool(tools: &mut Vec<Value>, armed: bool) -> bool {
+    let has = has_tool(tools, "ask");
+    match (armed, has) {
+        (true, false) => {
+            tools.push(ask_tool());
+            true
+        }
+        (false, true) => {
+            tools.retain(|t| t["function"]["name"].as_str() != Some("ask"));
+            true
+        }
+        _ => false,
+    }
 }
 
 pub fn has_tool(tools: &[Value], name: &str) -> bool {
@@ -131,11 +154,19 @@ mod tests {
         assert_eq!(serde_json::to_string(&view_tool()).unwrap(), VIEW);
         assert_eq!(serde_json::to_string(&search_tool()).unwrap(), SEARCH);
         assert_eq!(serde_json::to_string(&web_tool()).unwrap(), WEB);
+        assert_eq!(serde_json::to_string(&ask_tool()).unwrap(), ASK);
+        assert!(!has_tool(&tools, "ask"));
         assert!(!has_tool(&tools, "memory_search"));
         assert!(!has_tool(&tools, "skill"));
         assert!(!has_tool(&tools, "mcp"));
         assert!(!has_tool(&tools, "view"));
         assert!(!has_tool(&tools, "search"));
         assert!(!has_tool(&tools, "web"));
+        let mut extra = tools.clone();
+        assert!(sync_ask_tool(&mut extra, true));
+        assert!(has_tool(&extra, "ask"));
+        assert!(!sync_ask_tool(&mut extra, true));
+        assert!(sync_ask_tool(&mut extra, false));
+        assert!(!has_tool(&extra, "ask"));
     }
 }

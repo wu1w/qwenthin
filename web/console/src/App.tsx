@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { api, connectEvents, rpc, type Permit, type SessionEvent, type Snap } from "./api";
-import { ChatPage, PermitModal, RunChip, runPhase } from "./Chat";
+import { api, connectEvents, rpc, type Clarify, type Permit, type SessionEvent, type Snap } from "./api";
+import { ChatPage, ClarifyModal, PermitModal, RunChip, runPhase } from "./Chat";
 import {
   ChannelsPage,
   CronPage,
@@ -126,6 +126,7 @@ export function App() {
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [live, setLive] = useState({ think: "", content: "" });
   const [permit, setPermit] = useState<Permit>(null);
+  const [clarify, setClarify] = useState<Clarify>(null);
   const [elapsed, setElapsed] = useState(0);
   const [link, setLink] = useState<{ ok: boolean | null; model: string; error?: string }>({
     ok: null,
@@ -141,6 +142,7 @@ export function App() {
     const st = await api<Snap>("/state");
     setSnap(st);
     setPermit(st.permit ?? null);
+    setClarify(st.clarify ?? null);
     const h = await api<{ events: SessionEvent[] }>("/history");
     setEvents(h.events || []);
     setLive({ think: "", content: "" });
@@ -173,10 +175,16 @@ export function App() {
     return connectEvents(
       (msg) => {
         if (msg.method === "hello") {
-          const p = msg.params as { state?: Snap; events?: SessionEvent[]; permit?: Permit };
+          const p = msg.params as {
+            state?: Snap;
+            events?: SessionEvent[];
+            permit?: Permit;
+            clarify?: Clarify;
+          };
           setSnap(p.state || {});
           setEvents(p.events || []);
           setPermit(p.permit ?? null);
+          setClarify(p.clarify ?? null);
           // 重连后的基线里没有断线前的旧增量，清掉避免流式文本重复。
           setLive({ think: "", content: "" });
         } else if (msg.method === "history.replace") {
@@ -200,6 +208,10 @@ export function App() {
           setPermit(msg.params as Permit);
         } else if (msg.method === "permit.clear") {
           setPermit(null);
+        } else if (msg.method === "clarify.ask") {
+          setClarify(msg.params as Clarify);
+        } else if (msg.method === "clarify.clear") {
+          setClarify(null);
         } else if (msg.method === "state") {
           setSnap(msg.params as Snap);
         }
@@ -208,7 +220,7 @@ export function App() {
     );
   }, []);
 
-  const phase = runPhase({ busy, live, events, permit });
+  const phase = runPhase({ busy, live, events, permit, clarify });
   const linked = link.ok === true;
   const modelLabel = (link.model || snap.model || "").trim();
 
@@ -365,6 +377,7 @@ export function App() {
                 live={live}
                 busy={busy}
                 permit={permit}
+                clarify={clarify}
                 elapsed={elapsed}
                 detailsOpen={details}
                 onToggleDetails={toggleDetails}
@@ -411,6 +424,7 @@ export function App() {
         </div>
       </div>
       {permit && page !== "inbox" ? <PermitModal permit={permit} onClose={() => setPermit(null)} /> : null}
+      {clarify ? <ClarifyModal clarify={clarify} onClose={() => setClarify(null)} /> : null}
       <DialogHost />
     </>
   );

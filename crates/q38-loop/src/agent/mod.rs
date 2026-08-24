@@ -61,8 +61,8 @@ use crate::tools::{
     ToolLimits, Workspace,
 };
 use crate::tools_schema::{
-    agent_tools, code_tools, has_recall, has_tool, mcp_tool, memory_search_tool, recall_tool,
-    search_tool, view_tool,
+    agent_tools, ask_tool, code_tools, has_recall, has_tool, mcp_tool, memory_search_tool,
+    recall_tool, search_tool, view_tool,
 };
 
 pub use delta::TokenSink;
@@ -192,10 +192,14 @@ pub struct RunOpts {
     pub prompt_file: String,
     /// Builtin 编程助手 when no AGENT.md exists.
     pub coding_identity: bool,
-    /// Hidden plan card + mutating-tool deny. Does not change tools[].
+    /// Hidden plan card + mutating-tool deny. Does not change the frozen four.
     pub plan_mode: bool,
+    /// Session `/clarify`. Combined with plan_mode, appends the `ask` tool.
+    pub clarify_mode: bool,
     /// TUI permission bridge. None = YOLO (`--print`, tests).
     pub permit: Option<crate::permit::PermitHub>,
+    /// Blocking ask overlay. None = skip to the recommended option.
+    pub clarify: Option<crate::clarify::ClarifyHub>,
     /// User switch: tighter doom/parse/repeat guards. Default off.
     pub low_precision: bool,
     /// IM / console channel stamped on new JSONL `session/start`. Empty = default `cli`.
@@ -251,7 +255,9 @@ impl RunOpts {
             prompt_file: cfg.prompt.file.clone(),
             coding_identity: cfg.prompt.coding,
             plan_mode: false,
+            clarify_mode: false,
             permit: None,
+            clarify: None,
             low_precision: cfg.policy.low_precision,
             channel: String::new(),
             narrate: cfg.prompt.narrate,
@@ -357,7 +363,9 @@ pub struct Agent<C> {
     emit: Option<crate::sidecar::EventSink>,
     stdio: std::sync::Arc<delta::StdioState>,
     plan_mode: bool,
+    clarify_mode: bool,
     permit: Option<PermitHub>,
+    clarify: Option<crate::clarify::ClarifyHub>,
     low_precision: bool,
     parse_stop_after: u32,
     /// Last substantial assistant content this user turn. Harness-only.
@@ -536,7 +544,9 @@ impl<C: Completer> Agent<C> {
             emit: None,
             stdio: std::sync::Arc::new(delta::StdioState::default()),
             plan_mode: opts.plan_mode,
+            clarify_mode: opts.clarify_mode,
             permit: opts.permit,
+            clarify: opts.clarify,
             low_precision: lossy,
             parse_stop_after: if lossy { 2 } else { 3 },
             last_spoken: None,
@@ -1289,6 +1299,11 @@ impl<C: Completer> Agent<C> {
         if self.plan_mode && !sticky::live_has_plan_note(&self.messages) {
             self.push_hidden_user(PLAN_CARD);
         }
+        if (self.plan_mode || self.clarify_mode)
+            && !sticky::live_has_clarify_note(&self.messages)
+        {
+            self.push_hidden_user(crate::clarify::CLARIFY_CARD);
+        }
         if self.narrate && !sticky::live_has_style_note(&self.messages) {
             self.push_hidden_user(sticky::STYLE_CARD);
         }
@@ -1448,6 +1463,40 @@ impl<C: Completer> Agent<C> {
         Some(prev)
     }
 
+    async fn run_ask(&self, call: &ToolCall) -> ToolResponse {
+        let armed = self.plan_mode || self.clarify_mode;
+        if !armed {
+            return ToolResponse::text(
+                &call.id,
+                "Error: ask is off. Proceed without asking. User can /clarify or /plan.",
+                ToolState::Error,
+            );
+        }
+        let ask = match crate::clarify::parse_ask(&call.arguments) {
+            Ok(a) => a,
+            Err(e) => {
+                return ToolResponse::text(&call.id, format!("Error: {e}"), ToolState::Error);
+            }
+        };
+        let yolo = self
+            .permit
+            .as_ref()
+            .map(|p| p.mode() == crate::permit::ApprovalMode::Yolo)
+            .unwrap_or(true);
+        let decision = if yolo {
+            crate::clarify::ClarifyDecision::Skip
+        } else if let Some(hub) = &self.clarify {
+            hub.ask(ask.clone(), &self.cancel).await
+        } else {
+            crate::clarify::ClarifyDecision::Skip
+        };
+        ToolResponse::text(
+            &call.id,
+            crate::clarify::format_decision(&ask, decision),
+            ToolState::Success,
+        )
+    }
+
     fn arm_sink(&self) {
         self.completer.set_token_sink(self.live_sink());
     }
@@ -1470,6 +1519,7 @@ impl<C: Completer> Agent<C> {
             return refused;
         }
         match call.name.as_str() {
+            "ask" => self.run_ask(call).await,
             "recall" => run_recall(self.log.as_ref(), &self.blobs, call, self.limits),
             "memory_search" => match &self.memory {
                 Some(store) => run_memory_search(store, call, self.limits),
@@ -1584,8 +1634,8 @@ impl<C: Completer> Agent<C> {
     }
 
     async fn dispatch_parallel(&self, calls: &[ToolCall]) -> Vec<ToolResponse> {
-        // Same handlers as the serial path. `parallel_safe_batch` only admits
-        // read/view today; if that predicate grows, mcp/skill/recall still run.
+        // Same handlers as the serial path. `parallel_safe_batch` admits
+        // read/view/search/web/ask; mutating tools still run serially.
         futures::future::join_all(calls.iter().map(|c| self.dispatch_one(c))).await
     }
 
@@ -2019,6 +2069,7 @@ fn preview_args(call: &ToolCall) -> String {
         .or_else(|| call.arguments.get("name"))
         .or_else(|| call.arguments.get("method"))
         .or_else(|| call.arguments.get("server"))
+        .or_else(|| call.arguments.get("prompt"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| call.arguments.get("seq").map(|v| v.to_string()))
@@ -2156,6 +2207,9 @@ fn bind_periphery(
     if opts.media && matches!(tool_set, ToolSet::Agent) {
         tools.push(view_tool());
     }
+    if matches!(tool_set, ToolSet::Agent) && (opts.plan_mode || opts.clarify_mode) {
+        tools.push(ask_tool());
+    }
     (system, tools, memory, skills, mcp)
 }
 
@@ -2172,7 +2226,7 @@ fn parallel_safe_batch(calls: &[ToolCall]) -> bool {
     calls.len() > 1
         && calls
             .iter()
-            .all(|c| matches!(c.name.as_str(), "read" | "view" | "search" | "web"))
+            .all(|c| matches!(c.name.as_str(), "read" | "view" | "search" | "web" | "ask"))
 }
 
 /// Merge agent-level stop with the coordinator's per-call flag. Native tools
@@ -3559,8 +3613,10 @@ mod tests {
         let view = call("v", "view");
         assert!(parallel_safe_batch(&[read.clone(), view.clone()]));
         assert!(parallel_safe_batch(&[read.clone(), call("s", "search")]));
+        assert!(parallel_safe_batch(&[read.clone(), call("q", "ask")]));
         assert!(!parallel_safe_batch(&[read.clone()]));
         assert!(!parallel_safe_batch(&[read.clone(), call("m", "mcp")]));
+        assert!(!parallel_safe_batch(&[call("q", "ask"), call("w", "write")]));
         assert!(!parallel_safe_batch(&[view, call("s", "skill")]));
         assert!(!parallel_safe_batch(&[
             call("a", "read"),

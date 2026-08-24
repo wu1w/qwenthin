@@ -60,6 +60,7 @@ pub struct SidecarSession {
     pub(crate) title: String,
     pub(crate) tools: Vec<serde_json::Value>,
     pub(crate) plan_mode: bool,
+    pub(crate) clarify_mode: bool,
     pub(crate) approvals: ApprovalMode,
     pub(crate) low_precision: bool,
     pub(crate) workspace_confined: bool,
@@ -89,6 +90,7 @@ impl SidecarSession {
             title: String::new(),
             tools: Vec::new(),
             plan_mode: false,
+            clarify_mode: false,
             approvals: opts.approvals,
             low_precision: opts.low_precision,
             workspace_confined: opts.workspace_confined,
@@ -105,6 +107,16 @@ impl SidecarSession {
 
     pub fn set_plan_mode(&mut self, on: bool) {
         self.plan_mode = on;
+        self.sync_ask();
+    }
+
+    pub fn clarify_mode(&self) -> bool {
+        self.clarify_mode
+    }
+
+    pub fn set_clarify_mode(&mut self, on: bool) {
+        self.clarify_mode = on;
+        self.sync_ask();
     }
 
     pub fn approvals(&self) -> ApprovalMode {
@@ -206,6 +218,7 @@ impl SidecarSession {
             "model": self.model,
             "channel": self.channel,
             "plan_mode": self.plan_mode,
+            "clarify_mode": self.clarify_mode,
             "approvals": self.approvals.as_str(),
             "low_precision": self.low_precision,
             "agent_scope": if self.workspace_confined { "workspace" } else { "global" },
@@ -229,6 +242,7 @@ impl SidecarSession {
             effort_locked: self.effort_locked,
             model: self.model.clone(),
             plan_mode: self.plan_mode,
+            clarify_mode: self.clarify_mode,
             approvals: self.approvals,
             low_precision: self.low_precision,
             workspace_confined: self.workspace_confined,

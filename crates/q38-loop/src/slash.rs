@@ -52,6 +52,7 @@ pub enum SlashCmd {
     Setup,
     Approvals { mode: Option<ApprovalMode> },
     Plan { action: PlanAction },
+    Clarify { on: Option<bool> },
     Tools,
     Skills,
     Mcp,
@@ -256,6 +257,7 @@ pub fn parse_slash(text: &str) -> Option<SlashCmd> {
         "model" => Some(SlashCmd::Model { args: rest }),
         "setup" => rest.is_empty().then_some(SlashCmd::Setup),
         "plan" => parse_plan(&rest),
+        "clarify" => parse_clarify(&rest),
         "approvals" | "approval" => parse_approvals(&rest),
         "lossy" | "low-precision" | "lowprecision" => parse_lossy(&rest),
         "yolo" => rest.is_empty().then_some(SlashCmd::Approvals {
@@ -333,6 +335,16 @@ fn parse_plan(rest: &str) -> Option<SlashCmd> {
         }),
         _ => Some(SlashCmd::Unsupported {
             name: "plan".into(),
+        }),
+    }
+}
+
+fn parse_clarify(rest: &str) -> Option<SlashCmd> {
+    match rest.trim().to_ascii_lowercase().as_str() {
+        "" | "on" => Some(SlashCmd::Clarify { on: Some(true) }),
+        "off" | "exit" | "quit" => Some(SlashCmd::Clarify { on: Some(false) }),
+        _ => Some(SlashCmd::Unsupported {
+            name: "clarify".into(),
         }),
     }
 }
@@ -441,6 +453,7 @@ pub struct SlashView<'a> {
     pub family: Family,
     pub queued: usize,
     pub plan_mode: bool,
+    pub clarify_mode: bool,
     pub approvals: ApprovalMode,
     pub low_precision: bool,
 }
@@ -480,6 +493,7 @@ Plan / permissions (TUI; --print stays YOLO)
   /plan                  read-only: research, write a plan, no edits
   /plan go               approve the plan and implement (alias /approve)
   /plan off              leave plan mode
+  /clarify [on|off]      arm ask (2–4 options). /plan also arms it
   /approvals ask|auto|yolo
                          ask = prompt write/bash (Grok default)
                          auto = edits pass, bash still prompts
@@ -531,6 +545,7 @@ pub fn status_text(v: &SlashView<'_>) -> String {
 {low}\
          - approvals: {}\n\
          - plan: {}\n\
+         - clarify: {}\n\
          - busy: {} (queued {})\n\
          - events: {}\n\n\
          **Recap** (local)\n\
@@ -554,6 +569,7 @@ pub fn status_text(v: &SlashView<'_>) -> String {
         v.policy.max_think_tokens,
         v.approvals.as_str(),
         if v.plan_mode { "on" } else { "off" },
+        if v.clarify_mode { "on" } else { "off" },
         v.busy.as_str(),
         v.queued,
         v.events.len(),
@@ -1031,10 +1047,22 @@ pub fn plan_text(on: bool) -> String {
         format!(
             "**Plan mode on.** Read-only tools. Write a markdown plan, then `/plan go` \
              (or y on the TUI prompt) to implement.\n`/plan off` leaves without implementing.\n\
-             Next implement prompt: `{PLAN_IMPLEMENT}`"
+             `ask` is armed (2–4 options). Next implement prompt: `{PLAN_IMPLEMENT}`"
         )
     } else {
         "**Plan mode off.** `/plan` to research read-only before edits.".into()
+    }
+}
+
+pub fn clarify_text(on: bool, plan: bool) -> String {
+    if on {
+        "**Clarify on.** `ask` is armed. The model may present 2–4 options; pick, skip \
+         (recommended), or type Other.\n`/clarify off` disarms unless `/plan` is on."
+            .into()
+    } else if plan {
+        "**Clarify off.** `ask` stays armed because `/plan` is on.".into()
+    } else {
+        "**Clarify off.** `/clarify` or `/plan` to arm `ask`.".into()
     }
 }
 
@@ -1208,6 +1236,18 @@ mod tests {
             Some(SlashCmd::Plan {
                 action: PlanAction::Go
             })
+        );
+        assert_eq!(
+            parse_slash("/clarify"),
+            Some(SlashCmd::Clarify { on: Some(true) })
+        );
+        assert_eq!(
+            parse_slash("/clarify on"),
+            Some(SlashCmd::Clarify { on: Some(true) })
+        );
+        assert_eq!(
+            parse_slash("/clarify off"),
+            Some(SlashCmd::Clarify { on: Some(false) })
         );
         assert_eq!(
             parse_slash("/yolo"),

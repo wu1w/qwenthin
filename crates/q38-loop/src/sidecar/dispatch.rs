@@ -12,7 +12,7 @@ use crate::permit::{ApprovalMode, PlanAction, PLAN_IMPLEMENT};
 use crate::policy::{Effort, XHIGH_WARN};
 use crate::session::{new_session_id, PolicyReason, SessionEvent, SessionMode, SlashCmd};
 use crate::slash::{
-    approvals_text, config_text, context_text, diff_text, help_text, history_text,
+    approvals_text, clarify_text, config_text, context_text, diff_text, help_text, history_text,
     low_precision_text, mcp_text, parse_slash_with_periphery, plan_text, setup_text, skills_text,
     status_text, tools_text, unsupported_text, usage_view, version_text, SlashView,
 };
@@ -112,6 +112,7 @@ impl SidecarSession {
             SlashCmd::Setup => self.reply_text(setup_text()),
             SlashCmd::Approvals { mode } => self.set_approvals(mode),
             SlashCmd::Plan { action } => self.set_plan(action),
+            SlashCmd::Clarify { on } => self.set_clarify(on),
             SlashCmd::LowPrecision { on } => self.set_lossy(on),
             SlashCmd::InvokeSkill { name, args } => {
                 let prompt = crate::sticky::skill_turn_prompt(&name, &args);
@@ -162,6 +163,7 @@ impl SidecarSession {
             family: self.family,
             queued: self.mailbox.queued(),
             plan_mode: self.plan_mode,
+            clarify_mode: self.clarify_mode,
             approvals: self.approvals,
             low_precision: self.low_precision,
         }
@@ -195,10 +197,12 @@ impl SidecarSession {
         match action {
             PlanAction::On => {
                 self.plan_mode = true;
+                self.sync_ask();
                 self.reply_text(plan_text(true))
             }
             PlanAction::Off => {
                 self.plan_mode = false;
+                self.sync_ask();
                 self.reply_text(plan_text(false))
             }
             PlanAction::Go => {
@@ -209,9 +213,18 @@ impl SidecarSession {
                     );
                 }
                 self.plan_mode = false;
+                self.sync_ask();
                 Dispatch::turn(PLAN_IMPLEMENT)
             }
         }
+    }
+
+    fn set_clarify(&mut self, on: Option<bool>) -> Dispatch {
+        if let Some(on) = on {
+            self.clarify_mode = on;
+            self.sync_ask();
+        }
+        self.reply_text(clarify_text(self.clarify_mode, self.plan_mode))
     }
 
     pub(crate) fn fork_mode(&mut self, mode: SessionMode) -> Dispatch {

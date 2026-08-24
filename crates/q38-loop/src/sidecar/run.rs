@@ -67,9 +67,11 @@ pub async fn execute_turn(
     opts.persist_session = req.persist;
     opts.session_mode = req.snapshot.mode;
     opts.plan_mode = req.snapshot.plan_mode;
+    opts.clarify_mode = req.snapshot.clarify_mode;
     opts.low_precision = req.snapshot.low_precision;
     opts.confined = req.snapshot.workspace_confined;
     opts.permit = req.permit;
+    opts.clarify = req.clarify;
 
     let cancel = req.cancel.clone();
     let steer = req.steer.clone();

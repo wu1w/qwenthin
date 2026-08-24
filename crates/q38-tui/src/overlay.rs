@@ -1,6 +1,7 @@
 //! Grok-shaped composer overlays: `/setup`, permission ask, plan approve.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use q38_loop::clarify::{ClarifyDecision, ClarifyRequest};
 use q38_loop::config::Config;
 use q38_loop::permit::{PermitDecision, PermitRequest};
 use ratatui::style::{Modifier, Style};
@@ -26,6 +27,10 @@ pub struct SetupWizard {
 pub enum Overlay {
     Setup(SetupWizard),
     Permit(PermitRequest),
+    Clarify {
+        req: ClarifyRequest,
+        other: Option<String>,
+    },
     PlanReview,
 }
 
@@ -102,6 +107,7 @@ impl Overlay {
         match self {
             Overlay::Setup(wiz) => handle_setup(wiz, key, prompt, cfg),
             Overlay::Permit(req) => handle_permit(req, key),
+            Overlay::Clarify { req, other } => handle_clarify(req, other, key, prompt),
             Overlay::PlanReview => handle_plan(key),
         }
     }
@@ -152,17 +158,61 @@ impl Overlay {
                 Line::from("y implement   n stay in plan   q exit plan"),
             ])
             .block(Block::default().borders(Borders::TOP).title(" plan ")),
+            Overlay::Clarify { req, other } => {
+                let ask = &req.ask;
+                let mut lines = vec![
+                    Line::from(Span::styled(
+                        ask.title.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(clip(&ask.prompt, 80)),
+                ];
+                for (i, opt) in ask.options.iter().enumerate() {
+                    let mark = if i == 0 { "*" } else { " " };
+                    lines.push(Line::from(format!(
+                        "{mark}{}. {}",
+                        i + 1,
+                        clip(&opt.label, 72)
+                    )));
+                }
+                if other.is_some() {
+                    lines.push(Line::from(format!("other ❯ {}", prompt.text())));
+                    lines.push(Line::from(Span::styled(
+                        "enter submit  esc back",
+                        Style::default().add_modifier(Modifier::DIM),
+                    )));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        "1-4 pick  s skip  o other",
+                        Style::default().add_modifier(Modifier::DIM),
+                    )));
+                }
+                Paragraph::new(lines).block(Block::default().borders(Borders::TOP).title(" ask "))
+            }
         }
     }
 
     pub fn height(&self) -> u16 {
-        4
+        match self {
+            Overlay::Clarify { req, other } => {
+                let extra = if other.is_some() { 2 } else { 1 };
+                (3 + req.ask.options.len() as u16 + extra).clamp(5, 12)
+            }
+            _ => 4,
+        }
     }
 
     pub fn abort(&mut self) {
-        if let Overlay::Permit(req) = self {
-            let tx = std::mem::replace(&mut req.reply, tokio::sync::oneshot::channel().0);
-            let _ = tx.send(PermitDecision::Deny);
+        match self {
+            Overlay::Permit(req) => {
+                let tx = std::mem::replace(&mut req.reply, tokio::sync::oneshot::channel().0);
+                let _ = tx.send(PermitDecision::Deny);
+            }
+            Overlay::Clarify { req, .. } => {
+                let tx = std::mem::replace(&mut req.reply, tokio::sync::oneshot::channel().0);
+                let _ = tx.send(ClarifyDecision::Skip);
+            }
+            _ => {}
         }
     }
 }
@@ -227,6 +277,64 @@ fn handle_permit(req: &mut PermitRequest, key: KeyEvent) -> OverlayAction {
     let tx = std::mem::replace(&mut req.reply, tokio::sync::oneshot::channel().0);
     let _ = tx.send(dec);
     OverlayAction::Close
+}
+
+fn handle_clarify(
+    req: &mut ClarifyRequest,
+    other: &mut Option<String>,
+    key: KeyEvent,
+    prompt: &mut Prompt,
+) -> OverlayAction {
+    if other.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                *other = None;
+                prompt.clear();
+                OverlayAction::None
+            }
+            KeyCode::Enter => {
+                let text = prompt.take();
+                let dec = if text.trim().is_empty() {
+                    ClarifyDecision::Skip
+                } else {
+                    ClarifyDecision::Other { text }
+                };
+                let tx = std::mem::replace(&mut req.reply, tokio::sync::oneshot::channel().0);
+                let _ = tx.send(dec);
+                OverlayAction::Close
+            }
+            _ => {
+                let _ = prompt.handle_key(key, false);
+                OverlayAction::None
+            }
+        }
+    } else {
+        let n = req.ask.options.len();
+        let dec = match key.code {
+            KeyCode::Char(c) if c >= '1' && c <= '4' => {
+                let i = (c as u8 - b'1') as usize;
+                if i < n {
+                    let o = &req.ask.options[i];
+                    ClarifyDecision::Pick {
+                        id: o.id.clone(),
+                        label: o.label.clone(),
+                    }
+                } else {
+                    return OverlayAction::None;
+                }
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Esc => ClarifyDecision::Skip,
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                *other = Some(String::new());
+                prompt.clear();
+                return OverlayAction::None;
+            }
+            _ => return OverlayAction::None,
+        };
+        let tx = std::mem::replace(&mut req.reply, tokio::sync::oneshot::channel().0);
+        let _ = tx.send(dec);
+        OverlayAction::Close
+    }
 }
 
 fn handle_plan(key: KeyEvent) -> OverlayAction {

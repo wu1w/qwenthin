@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use q38_loop::clarify::{ClarifyDecision, ClarifyHub, ClarifyRequest};
 use q38_loop::config::Config;
 use q38_loop::media::MediaPart;
 use q38_loop::permit::{PermitDecision, PermitHub, PermitRequest};
@@ -34,6 +35,9 @@ pub struct Inner {
     pub permit: PermitHub,
     pub pending: VecDeque<PendingPermit>,
     pub permit_seq: u64,
+    pub clarify: ClarifyHub,
+    pub pending_clarify: VecDeque<PendingClarify>,
+    pub clarify_seq: u64,
     pub agents_md: bool,
     pub agents_md_head: bool,
     pub cron: CronStore,
@@ -79,6 +83,25 @@ impl PendingPermit {
     }
 }
 
+pub struct PendingClarify {
+    pub id: u64,
+    pub req: ClarifyRequest,
+}
+
+impl PendingClarify {
+    pub fn json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "title": self.req.ask.title,
+            "prompt": self.req.ask.prompt,
+            "options": self.req.ask.options.iter().map(|o| json!({
+                "id": o.id,
+                "label": o.label,
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
 impl AppState {
     pub fn new(
         session: SidecarSession,
@@ -97,6 +120,7 @@ impl AppState {
         });
         let approvals = session.approvals();
         let (permit, permit_rx) = PermitHub::pair(approvals);
+        let (clarify, clarify_rx) = ClarifyHub::pair();
         let inner = Arc::new(Mutex::new(Inner {
             session,
             cfg,
@@ -105,6 +129,9 @@ impl AppState {
             permit,
             pending: VecDeque::new(),
             permit_seq: 0,
+            clarify,
+            pending_clarify: VecDeque::new(),
+            clarify_seq: 0,
             agents_md,
             agents_md_head,
             cron: CronStore::load(),
@@ -129,6 +156,23 @@ impl AppState {
                 // Later items surface via decide_permit → permit.ask(front).
                 if was_empty {
                     let _ = bus_p.send(notify("permit.ask", payload));
+                }
+            }
+        });
+        let pending_clarify = inner.clone();
+        let bus_c = bus.clone();
+        tokio::spawn(async move {
+            let mut rx = clarify_rx;
+            while let Some(req) = rx.recv().await {
+                let mut g = pending_clarify.lock().await;
+                g.clarify_seq += 1;
+                let id = g.clarify_seq;
+                let p = PendingClarify { id, req };
+                let payload = p.json();
+                let was_empty = g.pending_clarify.is_empty();
+                g.pending_clarify.push_back(p);
+                if was_empty {
+                    let _ = bus_c.send(notify("clarify.ask", payload));
                 }
             }
         });
@@ -230,6 +274,27 @@ impl AppState {
             let _ = g.bus.send(notify("permit.ask", next.json()));
         } else {
             let _ = g.bus.send(notify("permit.clear", json!(null)));
+        }
+        Ok(json!({"ok": true, "id": id}))
+    }
+
+    pub async fn decide_clarify(
+        &self,
+        id: u64,
+        decision: ClarifyDecision,
+    ) -> Result<Value, String> {
+        let mut g = self.inner.lock().await;
+        let idx = g
+            .pending_clarify
+            .iter()
+            .position(|p| p.id == id)
+            .ok_or_else(|| "no matching clarify".to_string())?;
+        let p = g.pending_clarify.remove(idx).expect("idx");
+        let _ = p.req.reply.send(decision);
+        if let Some(next) = g.pending_clarify.front() {
+            let _ = g.bus.send(notify("clarify.ask", next.json()));
+        } else {
+            let _ = g.bus.send(notify("clarify.clear", json!(null)));
         }
         Ok(json!({"ok": true, "id": id}))
     }
@@ -412,6 +477,7 @@ pub fn apply_dispatch(inner: &mut Inner, shared: Arc<Mutex<Inner>>, dispatch: Di
                 live.cancel.cancel();
             }
             clear_pending_permits(inner);
+            clear_pending_clarifies(inner);
             push_state(inner);
             json!({"ok": true, "aborted": true})
         }
@@ -420,6 +486,7 @@ pub fn apply_dispatch(inner: &mut Inner, shared: Arc<Mutex<Inner>>, dispatch: Di
                 live.cancel.cancel();
             }
             clear_pending_permits(inner);
+            clear_pending_clarifies(inner);
             push_state(inner);
             json!({"ok": true, "aborted": true, "cleared": cleared})
         }
@@ -434,6 +501,16 @@ fn clear_pending_permits(inner: &mut Inner) {
     }
     inner.pending.clear();
     let _ = inner.bus.send(notify("permit.clear", json!(null)));
+}
+
+fn clear_pending_clarifies(inner: &mut Inner) {
+    if inner.pending_clarify.is_empty() {
+        return;
+    }
+    for p in inner.pending_clarify.drain(..) {
+        let _ = p.req.reply.send(ClarifyDecision::Skip);
+    }
+    let _ = inner.bus.send(notify("clarify.clear", json!(null)));
 }
 
 pub(crate) fn push_state(inner: &Inner) {
@@ -482,6 +559,7 @@ fn cleanup_after_panic(g: &mut Inner) {
     }
     g.live = None;
     clear_pending_permits(g);
+    clear_pending_clarifies(g);
     push_state(g);
 }
 
@@ -507,6 +585,7 @@ pub fn start_turn(
         steer: inner.session.steer_slot(),
         persist: true,
         permit: Some(inner.permit.clone()),
+        clarify: Some(inner.clarify.clone()),
     };
     let cfg = inner.cfg.clone();
     let agents_md = inner.agents_md;

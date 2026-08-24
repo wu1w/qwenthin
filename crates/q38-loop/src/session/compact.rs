@@ -30,6 +30,10 @@ const STATE_CAP: usize = 10;
 const STATE_HEAD: usize = 3;
 const NOTE_CAP: usize = 2;
 const DECISION_CAP: usize = 8;
+/// Prior real user turns that left the live window. Cap drops oldest.
+const CONSTRAINT_CAP: usize = 6;
+const PRIOR_USER: &str = "Prior User";
+const PRIOR_USER_LEGACY: &str = "Constraints";
 
 #[derive(Clone, Copy, Debug)]
 enum Mode {
@@ -288,10 +292,11 @@ fn merge_extract(prev_s: &str, prev_i: &str, new_s: &str, new_i: &str) -> (Strin
     );
     upsert_section(
         &mut out,
-        "Constraints",
-        pick_keep_prev(
-            section_get(&new, "Constraints"),
-            section_get(&prev, "Constraints"),
+        PRIOR_USER,
+        merge_bullets(
+            prior_user_body(&prev),
+            prior_user_body(&new),
+            CONSTRAINT_CAP,
         ),
     );
     upsert_section(
@@ -353,21 +358,48 @@ fn section_get<'a>(sections: &'a [(String, String)], name: &str) -> Option<&'a s
         .map(|(_, v)| v.as_str())
 }
 
-fn pick_keep_prev(new: Option<&str>, prev: Option<&str>) -> String {
-    match (prev, new) {
-        (Some(p), _) if !is_stub_section(p) => p.to_string(),
-        (_, Some(n)) if !is_stub_section(n) => n.to_string(),
-        (Some(p), _) => p.to_string(),
-        (_, Some(n)) => n.to_string(),
-        _ => "(none)".into(),
-    }
-}
-
 fn pick_plain(new: Option<&str>, prev: Option<&str>) -> String {
     new.filter(|s| !s.trim().is_empty())
         .or(prev)
         .unwrap_or("(see live user)")
         .to_string()
+}
+
+fn prior_user_body(sections: &[(String, String)]) -> Option<&str> {
+    section_get(sections, PRIOR_USER).or_else(|| section_get(sections, PRIOR_USER_LEGACY))
+}
+
+fn bullet_key(item: &str) -> String {
+    item.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Short acknowledgements are not standing intent. Do not keyword-mine constraints.
+fn is_ack_user(text: &str) -> bool {
+    if text.contains('/') || text.contains('\\') || text.contains('`') {
+        return false;
+    }
+    let key: String = text
+        .chars()
+        .filter(|c| c.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(c))
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    matches!(
+        key.as_str(),
+        "好" | "好的"
+            | "行"
+            | "继续"
+            | "嗯"
+            | "ok"
+            | "okay"
+            | "yes"
+            | "y"
+            | "是"
+            | "对"
+            | "就这样"
+            | "好就这样"
+            | "继续吧"
+            | "go"
+    )
 }
 
 fn merge_bullets(prev: Option<&str>, new: Option<&str>, cap: usize) -> String {
@@ -376,10 +408,11 @@ fn merge_bullets(prev: Option<&str>, new: Option<&str>, cap: usize) -> String {
         for line in block.lines() {
             let t = line.trim();
             let item = t.strip_prefix("- ").unwrap_or(t);
-            if item.is_empty() || item == "(none)" {
+            if item.is_empty() || is_stub_section(item) {
                 continue;
             }
-            if !bullets.iter().any(|b: &String| b == item) {
+            let key = bullet_key(item);
+            if !bullets.iter().any(|b: &String| bullet_key(b) == key) {
                 bullets.push(item.to_string());
             }
         }
@@ -418,16 +451,16 @@ fn render_sections(sections: &[(String, String)]) -> String {
     const ORDER: [&str; 5] = [
         "Active Task",
         "Current State",
-        "Constraints",
+        PRIOR_USER,
         "Decisions",
         "Open Work",
     ];
     let mut body = String::new();
     for name in ORDER {
         let val = section_get(sections, name).unwrap_or("(none)");
-        // An empty Constraints heading is a false hint ("there are none").
+        // An empty Prior User heading is a false hint ("there are none").
         // Omit it; S1/S7 enforce test/spec constraints in the live turn.
-        if name == "Constraints" && is_stub_section(val) {
+        if name == PRIOR_USER && is_stub_section(val) {
             continue;
         }
         body.push_str("## ");
@@ -519,13 +552,20 @@ fn extract(
     let mut tools: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     let mut decisions: Vec<String> = Vec::new();
+    let mut constraints: Vec<String> = Vec::new();
     let mut lines: Vec<String> = Vec::new();
     let mut pending: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     for (seq, event) in events.iter().enumerate().take(until + 1).skip(from) {
         match event {
             SessionEvent::User(u) if !is_hidden_user_text(&u.text) => {
-                lines.push(format!("seq {seq}  user  {}", clip(&u.text, CLIP)));
+                let clipped = clip(&u.text, CLIP);
+                lines.push(format!("seq {seq}  user  {clipped}"));
+                // Live user is Active Task. Earlier real turns are the sticky
+                // channel as Prior User — no keyword mining.
+                if seq != keep_user && !clipped.is_empty() && !is_ack_user(&clipped) {
+                    constraints.push(clipped);
+                }
             }
             SessionEvent::Assistant(a) => {
                 if let Some(calls) = &a.tool_calls {
@@ -570,6 +610,11 @@ fn extract(
     summary.push_str(if task.is_empty() { "(none)" } else { &task });
     summary.push_str("\n\n## Current State\n");
     write_bullets(&mut summary, &state);
+    let constraints = take_last(constraints, CONSTRAINT_CAP);
+    if !constraints.is_empty() {
+        summary.push_str("\n## Prior User\n");
+        write_bullets(&mut summary, &constraints);
+    }
     summary.push_str("\n## Decisions\n");
     write_bullets(&mut summary, &take_last(decisions, DECISION_CAP));
     summary.push_str("\n## Open Work\n");
@@ -1168,8 +1213,8 @@ mod tests {
         );
         assert!(plan.summary.contains("obsidian-compact"));
         assert!(
-            !plan.summary.contains("## Constraints"),
-            "empty Constraints is a false hint: {}",
+            !plan.summary.contains("## Prior User"),
+            "empty Prior User is a false hint: {}",
             plan.summary
         );
         assert!(
@@ -1188,8 +1233,8 @@ mod tests {
             "idx-b",
         );
         assert!(
-            !merged.contains("## Constraints"),
-            "stub Constraints survived merge: {merged}"
+            !merged.contains("## Constraints") && !merged.contains("## Prior User"),
+            "stub Prior User survived merge: {merged}"
         );
         assert!(merged.contains("chose b"));
     }
@@ -1371,6 +1416,90 @@ mod tests {
             !task.contains("别用工具"),
             "stale first-turn Active Task hijacks later work: {}",
             plan.summary
+        );
+        let constraints = section_get(&sections, "Prior User").unwrap_or("");
+        assert!(
+            constraints.contains("别用工具"),
+            "evicted user text must stick in Prior User: {}",
+            plan.summary
+        );
+        assert!(
+            !constraints.contains("read pads/p01.txt"),
+            "live user must not duplicate into Prior User: {}",
+            plan.summary
+        );
+    }
+
+    #[test]
+    fn hidden_user_is_not_a_constraint() {
+        let events = vec![
+            start(),
+            SessionEvent::user("real task"),
+            SessionEvent::assistant("working", "", None),
+            SessionEvent::user(wrap_tool_response("Continue working on the task.")),
+            SessionEvent::user("next file"),
+        ];
+        let plan = plan_compact(&events).expect("compact");
+        let sections = parse_sections(&plan.summary);
+        let constraints = section_get(&sections, "Prior User").unwrap_or("");
+        assert!(
+            constraints.contains("real task"),
+            "prior real user should stick: {}",
+            plan.summary
+        );
+        assert!(
+            !constraints.to_ascii_lowercase().contains("continue working"),
+            "hidden continue must not become Prior User: {}",
+            plan.summary
+        );
+    }
+
+    #[test]
+    fn ack_user_is_not_prior_user() {
+        let events = vec![
+            start(),
+            SessionEvent::user("好，就这样"),
+            SessionEvent::assistant("嗯。", "", None),
+            SessionEvent::user("read pads/p01.txt then stop"),
+            SessionEvent::assistant("", "", Some(vec![read_call("r", "pads/p01.txt")])),
+            SessionEvent::tool("r", "read", "pad-01 line"),
+        ];
+        let plan = plan_compact(&events).expect("compact");
+        assert!(
+            !plan.summary.contains("就这样") && !plan.summary.contains("## Prior User"),
+            "ack must not become Prior User: {}",
+            plan.summary
+        );
+    }
+
+    #[test]
+    fn constraints_merge_appends_and_drops_oldest() {
+        let prev = "## Active Task\na\n\n## Current State\n- x\n\n## Constraints\n- keep-zh\n- old-eval\n\n## Decisions\n(none)\n\n## Open Work\nlive\n";
+        let new = "## Active Task\nb\n\n## Current State\n- y\n\n## Constraints\n- new-path\n\n## Decisions\n(none)\n\n## Open Work\nlive\n";
+        let (merged, _) = merge_extract(prev, "i1", new, "i2");
+        let sections = parse_sections(&merged);
+        let constraints = section_get(&sections, "Prior User").unwrap_or("");
+        assert!(
+            constraints.contains("keep-zh") && constraints.contains("new-path"),
+            "merge must append, not freeze: {merged}"
+        );
+        let many_prev = format!(
+            "## Active Task\na\n\n## Current State\n- x\n\n## Constraints\n{}\n\n## Decisions\n(none)\n\n## Open Work\nlive\n",
+            (0..CONSTRAINT_CAP)
+                .map(|i| format!("- c{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let (capped, _) = merge_extract(&many_prev, "i1", new, "i2");
+        let capped_sections = parse_sections(&capped);
+        let body = section_get(&capped_sections, "Prior User").unwrap_or("");
+        assert!(
+            !body.contains("- c0"),
+            "cap should drop the oldest constraint: {capped}"
+        );
+        assert!(
+            body.contains("new-path") && body.contains(&format!("c{}", CONSTRAINT_CAP - 1)),
+            "newest prev + new slice should remain: {capped}"
         );
     }
 

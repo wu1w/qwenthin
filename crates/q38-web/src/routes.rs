@@ -10,6 +10,7 @@ use q38_loop::channel::{
     catalog_json, endpoint_kind, fetch_qrcode, merge_channel_endpoints, poll_qrcode,
     remove_channel_endpoint, upsert_channel_endpoint, BusyPolicy, ChannelEndpoint,
 };
+use q38_loop::clarify::ClarifyDecision;
 use q38_loop::config::{parse_max_tokens, parse_working_window, Config};
 use q38_loop::mcp::{merge_mcp_servers, remove_mcp_server, upsert_mcp_server, McpRegistry};
 use q38_loop::permit::{ApprovalMode, PermitDecision};
@@ -49,6 +50,7 @@ pub fn router(state: AppState, dist: PathBuf) -> Router {
         .route("/workspace/ls", get(workspace_ls))
         .route("/config", get(config_get).post(config_post))
         .route("/permit", post(permit_post))
+        .route("/clarify", post(clarify_post))
         .route("/skills", get(skills_get).post(skills_post))
         .route("/mcp", get(mcp_get).post(mcp_post))
         .route("/mcp/test", post(mcp_test))
@@ -124,6 +126,7 @@ async fn state_get(State(st): State<AppState>) -> Json<Value> {
     let g = st.inner.lock().await;
     let mut v = g.session.state_json();
     v["permit"] = json!(g.pending.front().map(|p| p.json()));
+    v["clarify"] = json!(g.pending_clarify.front().map(|p| p.json()));
     v["jobs"] = json!(g.cron.jobs.len());
     Json(v)
 }
@@ -224,6 +227,7 @@ async fn client_ws(mut socket: WebSocket, st: AppState) {
                 "state": g.session.state_json(),
                 "events": g.session.events(),
                 "permit": g.pending.front().map(|p| p.json()),
+                "clarify": g.pending_clarify.front().map(|p| p.json()),
             }
         });
         if socket
@@ -253,6 +257,7 @@ async fn client_ws(mut socket: WebSocket, st: AppState) {
                                     "state": g.session.state_json(),
                                     "events": g.session.events(),
                                     "permit": g.pending.front().map(|p| p.json()),
+                "clarify": g.pending_clarify.front().map(|p| p.json()),
                                 }
                             })
                         };
@@ -676,6 +681,64 @@ async fn permit_post(
         }
     };
     st.decide_permit(body.id, decision)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))
+}
+
+#[derive(Deserialize)]
+struct ClarifyBody {
+    id: u64,
+    #[serde(default)]
+    pick: Option<String>,
+    #[serde(default)]
+    skip: Option<bool>,
+    #[serde(default)]
+    other: Option<String>,
+}
+
+async fn clarify_post(
+    State(st): State<AppState>,
+    Json(body): Json<ClarifyBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let decision = if body.skip.unwrap_or(false) {
+        ClarifyDecision::Skip
+    } else if let Some(text) = body.other {
+        let t = text.trim();
+        if t.is_empty() {
+            ClarifyDecision::Skip
+        } else {
+            ClarifyDecision::Other {
+                text: t.to_string(),
+            }
+        }
+    } else if let Some(pick) = body.pick {
+        let g = st.inner.lock().await;
+        let pending = g
+            .pending_clarify
+            .iter()
+            .find(|p| p.id == body.id)
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "no matching clarify".into()))?;
+        let opt = pending
+            .req
+            .ask
+            .options
+            .iter()
+            .find(|o| o.id == pick)
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "unknown option".into()))?;
+        let decision = ClarifyDecision::Pick {
+            id: opt.id.clone(),
+            label: opt.label.clone(),
+        };
+        drop(g);
+        decision
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "clarify needs pick, skip, or other".into(),
+        ));
+    };
+    st.decide_clarify(body.id, decision)
         .await
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))

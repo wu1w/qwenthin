@@ -487,6 +487,13 @@ impl SidecarSession {
         if matches!(self.mode, SessionMode::Chat) {
             self.tools.clear();
         }
+        self.sync_ask();
+    }
+
+    pub(crate) fn sync_ask(&mut self) {
+        let armed = matches!(self.mode, SessionMode::Agent | SessionMode::Think)
+            && (self.plan_mode || self.clarify_mode);
+        crate::tools_schema::sync_ask_tool(&mut self.tools, armed);
     }
 
     pub(crate) fn refresh_title(&mut self) {

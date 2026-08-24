@@ -881,6 +881,8 @@ th.tick input, td.tick input {
 .modal h2 { font-size: 15px; margin: 0 0 4px; display: flex; align-items: center; gap: 8px; }
 .modal .m-sub { color: var(--label-3); font-size: 11px; margin-bottom: 12px; font-family: var(--mono); }
 .m-actions { display: flex; gap: 10px; justify-content: flex-end; }
+.m-actions.col { flex-direction: column; align-items: stretch; margin-bottom: 14px; }
+.m-actions.col .btn { width: 100%; justify-content: flex-start; }
 .preview-img { max-width: 100%; border-radius: 8px; }
 
 .stat-num { font-size: 24px; font-weight: 700; font-family: var(--mono); margin-top: 6px; }
@@ -1029,6 +1031,7 @@ th.tick input, td.tick input {
   font-weight: 600;
 }
 .run-chip.phase-permit.on { background: var(--warn-soft); color: var(--warn); }
+.run-chip.phase-clarify.on { background: var(--warn-soft); color: var(--warn); }
 .run-chip.phase-stopping.on { background: var(--danger-soft); color: var(--danger); }
 .run-dot {
   width: 7px; height: 7px; border-radius: 50%;
@@ -1041,6 +1044,7 @@ th.tick input, td.tick input {
 }
 .run-dot.lg { width: 9px; height: 9px; flex-basis: 9px; }
 .run-dot.phase-permit { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
+.run-dot.phase-clarify { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
 .run-dot.phase-stopping { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); animation: none; }
 @keyframes pulse {
   0%, 100% { opacity: 1; }

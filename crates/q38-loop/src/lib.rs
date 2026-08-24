@@ -7,6 +7,7 @@
 pub mod adapter;
 pub mod agent;
 pub mod channel;
+pub mod clarify;
 pub mod config;
 pub mod cron;
 pub mod echo;
@@ -75,6 +76,7 @@ pub use media::{MediaBins, MediaCaps, MediaKind, MediaPart};
 pub use paw_loop::{
     Gate, GateCtx, GateDecision, HandlerScope, StopHandler, StopHandlerSet, ToolFingerprint,
 };
+pub use clarify::{ClarifyAsk, ClarifyDecision, ClarifyHub, ClarifyRequest};
 pub use permit::{ApprovalMode, PermitAsk, PermitDecision, PermitHub, PlanAction, PLAN_IMPLEMENT};
 pub use policy::{Effort, Sampling, ThinkBudget, ThinkPolicy, XHIGH_WARN};
 pub use probe::{run_probe, ProbeReport};
