@@ -18,6 +18,41 @@ import {
 import logo from "./assets/logo.png";
 import { DialogHost, Icon } from "./ui";
 
+function isWinDesktop() {
+  return window.qwenthinDesktop?.platform === "win32";
+}
+
+function WindowButtons() {
+  const desktop = window.qwenthinDesktop;
+  if (!desktop) {
+    return (
+      <div className="traffic" aria-hidden>
+        <span className="tl-r" />
+        <span className="tl-y" />
+        <span className="tl-g" />
+      </div>
+    );
+  }
+  const win = desktop.platform === "win32";
+  return (
+    <div className="traffic">
+      {win ? (
+        <>
+          <button type="button" className="tl-y" aria-label="最小化" onClick={() => desktop.minimize()} />
+          <button type="button" className="tl-g" aria-label="最大化" onClick={() => desktop.toggleMaximize()} />
+          <button type="button" className="tl-r" aria-label="关闭" onClick={() => desktop.close()} />
+        </>
+      ) : (
+        <>
+          <button type="button" className="tl-r" aria-label="关闭" onClick={() => desktop.close()} />
+          <button type="button" className="tl-y" aria-label="最小化" onClick={() => desktop.minimize()} />
+          <button type="button" className="tl-g" aria-label="最大化" onClick={() => desktop.toggleMaximize()} />
+        </>
+      )}
+    </div>
+  );
+}
+
 /** 右侧状态栏默认态：宽屏展开，窄屏收起；用户手动切换后记住偏好。 */
 function initialDetails(): boolean {
   const saved = localStorage.getItem("q38.details.open");
@@ -262,13 +297,12 @@ export function App() {
     <>
       <div className="desktop" />
       <div className="window">
-        <header className="titlebar">
-          <div className="traffic" aria-hidden>
-            <span className="tl-r" />
-            <span className="tl-y" />
-            <span className="tl-g" />
-          </div>
-          <div>
+        <header
+          className={`titlebar${isWinDesktop() ? " win" : ""}`}
+          onDoubleClick={() => window.qwenthinDesktop?.toggleMaximize()}
+        >
+          {isWinDesktop() ? null : <WindowButtons />}
+          <div className="titlebar-title">
             <span className="doc-title">Qwenthin 控制台</span>
             <span className="doc-sub"> · {TITLES[page]}</span>
           </div>
@@ -299,6 +333,7 @@ export function App() {
               </span>
             </button>
           </div>
+          {isWinDesktop() ? <WindowButtons /> : null}
         </header>
         {!wsUp ? (
           <div className="ws-banner" role="alert">

@@ -82,15 +82,81 @@ svg { display: block; }
   user-select: none;
   min-width: 0;
 }
-.titlebar > div:nth-child(2) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.titlebar-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .traffic { display: flex; gap: 8px; -webkit-app-region: no-drag; }
-.traffic span { width: 12px; height: 12px; border-radius: 50%; }
+.traffic span,
+.traffic button {
+  width: 12px;
+  height: 12px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  display: block;
+  cursor: default;
+}
+html.electron .traffic button { cursor: pointer; }
 .tl-r { background: #ff5f57; } .tl-y { background: #febc2e; } .tl-g { background: #28c840; }
+html.electron .desktop { display: none; }
+html.electron .window {
+  inset: 0;
+  border-radius: 0;
+  box-shadow: none;
+  border: none;
+}
 .doc-title { font-weight: 600; font-size: 13px; }
 .doc-sub { color: var(--label-3); font-size: 11px; }
 .spacer { flex: 1; min-width: 0; }
 .titlebar .spacer { flex: 1; }
 .titlebar .no-drag { -webkit-app-region: no-drag; display: flex; gap: 8px; align-items: center; min-width: 0; flex: 0 1 auto; }
+html.electron.win .titlebar,
+.titlebar.win {
+  padding: 0 0 0 16px;
+}
+html.electron.win .traffic,
+.titlebar.win .traffic {
+  display: flex;
+  flex: 0 0 auto;
+  height: 100%;
+  align-items: center;
+  gap: 0;
+  padding: 0 2px 0 8px;
+}
+html.electron.win .traffic button,
+.titlebar.win .traffic button {
+  width: 46px;
+  height: 100%;
+  border-radius: 0;
+  cursor: pointer;
+}
+html.electron.win .tl-y,
+.titlebar.win .tl-y { background: transparent; }
+html.electron.win .tl-g,
+.titlebar.win .tl-g { background: transparent; }
+html.electron.win .tl-r,
+.titlebar.win .tl-r { background: transparent; }
+html.electron.win .traffic button::before,
+.titlebar.win .traffic button::before {
+  content: "";
+  display: block;
+  margin: 0 auto;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+html.electron.win .tl-y::before,
+.titlebar.win .tl-y::before { background: #febc2e; }
+html.electron.win .tl-g::before,
+.titlebar.win .tl-g::before { background: #28c840; }
+html.electron.win .tl-r::before,
+.titlebar.win .tl-r::before { background: #ff5f57; }
+html.electron.win .tl-y:hover,
+.titlebar.win .tl-y:hover { background: rgba(15, 23, 42, 0.06); }
+html.electron.win .tl-g:hover,
+.titlebar.win .tl-g:hover { background: rgba(15, 23, 42, 0.06); }
+html.electron.win .tl-r:hover,
+.titlebar.win .tl-r:hover { background: #e81123; }
+html.electron.win .tl-r:hover::before,
+.titlebar.win .tl-r:hover::before { background: #fff; }
 
 .chip {
   display: inline-flex; align-items: center; gap: 6px;

@@ -57,6 +57,8 @@ read_default_lines = 600       # one page ≈ 600 lines; offset/limit pages the 
 result_max_chars = 10000
 result_head_chars = 8000
 result_tail_chars = 2000
+# extra_path = ["~/.cargo/bin"] # optional; bash already prepends rustup/homebrew/local bins when they exist
+
 
 [code_mode]
 timeout_s = 60

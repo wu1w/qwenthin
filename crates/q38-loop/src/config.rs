@@ -331,6 +331,10 @@ pub struct ToolsConfig {
     pub result_max_chars: u32,
     pub result_head_chars: u32,
     pub result_tail_chars: u32,
+    /// Extra dirs prepended to the bash tool PATH. GUI/Electron launches skip
+    /// rustup's shell hook, so cargo is otherwise missing even when installed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_path: Vec<String>,
 }
 
 impl Default for ToolsConfig {
@@ -343,6 +347,7 @@ impl Default for ToolsConfig {
             result_max_chars: 10_000,
             result_head_chars: 8_000,
             result_tail_chars: 2_000,
+            extra_path: Vec::new(),
         }
     }
 }

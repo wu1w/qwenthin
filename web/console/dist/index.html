@@ -4,9 +4,17 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Qwenthin · 本地控制台</title>
+    <script>
+      if (/\bElectron\b/.test(navigator.userAgent)) {
+        const html = document.documentElement;
+        html.classList.add("electron");
+        if (/Windows/i.test(navigator.userAgent)) html.classList.add("win");
+        else if (/Mac/i.test(navigator.userAgent)) html.classList.add("mac");
+      }
+    </script>
     <link rel="icon" type="image/png" href="/favicon.png" />
-    <script type="module" crossorigin src="/assets/index-CeSX-cGF.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-DQ-xDSy9.css">
+    <script type="module" crossorigin src="/assets/index-GXWsNF6L.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DdR6Gm0S.css">
   </head>
   <body>
     <div id="root"></div>

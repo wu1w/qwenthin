@@ -15,6 +15,10 @@
 plugins/**/node_modules/
 plugins/**/dist/
 web/**/node_modules/
+web/desktop/release/
+web/desktop/resources/
+web/desktop/build/icon.png
+web/desktop/*.log
 
 # Workspace secrets / local state — never commit
 .q38/

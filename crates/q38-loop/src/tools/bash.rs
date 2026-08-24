@@ -1,5 +1,6 @@
 //! `bash`. QwenPaw `execute_shell_command`: fresh subprocess, workspace cwd, formatted output.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -194,6 +195,7 @@ fn spawn_shell(command: &str, cwd: &Path) -> std::io::Result<tokio::process::Chi
         }
     }
     cmd.current_dir(cwd)
+        .env("PATH", tool_path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -207,6 +209,134 @@ fn spawn_shell(command: &str, cwd: &Path) -> std::io::Result<tokio::process::Chi
         });
     }
     cmd.spawn()
+}
+
+/// Bash runs `--noprofile --norc`, so rustup's shell hook never runs.
+/// GUI/Electron PATH is often just `/usr/bin:/bin`, which hides `~/.cargo/bin`.
+fn tool_path() -> OsString {
+    merge_tool_path(
+        std::env::var_os("PATH"),
+        crate::config::user_home().as_deref(),
+        &extra_path_dirs(),
+    )
+}
+
+fn extra_path_dirs() -> Vec<PathBuf> {
+    static DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    DIRS.get_or_init(|| {
+        let mut dirs = Vec::new();
+        if let Ok(raw) = std::env::var("Q38_PATH") {
+            for part in split_path_list(&raw) {
+                if let Some(p) = expand_dir(&part) {
+                    dirs.push(p);
+                }
+            }
+        }
+        for raw in crate::config::Config::load_file_or_default().tools.extra_path {
+            if let Some(p) = expand_dir(&raw) {
+                dirs.push(p);
+            }
+        }
+        dirs
+    })
+    .clone()
+}
+
+fn split_path_list(raw: &str) -> Vec<String> {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    raw.split(sep)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn expand_dir(raw: &str) -> Option<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw == "~" {
+        return crate::config::user_home();
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return Some(crate::config::user_home()?.join(rest));
+    }
+    #[cfg(windows)]
+    if let Some(rest) = raw.strip_prefix("~\\") {
+        return Some(crate::config::user_home()?.join(rest));
+    }
+    Some(PathBuf::from(raw))
+}
+
+fn well_known_bins(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = home {
+        dirs.push(home.join(".cargo/bin"));
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join("go/bin"));
+        #[cfg(windows)]
+        {
+            dirs.push(home.join("scoop/shims"));
+            dirs.push(home.join("AppData/Roaming/npm"));
+            dirs.push(home.join("AppData/Local/Microsoft/WinGet/Links"));
+        }
+    }
+    #[cfg(unix)]
+    {
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        dirs.push(PathBuf::from("/opt/homebrew/sbin"));
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(PathBuf::from("/usr/local/sbin"));
+    }
+    #[cfg(windows)]
+    {
+        for key in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(base) = std::env::var_os(key) {
+                let base = PathBuf::from(base);
+                dirs.push(base.join("Git/cmd"));
+                dirs.push(base.join("Git/bin"));
+                dirs.push(base.join("nodejs"));
+            }
+        }
+        if let Some(data) = std::env::var_os("ProgramData") {
+            dirs.push(PathBuf::from(data).join("chocolatey/bin"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let local = PathBuf::from(local);
+            dirs.push(local.join("Microsoft/WinGet/Links"));
+            dirs.push(local.join("Programs/Git/cmd"));
+        }
+    }
+    dirs
+}
+
+fn merge_tool_path(
+    current: Option<OsString>,
+    home: Option<&Path>,
+    extra: &[PathBuf],
+) -> OsString {
+    let mut ordered = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let push = |dir: PathBuf, ordered: &mut Vec<PathBuf>, seen: &mut std::collections::HashSet<PathBuf>| {
+        if dir.as_os_str().is_empty() || !dir.is_dir() {
+            return;
+        }
+        if seen.insert(dir.clone()) {
+            ordered.push(dir);
+        }
+    };
+    for dir in extra {
+        push(dir.clone(), &mut ordered, &mut seen);
+    }
+    for dir in well_known_bins(home) {
+        push(dir, &mut ordered, &mut seen);
+    }
+    if let Some(ref current) = current {
+        for dir in std::env::split_paths(current) {
+            push(dir, &mut ordered, &mut seen);
+        }
+    }
+    std::env::join_paths(&ordered).unwrap_or_else(|_| current.unwrap_or_default())
 }
 
 fn detect_shell() -> ShellSpec {
@@ -554,5 +684,50 @@ mod tests {
         assert!(live.contains("aaa"), "{live}");
         assert!(!live.contains("Command failed"), "{live}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tool_path_prepends_existing_cargo_bin() {
+        let home = std::env::temp_dir().join(format!("q38-path-{}", uuid::Uuid::new_v4().simple()));
+        let cargo_bin = home.join(".cargo/bin");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        let merged = merge_tool_path(
+            Some("/usr/bin".into()),
+            Some(home.as_path()),
+            &[],
+        );
+        let dirs: Vec<_> = std::env::split_paths(&merged).collect();
+        assert_eq!(dirs.first().map(PathBuf::as_path), Some(cargo_bin.as_path()));
+        assert!(dirs.iter().any(|d| d == Path::new("/usr/bin")));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn tool_path_skips_missing_well_known_dirs() {
+        let home = std::env::temp_dir().join(format!("q38-path-missing-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&home).unwrap();
+        let merged = merge_tool_path(Some("/usr/bin".into()), Some(home.as_path()), &[]);
+        let dirs: Vec<_> = std::env::split_paths(&merged).collect();
+        assert!(!dirs.iter().any(|d| d.ends_with(".cargo/bin")));
+        assert!(dirs.iter().any(|d| d == Path::new("/usr/bin")));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn tool_path_extra_dirs_win_over_well_known() {
+        let root = std::env::temp_dir().join(format!("q38-path-extra-{}", uuid::Uuid::new_v4().simple()));
+        let extra = root.join("extra");
+        let cargo_bin = root.join("home/.cargo/bin");
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        let merged = merge_tool_path(
+            Some("/usr/bin".into()),
+            Some(&root.join("home")),
+            &[extra.clone()],
+        );
+        let dirs: Vec<_> = std::env::split_paths(&merged).collect();
+        assert_eq!(dirs.first().map(PathBuf::as_path), Some(extra.as_path()));
+        assert_eq!(dirs.get(1).map(PathBuf::as_path), Some(cargo_bin.as_path()));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

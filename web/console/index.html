@@ -4,6 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Qwenthin · 本地控制台</title>
+    <script>
+      if (/\bElectron\b/.test(navigator.userAgent)) {
+        const html = document.documentElement;
+        html.classList.add("electron");
+        if (/Windows/i.test(navigator.userAgent)) html.classList.add("win");
+        else if (/Mac/i.test(navigator.userAgent)) html.classList.add("mac");
+      }
+    </script>
     <link rel="icon" type="image/png" href="/favicon.png" />
   </head>
   <body>

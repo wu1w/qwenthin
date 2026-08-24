@@ -115,9 +115,16 @@ pub async fn run(opts: WebOpts) -> Result<std::process::ExitCode> {
 fn console_dir() -> PathBuf {
     if let Ok(p) = std::env::var("Q38_CONSOLE_DIR") {
         let p = PathBuf::from(p);
-        if p.is_dir() {
+        if p.join("index.html").is_file() {
             return p;
         }
+    }
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .and_then(|dir| console_dir_near(&dir))
+    {
+        return dir;
     }
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for cand in [
@@ -135,6 +142,16 @@ fn console_dir() -> PathBuf {
         }
     }
     manifest.join("../../web/console/dist")
+}
+
+/// Packaged layout: `Resources/bin/q38` + `Resources/console/`, or the two
+/// sitting next to each other.
+fn console_dir_near(exe_dir: &std::path::Path) -> Option<PathBuf> {
+    let mut cands = vec![exe_dir.join("console")];
+    if let Some(parent) = exe_dir.parent() {
+        cands.push(parent.join("console"));
+    }
+    cands.into_iter().find(|cand| cand.join("index.html").is_file())
 }
 
 fn open_browser(url: &str) {
@@ -161,5 +178,18 @@ mod tests {
         let lan: SocketAddr = "0.0.0.0:3848".parse().unwrap();
         assert!(local.ip().is_loopback());
         assert!(!lan.ip().is_loopback());
+    }
+
+    #[test]
+    fn packaged_console_sits_beside_or_above_the_binary() {
+        let root = std::env::temp_dir().join(format!("q38-pack-{}", std::process::id()));
+        let bin = root.join("bin");
+        let console = root.join("console");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&console).unwrap();
+        std::fs::write(console.join("index.html"), "<html></html>").unwrap();
+        assert_eq!(console_dir_near(&bin).as_deref(), Some(console.as_path()));
+        assert_eq!(console_dir_near(&root).as_deref(), Some(console.as_path()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

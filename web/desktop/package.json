@@ -1,0 +1,86 @@
+{
+  "name": "qwenthin",
+  "productName": "Qwenthin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Qwenthin desktop shell: Electron window around q38 web",
+  "author": "wu1w",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "main.mjs",
+  "scripts": {
+    "start": "electron .",
+    "sidecars": "sh scripts/build-sidecars.sh",
+    "prepare:resources": "node scripts/prepare.mjs",
+    "dist": "npm run sidecars && node scripts/prepare.mjs && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --publish never --mac dmg zip --arm64 --win zip --x64",
+    "dist:mac": "npm run sidecars && node scripts/prepare.mjs && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --publish never --mac dmg zip --arm64",
+    "dist:win": "npm run sidecars && node scripts/prepare.mjs --require-win && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --publish never --win zip --x64"
+  },
+  "devDependencies": {
+    "electron": "^38.2.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "app.qwenthin.desktop",
+    "productName": "Qwenthin",
+    "copyright": "Apache-2.0",
+    "asar": true,
+    "files": [
+      "main.mjs",
+      "preload.cjs"
+    ],
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "extraResources": [
+      {
+        "from": "../console/dist",
+        "to": "console"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.png",
+      "identity": null,
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "extraResources": [
+        {
+          "from": "resources/mac",
+          "to": "bin"
+        }
+      ],
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["arm64"]
+        },
+        {
+          "target": "zip",
+          "arch": ["arm64"]
+        }
+      ]
+    },
+    "win": {
+      "icon": "build/icon.png",
+      "signAndEditExecutable": false,
+      "extraResources": [
+        {
+          "from": "resources/win",
+          "to": "bin"
+        }
+      ],
+      "target": [
+        {
+          "target": "zip",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "dmg": {
+      "sign": false
+    },
+    "publish": null
+  }
+}
