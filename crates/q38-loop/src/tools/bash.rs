@@ -208,6 +208,7 @@ fn spawn_shell(command: &str, cwd: &Path) -> std::io::Result<tokio::process::Chi
             Ok(())
         });
     }
+    crate::proc_spawn::hide_window_async(&mut cmd);
     cmd.spawn()
 }
 

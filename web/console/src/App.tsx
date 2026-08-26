@@ -22,6 +22,32 @@ function isWinDesktop() {
   return window.qwenthinDesktop?.platform === "win32";
 }
 
+function isMacDesktop() {
+  return window.qwenthinDesktop?.platform === "darwin";
+}
+
+function WinCaptionIcon({ kind }: { kind: "min" | "max" | "close" }) {
+  if (kind === "min") {
+    return (
+      <svg viewBox="0 0 10 10" aria-hidden>
+        <path d="M1 5h8" />
+      </svg>
+    );
+  }
+  if (kind === "max") {
+    return (
+      <svg viewBox="0 0 10 10" aria-hidden>
+        <rect x="1.5" y="1.5" width="7" height="7" />
+      </svg>
+    );
+  }
+  return (
+    <svg viewBox="0 0 10 10" aria-hidden>
+      <path d="M2 2l6 6M8 2l-6 6" />
+    </svg>
+  );
+}
+
 function WindowButtons() {
   const desktop = window.qwenthinDesktop;
   if (!desktop) {
@@ -33,22 +59,26 @@ function WindowButtons() {
       </div>
     );
   }
-  const win = desktop.platform === "win32";
+  if (desktop.platform === "win32") {
+    return (
+      <div className="win-caps">
+        <button type="button" className="win-cap min" aria-label="最小化" onClick={() => desktop.minimize()}>
+          <WinCaptionIcon kind="min" />
+        </button>
+        <button type="button" className="win-cap max" aria-label="最大化" onClick={() => desktop.toggleMaximize()}>
+          <WinCaptionIcon kind="max" />
+        </button>
+        <button type="button" className="win-cap close" aria-label="关闭" onClick={() => desktop.close()}>
+          <WinCaptionIcon kind="close" />
+        </button>
+      </div>
+    );
+  }
   return (
     <div className="traffic">
-      {win ? (
-        <>
-          <button type="button" className="tl-y" aria-label="最小化" onClick={() => desktop.minimize()} />
-          <button type="button" className="tl-g" aria-label="最大化" onClick={() => desktop.toggleMaximize()} />
-          <button type="button" className="tl-r" aria-label="关闭" onClick={() => desktop.close()} />
-        </>
-      ) : (
-        <>
-          <button type="button" className="tl-r" aria-label="关闭" onClick={() => desktop.close()} />
-          <button type="button" className="tl-y" aria-label="最小化" onClick={() => desktop.minimize()} />
-          <button type="button" className="tl-g" aria-label="最大化" onClick={() => desktop.toggleMaximize()} />
-        </>
-      )}
+      <button type="button" className="tl-r" aria-label="关闭" onClick={() => desktop.close()} />
+      <button type="button" className="tl-y" aria-label="最小化" onClick={() => desktop.minimize()} />
+      <button type="button" className="tl-g" aria-label="最大化" onClick={() => desktop.toggleMaximize()} />
     </div>
   );
 }
@@ -301,7 +331,7 @@ export function App() {
           className={`titlebar${isWinDesktop() ? " win" : ""}`}
           onDoubleClick={() => window.qwenthinDesktop?.toggleMaximize()}
         >
-          {isWinDesktop() ? null : <WindowButtons />}
+          {isWinDesktop() || isMacDesktop() ? null : <WindowButtons />}
           <div className="titlebar-title">
             <span className="doc-title">Qwenthin 控制台</span>
             <span className="doc-sub"> · {TITLES[page]}</span>

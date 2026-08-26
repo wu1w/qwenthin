@@ -153,6 +153,7 @@ fn spawn_python_bin(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     apply_env(&mut cmd, inherit_env);
+    crate::proc_spawn::hide_window_async(&mut cmd);
     cmd.spawn()
 }
 

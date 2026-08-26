@@ -21,6 +21,7 @@ pub mod permit;
 pub mod policy;
 pub mod prefix_cache;
 pub mod probe;
+mod proc_spawn;
 pub mod prompt;
 pub mod schemas;
 pub mod session;

@@ -32,6 +32,11 @@ const SKIP_DIR: &[&str] = &[
     "venv",
     ".q38",
     "blobs",
+    "AppData",
+    "Application Data",
+    "Local Settings",
+    "Library",
+    "Caches",
 ];
 
 pub struct CodeIndex {
@@ -46,13 +51,21 @@ pub(crate) struct Hit {
     body: String,
 }
 
+const MAX_NESTED_GIT: usize = 64;
+
 impl CodeIndex {
     pub fn build(root: &Path) -> Self {
-        let tracked = git_ls_files(root);
-        let files = tracked.clone().unwrap_or_else(|| walk_fallback(root));
+        // Packaged Electron used to spawn with cwd=home. Indexing a Windows
+        // profile (AppData / OneDrive / Downloads) blocks the first model hop
+        // for minutes while the UI says "正在调用模型".
+        if is_user_home(root) {
+            return Self::empty();
+        }
+        let git_backed = git_dir(root).is_some();
+        let files = collect_index_files(root);
         // Git workspaces get a global cache. Scratch/non-repository folders
         // stay in memory, so q38 never leaves project-local index artifacts.
-        let idx = if tracked.is_some() {
+        let idx = if git_backed {
             Self::persistent(root).unwrap_or_else(Self::empty)
         } else {
             Self::empty()
@@ -733,11 +746,104 @@ fn skip_rel(rel: &Path) -> bool {
     s.split('/').any(|c| SKIP_DIR.contains(&c))
 }
 
+fn is_user_home(root: &Path) -> bool {
+    let Some(home) = crate::config::user_home() else {
+        return false;
+    };
+    let a = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let b = std::fs::canonicalize(&home).unwrap_or(home);
+    a == b
+}
+
+fn git_dir(root: &Path) -> Option<PathBuf> {
+    let marker = root.join(".git");
+    marker.exists().then_some(marker)
+}
+
+fn collect_index_files(root: &Path) -> Vec<PathBuf> {
+    if git_dir(root).is_none() {
+        return walk_fallback(root);
+    }
+    let mut files = match git_ls_files(root) {
+        Some(files) => files,
+        None => walk_fallback(root),
+    };
+    merge_nested_git(root, &mut files);
+    if files.len() > MAX_FILES {
+        files.truncate(MAX_FILES);
+    }
+    files
+}
+
+fn merge_nested_git(root: &Path, files: &mut Vec<PathBuf>) {
+    let mut seen: HashSet<PathBuf> = files.iter().cloned().collect();
+    let mut nested = Vec::new();
+    find_nested_git(root, root, &mut nested);
+    for rel in nested {
+        if files.len() >= MAX_FILES {
+            return;
+        }
+        let abs = root.join(&rel);
+        let listed = git_ls_files(&abs).unwrap_or_else(|| walk_fallback(&abs));
+        for f in listed {
+            let p = rel.join(f);
+            if seen.insert(p.clone()) {
+                files.push(p);
+                if files.len() >= MAX_FILES {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn find_nested_git(workspace: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+    if out.len() >= MAX_NESTED_GIT {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= MAX_NESTED_GIT {
+            return;
+        }
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy();
+        if SKIP_DIR.contains(&name_s.as_ref()) {
+            continue;
+        }
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if git_dir(&path).is_some() {
+            if let Ok(rel) = path.strip_prefix(workspace) {
+                if !rel.as_os_str().is_empty() {
+                    out.push(rel.to_path_buf());
+                }
+            }
+        }
+        find_nested_git(workspace, &path, out);
+    }
+}
+
 fn git_ls_files(root: &Path) -> Option<Vec<PathBuf>> {
-    let out = Command::new("git")
-        .args(["-C"])
+    let git_dir = git_dir(root)?;
+    let mut cmd = Command::new("git");
+    crate::proc_spawn::hide_window(&mut cmd);
+    let out = cmd
+        .arg("--git-dir")
+        .arg(&git_dir)
+        .arg("--work-tree")
         .arg(root)
         .args(["ls-files", "-z", "-c", "-o", "--exclude-standard"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_PAGER", "")
         .output()
         .ok()?;
     if !out.status.success() || out.stdout.is_empty() {
@@ -1228,5 +1334,78 @@ mod tests {
         assert!(bash_search_query("python3 -m unittest").is_none());
         assert!(search_dump_too_big(&"x\n".repeat(25)));
         assert!(!search_dump_too_big("ok\n"));
+    }
+
+    #[test]
+    fn skip_rel_drops_windows_profile_junk() {
+        assert!(skip_rel(Path::new("AppData/Local/foo.rs")));
+        assert!(skip_rel(Path::new("Library/Caches/bar.py")));
+        assert!(!skip_rel(Path::new("src/foo.rs")));
+    }
+
+    fn git_ok() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn git_init(dir: &Path) {
+        let st = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .status()
+            .expect("git init");
+        assert!(st.success(), "git init {dir:?}");
+    }
+
+    #[test]
+    fn parent_git_does_not_steal_workspace_paths() {
+        if !git_ok() {
+            return;
+        }
+        let outer = std::env::temp_dir().join(format!("q38-git-parent-{}", uuid::Uuid::new_v4().simple()));
+        let ws = outer.join("proj");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        git_init(&outer);
+        std::fs::write(outer.join("unrelated.rs"), "fn outsider() {}\n").unwrap();
+        std::fs::write(ws.join("src/inside.rs"), "fn nested_hit() {}\n").unwrap();
+        let idx = CodeIndex::build(&ws);
+        let hits = idx.search("nested_hit", None, 8);
+        assert!(
+            hits.iter().any(|h| h.path.ends_with("inside.rs") && h.body.contains("nested_hit")),
+            "{hits:?}"
+        );
+        assert!(
+            hits.iter().all(|h| !h.path.contains("unrelated")),
+            "parent git leaked: {hits:?}"
+        );
+        let _ = std::fs::remove_dir_all(outer);
+    }
+
+    #[test]
+    fn nested_git_repo_is_indexed() {
+        if !git_ok() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("q38-git-nested-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("vendor/dep/src")).unwrap();
+        git_init(&dir);
+        git_init(&dir.join("vendor/dep"));
+        std::fs::write(dir.join("src/root.rs"), "fn root_fn() {}\n").unwrap();
+        std::fs::write(dir.join("vendor/dep/src/lib.rs"), "fn nested_dep() {}\n").unwrap();
+        let idx = CodeIndex::build(&dir);
+        let root_hits = idx.search("root_fn", None, 8);
+        let nested_hits = idx.search("nested_dep", None, 8);
+        assert!(root_hits.iter().any(|h| h.body.contains("root_fn")), "{root_hits:?}");
+        assert!(
+            nested_hits
+                .iter()
+                .any(|h| h.path.replace('\\', "/").contains("vendor/dep") && h.body.contains("nested_dep")),
+            "{nested_hits:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

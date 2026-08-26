@@ -8,9 +8,33 @@ use crate::family::Family;
 
 pub fn vendor_root() -> PathBuf {
     if let Ok(p) = std::env::var("Q38_VENDOR_DIR") {
-        return PathBuf::from(p);
+        let p = p.trim();
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .and_then(|dir| vendor_dir_near(&dir))
+    {
+        return dir;
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../third_party/qwen-family")
+}
+
+fn looks_like_vendor(dir: &Path) -> bool {
+    dir.join("qwen38").join("chat_template.jinja").is_file()
+}
+
+/// Packaged layout: `Resources/bin/q38` + `Resources/vendor/qwen38/…`.
+pub fn vendor_dir_near(exe_dir: &Path) -> Option<PathBuf> {
+    let mut cands = vec![exe_dir.join("vendor"), exe_dir.join("qwen-family")];
+    if let Some(parent) = exe_dir.parent() {
+        cands.push(parent.join("vendor"));
+        cands.push(parent.join("qwen-family"));
+    }
+    cands.into_iter().find(|p| looks_like_vendor(p))
 }
 
 pub fn family_dir(family: Family) -> PathBuf {
@@ -68,5 +92,19 @@ mod tests {
     #[test]
     fn qwen38_vendor_hashes() {
         verify_qwen38().expect("qwen38 vendor set");
+    }
+
+    #[test]
+    fn packaged_vendor_sits_beside_or_above_the_binary() {
+        let root = std::env::temp_dir().join(format!("q38-vendor-{}", std::process::id()));
+        let bin = root.join("bin");
+        let vendor = root.join("vendor");
+        let family = vendor.join("qwen38");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&family).unwrap();
+        fs::write(family.join("chat_template.jinja"), "x").unwrap();
+        assert_eq!(vendor_dir_near(&bin).as_deref(), Some(vendor.as_path()));
+        assert_eq!(vendor_dir_near(&root).as_deref(), Some(vendor.as_path()));
+        let _ = fs::remove_dir_all(&root);
     }
 }

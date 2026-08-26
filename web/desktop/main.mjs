@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow, Menu, dialog, shell, ipcMain } from "electron";
+import { app, BrowserWindow, Menu, dialog, nativeImage, shell, ipcMain } from "electron";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const READY_RE = /q38 web\s+(https?:\/\/\S+)/i;
@@ -23,6 +23,7 @@ function sidecarPaths() {
     return {
       bin: path.join(process.resourcesPath, "bin", binName),
       consoleDir: path.join(process.resourcesPath, "console"),
+      vendorDir: path.join(process.resourcesPath, "vendor"),
     };
   }
   const root = repoRoot();
@@ -32,12 +33,29 @@ function sidecarPaths() {
   return {
     bin: existsSync(release) ? release : debug,
     consoleDir: path.join(root, "web", "console", "dist"),
+    vendorDir: path.join(root, "third_party", "qwen-family"),
   };
 }
 
-function sidecarEnv(consoleDir) {
+function defaultWorkspace() {
+  const dir = path.join(app.getPath("home"), ".q38-agent", "workspace");
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function mergeNoProxy(env) {
+  const extra = "127.0.0.1,localhost,::1";
+  for (const key of ["NO_PROXY", "no_proxy"]) {
+    const cur = (env[key] || "").trim();
+    env[key] = cur ? `${extra},${cur}` : extra;
+  }
+}
+
+function sidecarEnv(consoleDir, vendorDir) {
   const env = { ...process.env, Q38_CONSOLE_DIR: consoleDir };
-  const key = process.platform === "win32" ? "Path" : "PATH";
+  if (vendorDir && existsSync(path.join(vendorDir, "qwen38", "chat_template.jinja"))) {
+    env.Q38_VENDOR_DIR = vendorDir;
+  }
   const delim = path.delimiter;
   const home = app.getPath("home");
   const extras = (
@@ -74,38 +92,70 @@ function sidecarEnv(consoleDir) {
   const current = env.PATH || env.Path || "";
   const parts = current.split(delim).filter(Boolean);
   const prepend = extras.filter((dir) => !parts.includes(dir));
-  env[key] = [...prepend, ...parts].join(delim);
+  const merged = [...prepend, ...parts].join(delim);
+  env.PATH = merged;
+  if (process.platform === "win32") env.Path = merged;
+  mergeNoProxy(env);
   return env;
+}
+
+function attachSidecarLog(child) {
+  try {
+    const dir = path.join(app.getPath("home"), ".q38-agent");
+    mkdirSync(dir, { recursive: true });
+    const out = createWriteStream(path.join(dir, "desktop.log"), { flags: "w" });
+    const write = (chunk) => {
+      try {
+        out.write(chunk);
+      } catch {
+        /* ignore */
+      }
+    };
+    child.stdout?.on("data", write);
+    child.stderr?.on("data", write);
+    child.once("exit", () => {
+      try {
+        out.end();
+      } catch {
+        /* ignore */
+      }
+    });
+  } catch {
+    /* logging is best-effort */
+  }
 }
 
 function waitForUrl(child) {
   return new Promise((resolve, reject) => {
     let buf = "";
+    let settled = false;
     const timer = setTimeout(() => {
-      cleanup();
+      if (settled) return;
+      settled = true;
       reject(new Error(`q38 web 在 ${READY_MS / 1000}s 内没有打出监听地址`));
     }, READY_MS);
 
+    // Keep reading after the ready line. Windows anonymous pipes are ~4KB;
+    // dropping the listeners lets q38 block on eprintln and freeze the turn.
     const onData = (chunk) => {
       buf += chunk.toString("utf8");
+      if (settled) return;
       const m = buf.match(READY_RE);
       if (!m) return;
-      cleanup();
+      settled = true;
+      clearTimeout(timer);
       resolve(m[1].replace(/\/?$/, "/"));
     };
     const onExit = (code, signal) => {
-      cleanup();
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       reject(new Error(`q38 web 提前退出 (code=${code} signal=${signal})\n${buf.trim()}`));
     };
-    const cleanup = () => {
-      clearTimeout(timer);
-      child.stdout?.off("data", onData);
-      child.stderr?.off("data", onData);
-      child.off("error", onError);
-      child.off("exit", onExit);
-    };
     const onError = (err) => {
-      cleanup();
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       reject(err);
     };
 
@@ -116,9 +166,25 @@ function waitForUrl(child) {
   });
 }
 
+function windowIcon() {
+  const packaged = app.isPackaged;
+  const candidates =
+    process.platform === "win32"
+      ? packaged
+        ? [path.join(process.resourcesPath, "icon.ico"), path.join(process.resourcesPath, "icon.png")]
+        : [path.join(here, "build", "icon.ico"), path.join(here, "build", "icon.png")]
+      : packaged
+        ? [path.join(process.resourcesPath, "icon.png")]
+        : [path.join(here, "build", "icon.png")];
+  const file = candidates.find((p) => existsSync(p));
+  if (!file) return undefined;
+  const img = nativeImage.createFromPath(file);
+  return img.isEmpty() ? undefined : img;
+}
+
 async function startBackend() {
   if (backendUrl) return backendUrl;
-  const { bin, consoleDir } = sidecarPaths();
+  const { bin, consoleDir, vendorDir } = sidecarPaths();
   if (!existsSync(bin)) {
     throw new Error(`找不到 q38 可执行文件: ${bin}`);
   }
@@ -127,12 +193,15 @@ async function startBackend() {
   }
 
   const child = spawn(bin, ["web", "--no-open", "--bind", "127.0.0.1:0"], {
-    cwd: app.getPath("home"),
-    env: sidecarEnv(consoleDir),
+    // Not the user profile: an empty/invalid [console] workspace falls back to
+    // cwd, and indexing HOME on Windows blocks the first model call for minutes.
+    cwd: defaultWorkspace(),
+    env: sidecarEnv(consoleDir, vendorDir),
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
   backend = child;
+  attachSidecarLog(child);
   backendUrl = await waitForUrl(child);
   child.on("exit", () => {
     if (!quitting) {
@@ -193,6 +262,8 @@ async function createWindow() {
     return;
   }
 
+  const isMac = process.platform === "darwin";
+  const icon = windowIcon();
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 840,
@@ -201,8 +272,11 @@ async function createWindow() {
     title: "Qwenthin",
     backgroundColor: "#eceff4",
     show: false,
-    frame: false,
+    frame: isMac,
+    titleBarStyle: isMac ? "hiddenInset" : undefined,
+    trafficLightPosition: isMac ? { x: 16, y: 16 } : undefined,
     autoHideMenuBar: true,
+    ...(icon ? { icon } : {}),
     webPreferences: {
       preload: path.join(here, "preload.cjs"),
       sandbox: true,
@@ -236,6 +310,10 @@ if (!gotLock) {
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();
   });
+
+  if (process.platform === "win32") {
+    app.setAppUserModelId("app.qwenthin.desktop");
+  }
 
   app.whenReady().then(async () => {
     app.setName("Qwenthin");

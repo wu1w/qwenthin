@@ -532,6 +532,7 @@ fn spawn(spec: &McpServer) -> Result<tokio::process::Child> {
         cmd.current_dir(PathBuf::from(&spec.cwd));
     }
     apply_mcp_env(&mut cmd, spec);
+    crate::proc_spawn::hide_window_async(&mut cmd);
     cmd.spawn().map_err(Error::msg)
 }
 

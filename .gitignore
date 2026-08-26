@@ -18,6 +18,10 @@ web/**/node_modules/
 web/desktop/release/
 web/desktop/resources/
 web/desktop/build/icon.png
+web/desktop/build/icon.ico
+web/desktop/build/icon.icns
+web/desktop/build/icon.iconset/
+web/desktop/build/icon-256.png
 web/desktop/*.log
 
 # Workspace secrets / local state — never commit

@@ -108,55 +108,57 @@ html.electron .window {
 .spacer { flex: 1; min-width: 0; }
 .titlebar .spacer { flex: 1; }
 .titlebar .no-drag { -webkit-app-region: no-drag; display: flex; gap: 8px; align-items: center; min-width: 0; flex: 0 1 auto; }
+html.electron.mac .titlebar {
+  padding-left: 78px;
+}
+html.electron.mac .traffic { display: none; }
 html.electron.win .titlebar,
 .titlebar.win {
   padding: 0 0 0 16px;
 }
-html.electron.win .traffic,
-.titlebar.win .traffic {
+html.electron.win .win-caps,
+.titlebar.win .win-caps {
   display: flex;
   flex: 0 0 auto;
   height: 100%;
-  align-items: center;
-  gap: 0;
-  padding: 0 2px 0 8px;
+  align-items: stretch;
+  -webkit-app-region: no-drag;
 }
-html.electron.win .traffic button,
-.titlebar.win .traffic button {
+html.electron.win .win-cap,
+.titlebar.win .win-cap {
   width: 46px;
   height: 100%;
+  padding: 0;
+  border: 0;
   border-radius: 0;
+  background: transparent;
+  color: var(--label-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
 }
-html.electron.win .tl-y,
-.titlebar.win .tl-y { background: transparent; }
-html.electron.win .tl-g,
-.titlebar.win .tl-g { background: transparent; }
-html.electron.win .tl-r,
-.titlebar.win .tl-r { background: transparent; }
-html.electron.win .traffic button::before,
-.titlebar.win .traffic button::before {
-  content: "";
-  display: block;
-  margin: 0 auto;
+html.electron.win .win-cap svg,
+.titlebar.win .win-cap svg {
   width: 10px;
   height: 10px;
-  border-radius: 50%;
+  stroke: currentColor;
+  stroke-width: 1.15;
+  fill: none;
+  stroke-linecap: round;
 }
-html.electron.win .tl-y::before,
-.titlebar.win .tl-y::before { background: #febc2e; }
-html.electron.win .tl-g::before,
-.titlebar.win .tl-g::before { background: #28c840; }
-html.electron.win .tl-r::before,
-.titlebar.win .tl-r::before { background: #ff5f57; }
-html.electron.win .tl-y:hover,
-.titlebar.win .tl-y:hover { background: rgba(15, 23, 42, 0.06); }
-html.electron.win .tl-g:hover,
-.titlebar.win .tl-g:hover { background: rgba(15, 23, 42, 0.06); }
-html.electron.win .tl-r:hover,
-.titlebar.win .tl-r:hover { background: #e81123; }
-html.electron.win .tl-r:hover::before,
-.titlebar.win .tl-r:hover::before { background: #fff; }
+html.electron.win .win-cap.min:hover,
+html.electron.win .win-cap.max:hover,
+.titlebar.win .win-cap.min:hover,
+.titlebar.win .win-cap.max:hover {
+  background: rgba(15, 23, 42, 0.06);
+  color: var(--label-1);
+}
+html.electron.win .win-cap.close:hover,
+.titlebar.win .win-cap.close:hover {
+  background: #c42b1c;
+  color: #fff;
+}
 
 .chip {
   display: inline-flex; align-items: center; gap: 6px;

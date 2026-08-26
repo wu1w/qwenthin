@@ -1077,6 +1077,7 @@ pub fn config_text(model: &str, workspace: &Path, mode: SessionMode, busy: BusyP
 
 pub fn diff_text(workspace: &Path, args: &str) -> String {
     let mut cmd = Command::new("git");
+    crate::proc_spawn::hide_window(&mut cmd);
     cmd.arg("-C").arg(workspace).arg("diff");
     let args = args.trim();
     if args == "staged" {

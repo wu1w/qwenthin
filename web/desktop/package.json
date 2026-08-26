@@ -25,6 +25,7 @@
     "productName": "Qwenthin",
     "copyright": "Apache-2.0",
     "asar": true,
+    "icon": "build/icon.png",
     "files": [
       "main.mjs",
       "preload.cjs"
@@ -37,11 +38,23 @@
       {
         "from": "../console/dist",
         "to": "console"
+      },
+      {
+        "from": "../../third_party/qwen-family",
+        "to": "vendor"
+      },
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
+      },
+      {
+        "from": "build/icon.ico",
+        "to": "icon.ico"
       }
     ],
     "mac": {
       "category": "public.app-category.developer-tools",
-      "icon": "build/icon.png",
+      "icon": "build/icon.icns",
       "identity": null,
       "hardenedRuntime": false,
       "gatekeeperAssess": false,
@@ -63,8 +76,8 @@
       ]
     },
     "win": {
-      "icon": "build/icon.png",
-      "signAndEditExecutable": false,
+      "icon": "build/icon.ico",
+      "signExecutable": false,
       "extraResources": [
         {
           "from": "resources/win",

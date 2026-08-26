@@ -383,11 +383,7 @@ fn media_cmd(bin: &Path) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    crate::proc_spawn::hide_window_async(&mut cmd);
     cmd
 }
 
