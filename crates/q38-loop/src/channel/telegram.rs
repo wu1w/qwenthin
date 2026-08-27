@@ -190,6 +190,8 @@ async fn native_from_message(
                         url: String::new(),
                         mime: "image/jpeg".into(),
                     });
+                } else {
+                    parts.push(ContentPart::text("[图片]"));
                 }
             }
         }
@@ -203,8 +205,37 @@ async fn native_from_message(
                     file_id: file_id.into(),
                     name,
                 });
+            } else {
+                parts.push(ContentPart::text(format!("[文件] {name}")));
             }
         }
+    }
+    for key in ["voice", "audio"] {
+        if let Some(fid) = msg.get(key).and_then(|v| v["file_id"].as_str()) {
+            match download_file(client, token, fid).await {
+                Ok(url) => parts.push(ContentPart::Audio {
+                    audio_url: url,
+                    url: String::new(),
+                    mime: "audio/ogg".into(),
+                }),
+                Err(_) => parts.push(ContentPart::text("[语音]")),
+            }
+        }
+    }
+    for key in ["video", "video_note"] {
+        if let Some(fid) = msg.get(key).and_then(|v| v["file_id"].as_str()) {
+            match download_file(client, token, fid).await {
+                Ok(url) => parts.push(ContentPart::Video {
+                    video_url: url,
+                    url: String::new(),
+                    mime: "video/mp4".into(),
+                }),
+                Err(_) => parts.push(ContentPart::text("[视频]")),
+            }
+        }
+    }
+    if msg.get("sticker").is_some() && parts.is_empty() {
+        parts.push(ContentPart::text("[表情]"));
     }
     if parts.is_empty() {
         return Ok(None);

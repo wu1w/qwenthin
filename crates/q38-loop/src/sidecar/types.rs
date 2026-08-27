@@ -173,6 +173,10 @@ pub struct SidecarOpts {
     pub workspace_confined: bool,
     /// From `config.toml` `[features].approvals`. Default Ask is only for tests.
     pub approvals: crate::permit::ApprovalMode,
+    /// Override `~/.q38-agent/sessions`. SaaS hosts pass a tenant directory.
+    pub sessions_dir: Option<PathBuf>,
+    /// Override `~/.q38-agent` for MEMORY.md / skills / blobs.
+    pub home: Option<PathBuf>,
 }
 
 impl Default for SidecarOpts {
@@ -194,6 +198,8 @@ impl Default for SidecarOpts {
             low_precision: false,
             workspace_confined: true,
             approvals: crate::permit::ApprovalMode::Ask,
+            sessions_dir: None,
+            home: None,
         }
     }
 }
@@ -211,6 +217,8 @@ pub struct TurnSnapshot {
     pub approvals: crate::permit::ApprovalMode,
     pub low_precision: bool,
     pub workspace_confined: bool,
+    pub sessions_dir: Option<PathBuf>,
+    pub home: Option<PathBuf>,
 }
 
 pub struct TurnRequest {

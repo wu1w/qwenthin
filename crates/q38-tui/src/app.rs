@@ -93,6 +93,8 @@ pub async fn run(opts: TuiOpts) -> Result<ExitCode> {
         low_precision: opts.cfg.policy.low_precision,
         workspace_confined: opts.cfg.features.workspace_write_only,
         approvals: ApprovalMode::parse(&opts.cfg.features.approvals).unwrap_or(ApprovalMode::Ask),
+        sessions_dir: None,
+        home: None,
     });
     match session.handle(&rpc(
         1,

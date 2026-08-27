@@ -127,6 +127,19 @@ impl ChatMessage {
 
     fn to_wire(&self, jinja: bool) -> serde_json::Value {
         let mut v = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
+        if jinja {
+            // Flash-Next / Unsloth Jinja raises if function.arguments is a JSON string.
+            if let Some(calls) = v.get_mut("tool_calls").and_then(|c| c.as_array_mut()) {
+                for call in calls {
+                    if let Some(args) = call.pointer_mut("/function/arguments") {
+                        if let Some(s) = args.as_str().map(str::to_string) {
+                            *args =
+                                serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s));
+                        }
+                    }
+                }
+            }
+        }
         if self.parts.is_empty() {
             return v;
         }
@@ -252,6 +265,10 @@ fn preprocess_qwen_jinja(src: &str) -> String {
     .replace(
         "{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}",
         "{%- set ns = namespace() %}{%- set ns.multi_step_tool = true %}{%- set ns.last_query_index = messages|length - 1 %}",
+    )
+    .replace(
+        "{%- set sysns = namespace(count=0, text='') %}",
+        "{%- set sysns = namespace() %}{%- set sysns.count = 0 %}{%- set sysns.text = '' %}",
     )
 }
 
@@ -565,6 +582,35 @@ mod tests {
     }
 
     #[test]
+    fn q38next_parses_string_tool_arguments() {
+        crate::vendor::verify_q38next().unwrap();
+        let calls = vec![serde_json::json!({
+            "id": "c1",
+            "type": "function",
+            "function": {
+                "name": "read",
+                "arguments": "{\"path\":\"a.rs\"}"
+            }
+        })];
+        let msgs = vec![
+            ChatMessage::user("read it"),
+            ChatMessage::assistant_tools(None, calls),
+            ChatMessage::tool("c1", "ok"),
+        ];
+        let text = render(&RenderOpts {
+            family: Family::Qwen38Next,
+            messages: &msgs,
+            tools: Some(&agent_tools()),
+            add_generation_prompt: true,
+            kwargs: kw(&ThinkPolicy::agent_default()),
+        })
+        .unwrap()
+        .text;
+        assert!(text.contains("<parameter=path>"), "{text}");
+        assert!(text.contains("a.rs"), "{text}");
+    }
+
+    #[test]
     fn tool_step_extends_suffix_only() {
         let policy = ThinkPolicy::agent_default();
         let tools = agent_tools();
@@ -650,5 +696,32 @@ mod tests {
                 .contains("System message cannot contain images"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn q38next_merges_system_and_maps_high_effort() {
+        crate::vendor::verify_q38next().unwrap();
+        let msgs = vec![
+            ChatMessage::system("alpha"),
+            ChatMessage::system("beta"),
+            ChatMessage::user("hi"),
+        ];
+        let text = render(&RenderOpts {
+            family: Family::Qwen38Next,
+            messages: &msgs,
+            tools: None,
+            add_generation_prompt: true,
+            kwargs: TemplateKwargs {
+                enable_thinking: Some(true),
+                reasoning_effort: Some("high".into()),
+                preserve_thinking: Some(true),
+            },
+        })
+        .unwrap()
+        .text;
+        assert!(text.contains("alpha"), "{text}");
+        assert!(text.contains("beta"), "{text}");
+        assert!(text.contains("Reasoning effort is set to xhigh"), "{text}");
+        assert!(text.contains("<|im_start|>assistant\n<think>\n"), "{text}");
     }
 }

@@ -1365,7 +1365,8 @@ mod tests {
         if !git_ok() {
             return;
         }
-        let outer = std::env::temp_dir().join(format!("q38-git-parent-{}", uuid::Uuid::new_v4().simple()));
+        let outer =
+            std::env::temp_dir().join(format!("q38-git-parent-{}", uuid::Uuid::new_v4().simple()));
         let ws = outer.join("proj");
         std::fs::create_dir_all(ws.join("src")).unwrap();
         git_init(&outer);
@@ -1374,7 +1375,8 @@ mod tests {
         let idx = CodeIndex::build(&ws);
         let hits = idx.search("nested_hit", None, 8);
         assert!(
-            hits.iter().any(|h| h.path.ends_with("inside.rs") && h.body.contains("nested_hit")),
+            hits.iter()
+                .any(|h| h.path.ends_with("inside.rs") && h.body.contains("nested_hit")),
             "{hits:?}"
         );
         assert!(
@@ -1389,7 +1391,8 @@ mod tests {
         if !git_ok() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("q38-git-nested-{}", uuid::Uuid::new_v4().simple()));
+        let dir =
+            std::env::temp_dir().join(format!("q38-git-nested-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("vendor/dep/src")).unwrap();
         git_init(&dir);
@@ -1399,11 +1402,15 @@ mod tests {
         let idx = CodeIndex::build(&dir);
         let root_hits = idx.search("root_fn", None, 8);
         let nested_hits = idx.search("nested_dep", None, 8);
-        assert!(root_hits.iter().any(|h| h.body.contains("root_fn")), "{root_hits:?}");
+        assert!(
+            root_hits.iter().any(|h| h.body.contains("root_fn")),
+            "{root_hits:?}"
+        );
         assert!(
             nested_hits
                 .iter()
-                .any(|h| h.path.replace('\\', "/").contains("vendor/dep") && h.body.contains("nested_dep")),
+                .any(|h| h.path.replace('\\', "/").contains("vendor/dep")
+                    && h.body.contains("nested_dep")),
             "{nested_hits:?}"
         );
         let _ = std::fs::remove_dir_all(dir);

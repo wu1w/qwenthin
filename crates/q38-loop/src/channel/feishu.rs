@@ -625,11 +625,11 @@ fn native_from_event(ep: &ChannelEndpoint, event: &Value) -> Option<NativePayloa
     let chat_type = js_str(&message["chat_type"]);
     let is_group = chat_type.eq_ignore_ascii_case("group");
     let msg_type = js_str(&message["message_type"]);
-    let text = parse_text_content(&message["content"]);
+    let mut text = parse_text_content(&message["content"]);
     if text.is_empty() {
-        return None;
+        text = feishu_nontext_caption(&msg_type, &message["content"]);
     }
-    if !msg_type.is_empty() && msg_type != "text" && msg_type != "post" {
+    if text.is_empty() {
         return None;
     }
     let message_id = js_str(&message["message_id"]);
@@ -662,6 +662,43 @@ fn native_from_event(ep: &ChannelEndpoint, event: &Value) -> Option<NativePayloa
     Some(env)
 }
 
+fn feishu_nontext_caption(msg_type: &str, content: &Value) -> String {
+    let kind = msg_type.trim().to_ascii_lowercase();
+    match kind.as_str() {
+        "image" | "sticker" => "[图片]".into(),
+        "audio" => "[语音]".into(),
+        "media" | "video" => "[视频]".into(),
+        "file" => {
+            let name = parse_file_name(content);
+            if name.is_empty() {
+                "[文件]".into()
+            } else {
+                format!("[文件] {name}")
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn parse_file_name(content: &Value) -> String {
+    let from_obj = |v: &Value| {
+        let n = js_str(&v["file_name"]);
+        if n.is_empty() {
+            js_str(&v["name"])
+        } else {
+            n
+        }
+    };
+    match content {
+        Value::String(s) => serde_json::from_str::<Value>(s)
+            .ok()
+            .map(|v| from_obj(&v))
+            .unwrap_or_default(),
+        Value::Object(_) => from_obj(content),
+        _ => String::new(),
+    }
+}
+
 #[cfg(test)]
 fn parse_text_content_str(raw: &str) -> String {
     if raw.is_empty() {
@@ -680,6 +717,9 @@ fn parse_text_content(content: &Value) -> String {
                 let t = js_str(&v["text"]);
                 if !t.is_empty() {
                     return t;
+                }
+                if v.is_object() {
+                    return String::new();
                 }
             }
             s.trim().to_string()
@@ -1049,6 +1089,25 @@ mod tests {
         assert_eq!(env.meta["receive_id"], json!("oc_group"));
         assert_eq!(env.meta["is_mentioned"], json!(true));
         assert_eq!(receive_id(&env, "chat_id"), "oc_group");
+    }
+
+    #[test]
+    fn native_ingests_image() {
+        let ep = ep_with(&[]);
+        let v = json!({
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_u"}, "sender_type": "user"},
+                "message": {
+                    "message_id": "om_i",
+                    "chat_id": "oc_dm",
+                    "chat_type": "p2p",
+                    "message_type": "image",
+                    "content": "{\"image_key\":\"img_x\"}"
+                }
+            }
+        });
+        let env = native_from_envelope(&ep, &v).expect("image");
+        assert_eq!(env.text, "[图片]");
     }
 
     #[test]

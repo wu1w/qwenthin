@@ -283,6 +283,7 @@ pub struct EffortController {
     auto_upgraded: bool,
     parse_fails: u32,
     harness_fails: u32,
+    test_fails: u32,
     parse_upgrade_after: u32,
 }
 
@@ -295,6 +296,7 @@ impl EffortController {
             auto_upgraded: false,
             parse_fails: 0,
             harness_fails: 0,
+            test_fails: 0,
             parse_upgrade_after: 2,
         }
     }
@@ -334,6 +336,18 @@ impl EffortController {
         false
     }
 
+    /// Two consecutive test-runner failures (model or harness oracle) bump
+    /// Low→Medium. Never auto-xhigh. Already-Medium stays put.
+    pub fn note_test_fail(&mut self) -> bool {
+        self.test_fails = self.test_fails.saturating_add(1);
+        if self.test_fails < 2 {
+            return false;
+        }
+        let before = self.auto_upgraded;
+        self.bump_effort();
+        self.auto_upgraded && !before
+    }
+
     /// Edit thrash (mutually reverting edits on one path) is a judgment
     /// failure, not an execution failure: upgrade immediately so the very
     /// next turn plans at medium. Same decay as the other upgrades — one
@@ -344,7 +358,8 @@ impl EffortController {
         self.auto_upgraded && !before
     }
 
-    /// Reset parse/harness streaks. If this turn auto-upgraded, drop back
+    /// Reset parse/harness streaks. Test-fail streak survives a clean edit
+    /// so red→edit→red still counts. If this turn auto-upgraded, drop back
     /// to the baseline policy. Returns true when kwargs must be synced.
     pub fn note_clean_step(&mut self) -> bool {
         self.parse_fails = 0;
@@ -358,6 +373,21 @@ impl EffortController {
         }
         self.policy = self.baseline.clone();
         true
+    }
+
+    /// Green tests reset the consecutive-red streak. Does not change effort.
+    pub fn note_tests_green(&mut self) {
+        self.test_fails = 0;
+    }
+
+    fn bump_effort(&mut self) {
+        if self.user_locked {
+            return;
+        }
+        match self.policy.effort {
+            Some(Effort::Xhigh) | Some(Effort::Medium) => {}
+            Some(Effort::Low) | None => self.upgrade_medium(),
+        }
     }
 
     fn upgrade_medium(&mut self) {
@@ -655,5 +685,33 @@ mod tests {
         c.note_harness_fail();
         assert_ne!(c.policy().effort, Some(Effort::Xhigh));
         assert_eq!(c.policy().effort, Some(Effort::Medium));
+    }
+
+    #[test]
+    fn two_test_fails_survive_clean_edit() {
+        let mut c = EffortController::new(ThinkPolicy::agent_default(), false);
+        assert!(!c.note_test_fail());
+        c.note_clean_step();
+        assert!(
+            c.note_test_fail(),
+            "second consecutive red must survive a clean edit"
+        );
+        assert_eq!(c.policy().effort, Some(Effort::Medium));
+        c.note_tests_green();
+        assert!(!c.note_test_fail(), "green tests reset the streak");
+        assert_eq!(c.policy().effort, Some(Effort::Medium));
+    }
+
+    #[test]
+    fn two_test_fails_bump_low_to_medium_not_xhigh() {
+        let mut c = EffortController::new(ThinkPolicy::agent_default(), false);
+        assert!(!c.note_test_fail());
+        assert_eq!(c.policy().effort, Some(Effort::Low));
+        assert!(c.note_test_fail());
+        assert_eq!(c.policy().effort, Some(Effort::Medium));
+        c.note_test_fail();
+        c.note_test_fail();
+        assert_eq!(c.policy().effort, Some(Effort::Medium));
+        assert_ne!(c.policy().effort, Some(Effort::Xhigh));
     }
 }

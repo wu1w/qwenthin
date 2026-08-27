@@ -11,7 +11,7 @@ base_url = "http://127.0.0.1:8080/v1"
 api_key = "local"
 model = ""                     # empty => first id from GET /v1/models
 profile = "auto"               # auto | llamacpp | vllm | sglang | generic
-family = "auto"                # auto | qwen35 | qwen36 | qwen38
+family = "auto"                # auto | qwen35 | qwen36 | qwen38 | q38next
 connect_timeout_s = 5
 read_timeout_s = 1800          # long prefills at ~30 tok/s need minutes, not 240s
 
@@ -35,6 +35,8 @@ max_think_tokens_xhigh = 4096
 max_steps = 80
 max_steps_think = 100
 max_wall_seconds = 1800
+max_steps_unattended = 500      # IM / --channels. 0 = same as max_steps
+max_wall_unattended_seconds = 0 # IM: 0 = no wall (Hermes). Interactive still uses max_wall_seconds
 max_tokens = 8192
 think_mode_max_tokens = 16384
 low_precision = false        # on: tighter doom/parse/repeat guards for IQ4/Q3. Model does not see this.

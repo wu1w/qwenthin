@@ -4,6 +4,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 /// Qwen3.5-family generation. v1 quality gate is **Qwen3.8-27B**.
+/// `Qwen38Next` is the Qwen4-preview Flash-Next line (sparse MoE, own Jinja).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Family {
@@ -12,6 +13,8 @@ pub enum Family {
     Qwen36,
     #[default]
     Qwen38,
+    #[serde(rename = "q38next", alias = "qwen38next", alias = "flash-next")]
+    Qwen38Next,
 }
 
 impl Family {
@@ -21,6 +24,7 @@ impl Family {
             Self::Qwen35 => "qwen35",
             Self::Qwen36 => "qwen36",
             Self::Qwen38 => "qwen38",
+            Self::Qwen38Next => "q38next",
         }
     }
 
@@ -30,6 +34,7 @@ impl Family {
             Self::Qwen35 => "qwen35",
             Self::Qwen36 => "qwen36",
             Self::Qwen38 => "qwen38",
+            Self::Qwen38Next => "q38next",
         }
     }
 
@@ -37,19 +42,39 @@ impl Family {
     /// Empty means the key must be omitted (3.5 / 3.6 templates have no effort sentence).
     pub fn effort_values(self) -> &'static [&'static str] {
         match self {
-            Self::Qwen38 => &["low", "medium", "xhigh"],
+            Self::Qwen38 | Self::Qwen38Next => &["low", "medium", "xhigh"],
             Self::Auto | Self::Qwen35 | Self::Qwen36 => &[],
         }
     }
 
     pub fn preserve_thinking_kwarg(self) -> bool {
-        matches!(self, Self::Qwen36 | Self::Qwen38 | Self::Auto)
+        matches!(
+            self,
+            Self::Qwen36 | Self::Qwen38 | Self::Qwen38Next | Self::Auto
+        )
+    }
+
+    /// Follow-up compact after this many live tool messages. Flash-Next on a
+    /// 1-slot llama.cpp box pays a full cold prefill; archive sooner than 27B.
+    pub fn follow_up_compact_tools(self) -> usize {
+        match self {
+            Self::Qwen38Next => 6,
+            _ => 8,
+        }
     }
 
     /// Best-effort parse of a `/v1/models` id. Unknown Qwen-like ids return `None`
     /// so the builder will not inject 3.8 `xhigh` into a 3.5 template.
     pub fn detect(model_id: &str) -> Option<Self> {
         let s = model_id.to_ascii_lowercase();
+        if s.contains("flash-next")
+            || s.contains("flash_next")
+            || s.contains("q38next")
+            || s.contains("qwen3.8-flash")
+            || s.contains("qwen38-flash")
+        {
+            return Some(Self::Qwen38Next);
+        }
         if s.contains("qwen3.8") || s.contains("qwen3_8") {
             return Some(Self::Qwen38);
         }
@@ -84,6 +109,7 @@ impl FromStr for Family {
             "qwen35" | "qwen3.5" | "3.5" => Ok(Self::Qwen35),
             "qwen36" | "qwen3.6" | "3.6" => Ok(Self::Qwen36),
             "qwen38" | "qwen3.8" | "3.8" => Ok(Self::Qwen38),
+            "q38next" | "qwen38next" | "qwen3.8-flash-next" | "flash-next" => Ok(Self::Qwen38Next),
             other => Err(format!("unknown family {other:?}")),
         }
     }
@@ -252,6 +278,14 @@ mod tests {
     #[test]
     fn detect_qwen38_primary() {
         assert_eq!(Family::detect("Qwen3.8-27B-UD-Q8"), Some(Family::Qwen38));
+        assert_eq!(
+            Family::detect("qwen3.8-flash-next"),
+            Some(Family::Qwen38Next)
+        );
+        assert_eq!(
+            Family::detect("Qwen3.8-Flash-Next-UD-IQ3_XXS"),
+            Some(Family::Qwen38Next)
+        );
         assert_eq!(Family::detect("qwen3.6-27b"), Some(Family::Qwen36));
         assert_eq!(Family::detect("totally-other"), None);
     }
@@ -259,6 +293,8 @@ mod tests {
     #[test]
     fn qwen38_has_xhigh_others_do_not() {
         assert!(Family::Qwen38.effort_values().contains(&"xhigh"));
+        assert!(Family::Qwen38Next.effort_values().contains(&"xhigh"));
+        assert_eq!(Family::Qwen38Next.follow_up_compact_tools(), 6);
         assert!(Family::Qwen35.effort_values().is_empty());
         assert!(Family::Qwen36.effort_values().is_empty());
     }

@@ -187,20 +187,28 @@ pub struct WorkspaceShortcut {
 pub fn workspace_shortcuts() -> Vec<WorkspaceShortcut> {
     let mut out = Vec::new();
     let mut push = |id: &str, label: &str, p: PathBuf| {
-        if p.is_dir() {
-            let path = fs::canonicalize(&p).unwrap_or(p);
-            out.push(WorkspaceShortcut {
-                id: id.into(),
-                label: label.into(),
-                path: path.display().to_string(),
-            });
+        if !p.is_dir() {
+            return;
         }
+        let path = fs::canonicalize(&p).unwrap_or(p);
+        let s = path.display().to_string();
+        if out.iter().any(|x: &WorkspaceShortcut| x.path == s) {
+            return;
+        }
+        out.push(WorkspaceShortcut {
+            id: id.into(),
+            label: label.into(),
+            path: s,
+        });
     };
     if let Some(home) = user_home() {
         push("home", "主目录", home.clone());
         push("desktop", "桌面", home.join("Desktop"));
+        push("desktop-zh", "桌面", home.join("桌面"));
         push("documents", "文稿", home.join("Documents"));
+        push("documents-zh", "文档", home.join("文档"));
         push("downloads", "下载", home.join("Downloads"));
+        push("downloads-zh", "下载", home.join("下载"));
     }
     if let Ok(cwd) = std::env::current_dir() {
         push("cwd", "启动目录", cwd);
@@ -243,6 +251,11 @@ pub fn list_child_dirs(raw: &str, max: usize) -> Result<(PathBuf, Option<String>
 }
 
 /// Native OS folder dialog. `Ok(None)` = user cancelled. `Err` = no picker / failed.
+///
+/// Desktop Electron uses its own UTF-16 dialog and POSTs `/workspace`. This
+/// sidecar path is for `q38 web` in a browser. Windows PowerShell 5.1 writes
+/// native stdout as ASCII/`$OutputEncoding` unless we emit UTF-8 bytes; a
+/// Chinese folder would otherwise arrive as `?` and fail `is_dir()`.
 pub fn pick_folder_native() -> Result<Option<PathBuf>> {
     let output = if cfg!(target_os = "macos") {
         Command::new("osascript")
@@ -260,8 +273,23 @@ end try"#,
             .args([
                 "-NoProfile",
                 "-STA",
+                "-NonInteractive",
                 "-Command",
-                "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = '选择工作区文件夹'; $d.ShowNewFolderButton = $true; if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $d.SelectedPath }",
+                r#"
+$ErrorActionPreference = 'Stop'
+$utf8 = New-Object System.Text.UTF8Encoding $false
+[Console]::OutputEncoding = $utf8
+$OutputEncoding = $utf8
+Add-Type -AssemblyName System.Windows.Forms
+$d = New-Object System.Windows.Forms.FolderBrowserDialog
+$d.Description = '选择工作区文件夹'
+$d.ShowNewFolderButton = $true
+try { $d.SelectedPath = [Environment]::GetFolderPath('UserProfile') } catch {}
+if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK -and $d.SelectedPath) {
+  $bytes = $utf8.GetBytes($d.SelectedPath)
+  [Console]::OpenStandardOutput().Write($bytes, 0, $bytes.Length)
+}
+"#,
             ])
             .output()
     } else {
@@ -283,23 +311,33 @@ end try"#,
         Ok(o) => o,
         Err(_) => bail!("这台机器没有系统文件夹对话框，请把路径贴到输入框再点打开"),
     };
-    let text = String::from_utf8_lossy(&output.stdout);
-    let path = text.lines().next().unwrap_or("").trim();
+    let path = picker_stdout_path(&output.stdout);
     if path.is_empty() {
-        return Ok(None);
-    }
-    if !output.status.success() {
-        if output.status.code() == Some(1) {
+        if output.status.success() || output.status.code() == Some(1) {
             return Ok(None);
         }
         let err = String::from_utf8_lossy(&output.stderr);
         bail!("文件夹对话框失败: {}", err.trim());
     }
-    let p = PathBuf::from(path.trim_end_matches(['/', '\\']));
+    let p = PathBuf::from(path);
     if !p.is_dir() {
         bail!("选中的路径不是文件夹: {}", p.display());
     }
     Ok(Some(fs::canonicalize(&p).unwrap_or(p)))
+}
+
+/// First non-empty stdout line, UTF-8 with an optional BOM. PowerShell used to
+/// emit GBK/ASCII here; callers now write UTF-8, but a BOM still appears if
+/// `[UTF8Encoding]::new($true)` sneaks in.
+pub(crate) fn picker_stdout_path(stdout: &[u8]) -> String {
+    let bytes = stdout.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(stdout);
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(|l| l.trim().trim_matches('"'))
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .trim_end_matches(['/', '\\'])
+        .to_string()
 }
 
 fn walk(
@@ -593,6 +631,37 @@ mod tests {
         assert_eq!(path, fs::canonicalize(&dir).unwrap());
         assert_eq!(kids.len(), 1);
         assert_eq!(kids[0]["name"], "sub");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn picker_stdout_keeps_chinese_and_strips_bom() {
+        let raw = "C:\\Users\\张三\\文档\r\n".as_bytes();
+        assert_eq!(picker_stdout_path(raw), "C:\\Users\\张三\\文档");
+        let mut bom = vec![0xEF, 0xBB, 0xBF];
+        bom.extend_from_slice("/Users/张三/文稿/\n".as_bytes());
+        assert_eq!(picker_stdout_path(&bom), "/Users/张三/文稿");
+        assert_eq!(picker_stdout_path(b"\n\n"), "");
+        assert_eq!(
+            picker_stdout_path("\"/tmp/项目\"\n".as_bytes()),
+            "/tmp/项目"
+        );
+    }
+
+    #[test]
+    fn resolve_and_list_chinese_workspace() {
+        let dir = std::env::temp_dir().join(format!("q38-中文-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(dir.join("子文件夹")).unwrap();
+        fs::write(dir.join("说明.txt"), b"ok").unwrap();
+        let got = resolve_workspace_dir(&dir.display().to_string(), None).unwrap();
+        assert_eq!(got, fs::canonicalize(&dir).unwrap());
+        let (_path, _parent, kids) = list_child_dirs(&dir.display().to_string(), 50).unwrap();
+        assert_eq!(kids.len(), 1);
+        assert_eq!(kids[0]["name"], "子文件夹");
+        assert!(kids[0]["path"].as_str().unwrap().contains("子文件夹"));
+        let up = write_upload(&dir, "季度报告.docx", b"PK", 10_000).unwrap();
+        assert_eq!(up.name, "季度报告.docx");
+        assert!(up.path.contains("季度报告"));
         fs::remove_dir_all(&dir).ok();
     }
 }

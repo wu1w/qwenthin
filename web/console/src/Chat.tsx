@@ -74,7 +74,7 @@ function compactCount(events: SessionEvent[], snap?: Snap): number {
   return n || snap?.usage?.compacts || 0;
 }
 
-export type RunPhase = "idle" | "waiting" | "thinking" | "writing" | "tool" | "permit" | "clarify" | "stopping";
+export type RunPhase = "idle" | "waiting" | "thinking" | "writing" | "tool" | "permit" | "clarify" | "stopping" | "retrying";
 
 export function runPhase(opts: {
   busy: boolean;
@@ -90,6 +90,7 @@ export function runPhase(opts: {
   const liveOn = !!(opts.live.think || opts.live.content);
   if (!opts.busy && !liveOn) return "idle";
   if (opts.live.content) return "writing";
+  if (opts.live.think.includes("网络不稳") || opts.live.think.includes("正在重连")) return "retrying";
   if (opts.live.think) return "thinking";
   const last = opts.events[opts.events.length - 1];
   if (last?.type === "tool") return "tool";
@@ -107,6 +108,7 @@ export const PHASE_LABEL: Record<RunPhase, string> = {
   permit: "等待审批",
   clarify: "等待选择",
   stopping: "正在停止",
+  retrying: "正在重连",
 };
 
 export function fmtElapsed(s: number) {
@@ -469,7 +471,7 @@ export function ChatPage({
     phase === "waiting" ? usage?.live_prompt_tokens || usage?.last_prompt_tokens || 0 : 0;
   const waitPrefixBit = waitPrefix > 0 ? ` · ${waitPrefix} tokens` : "";
   const callLabel =
-    phase === "stopping" || phase === "permit" || phase === "clarify"
+    phase === "stopping" || phase === "permit" || phase === "clarify" || phase === "retrying"
       ? PHASE_LABEL[phase]
       : waitPrefix > 0
         ? `正在调用模型 · ${waitPrefix.toLocaleString()} tokens`

@@ -9,7 +9,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
 
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -43,12 +42,12 @@ pub struct HttpCompleter {
 
 impl HttpCompleter {
     pub async fn connect(cfg: &Config, policy: ThinkPolicy) -> Result<Self> {
-        let client = llm_client(cfg.server.connect_timeout_s, cfg.server.read_timeout_s)?;
+        let client = crate::llm_http::stream_client(cfg)?;
         let (model, owned) = match configured_chat_model(cfg) {
             Some(model) => (model, None),
             None => {
                 // GET /models must not inherit the 30-minute stream timeout.
-                let probe = llm_client(cfg.server.connect_timeout_s.min(5), 15)?;
+                let probe = crate::llm_http::probe_client(cfg.server.connect_timeout_s.min(5), 15)?;
                 fetch_model(&probe, cfg).await?
             }
         };
@@ -228,15 +227,6 @@ fn caps_for(cfg: &Config, model: &str, owned: Option<&str>) -> EndpointCaps {
     EndpointCaps::for_family(family, profile)
 }
 
-fn llm_client(connect_s: u64, timeout_s: u64) -> Result<Client> {
-    Client::builder()
-        .connect_timeout(Duration::from_secs(connect_s.max(1)))
-        .timeout(Duration::from_secs(timeout_s.max(5)))
-        .tcp_nodelay(true)
-        .build()
-        .map_err(|e| Error::Http(e.to_string()))
-}
-
 fn configured_chat_model(cfg: &Config) -> Option<String> {
     let m = cfg.server.model.trim();
     if m.is_empty() {
@@ -278,11 +268,7 @@ pub fn session_slot(session_id: &str, total_slots: u32) -> Option<i64> {
 }
 
 async fn fetch_total_slots(cfg: &Config) -> u32 {
-    let Ok(client) = Client::builder()
-        .connect_timeout(Duration::from_secs(1))
-        .timeout(Duration::from_secs(2))
-        .build()
-    else {
+    let Ok(client) = crate::llm_http::probe_client(1, 2) else {
         return 0;
     };
     let base = cfg.server.base_url.trim_end_matches('/');

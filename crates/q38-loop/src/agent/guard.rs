@@ -72,6 +72,11 @@ pub struct EditGuard {
     user_allows_test_edit: bool,
     /// Suite state before this turn's first edit. `None` = never probed.
     baseline_red: Option<bool>,
+    /// Production **code** files edited since the last oracle run this turn.
+    oracle_pending: bool,
+    /// Model already invoked a test runner this turn (not the harness oracle).
+    model_ran_tests: bool,
+    code_paths: Vec<String>,
 }
 
 impl EditGuard {
@@ -85,6 +90,9 @@ impl EditGuard {
         self.tests_seen_this_turn = false;
         self.baseline_red = None;
         self.user_allows_test_edit = allows_test_edit(user);
+        self.oracle_pending = false;
+        self.model_ran_tests = false;
+        self.code_paths.clear();
     }
 
     /// Suite state sampled before any edit this turn. Deliberately does not mark
@@ -93,13 +101,18 @@ impl EditGuard {
         self.baseline_red = Some(red);
     }
 
-    /// `--print` should run tests itself: production changed, tests file not
-    /// touched, and the model did not already invoke a runner this turn.
+    /// Run a scoped suite after a code edit. Not keyword-gated. Skip when the
+    /// model already ran tests, only test files changed, or plan mode (caller).
     pub fn wants_oracle(&self) -> bool {
-        self.prod_this_turn
-            && !self.test_this_turn
-            && !self.red_note_fired
-            && !self.tests_seen_this_turn
+        self.oracle_pending && !self.model_ran_tests && !self.test_this_turn
+    }
+
+    pub fn code_paths(&self) -> &[String] {
+        &self.code_paths
+    }
+
+    pub fn mark_oracle_ran(&mut self) {
+        self.oracle_pending = false;
     }
 
     /// Observe one successfully executed tool call. Returns the notes to
@@ -119,6 +132,13 @@ impl EditGuard {
                     self.test_this_turn = true;
                 } else {
                     self.prod_this_turn = true;
+                    if super::verify::is_code_path(&path) {
+                        self.oracle_pending = true;
+                        let n = normalize_path(&path);
+                        if !self.code_paths.iter().any(|p| p == &n) {
+                            self.code_paths.push(n);
+                        }
+                    }
                 }
             }
         }
@@ -192,8 +212,28 @@ impl EditGuard {
     /// After a tool round: bash/run_code already ran tests and they went red,
     /// while this user turn only edited production files.
     pub fn observe_tool_output(&mut self, name: &str, output: &str) -> Option<GuardNote> {
+        self.observe_runner_output(name, output, false)
+    }
+
+    /// Harness oracle: same TestRed logic, but do not consume `oracle_pending`
+    /// via `model_ran_tests` (a later edit this turn can re-trigger).
+    pub fn observe_oracle_output(&mut self, output: &str) -> Option<GuardNote> {
+        self.mark_oracle_ran();
+        self.observe_runner_output("bash", output, true)
+    }
+
+    fn observe_runner_output(
+        &mut self,
+        name: &str,
+        output: &str,
+        from_oracle: bool,
+    ) -> Option<GuardNote> {
         if looks_like_test_output(name, output) {
             self.tests_seen_this_turn = true;
+            if !from_oracle {
+                self.model_ran_tests = true;
+                self.oracle_pending = false;
+            }
         }
         if self.red_note_fired || !self.prod_this_turn || self.test_this_turn {
             return None;
@@ -230,7 +270,10 @@ fn looks_like_test_fail(name: &str, output: &str) -> bool {
         || l.contains("failed (failures")
         || l.contains("failed (errors")
         || l.contains("test failed")
+        || l.contains("test result: failed")
         || (l.contains("ran ") && l.contains("failed"))
+        || l.contains(" failed in ")
+        || (l.contains("short test summary") && l.contains("failed"))
 }
 
 fn looks_like_test_output(name: &str, output: &str) -> bool {
@@ -242,6 +285,8 @@ fn looks_like_test_output(name: &str, output: &str) -> bool {
         || l.contains("failed (failures")
         || l.contains("failed (errors")
         || l.contains("short test summary")
+        || l.contains("test result:")
+        || (l.contains("running ") && l.contains(" test"))
 }
 
 fn normalize_path(path: &str) -> String {

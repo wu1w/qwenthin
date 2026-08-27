@@ -30,7 +30,7 @@ pub struct WebOpts {
 
 pub async fn run(opts: WebOpts) -> Result<std::process::ExitCode> {
     let (cfg, cfg_path) = Config::load_or_init_file().context("load config")?;
-    vendor::verify_qwen38().ok();
+    vendor::verify_vendors().ok();
     // Q38_* overlay 仅 CLI/TUI 生效,web 模式只读 config.toml;启动时提醒一次
     let ignored = routes::env_ignored_names();
     if !ignored.is_empty() {
@@ -68,6 +68,8 @@ pub async fn run(opts: WebOpts) -> Result<std::process::ExitCode> {
         low_precision: cfg.policy.low_precision,
         workspace_confined: cfg.features.workspace_write_only,
         approvals: ApprovalMode::parse(&cfg.features.approvals).unwrap_or(ApprovalMode::Ask),
+        sessions_dir: None,
+        home: None,
     });
     let open = q38_loop::sidecar::RpcRequest {
         jsonrpc: "2.0".into(),
@@ -151,7 +153,9 @@ fn console_dir_near(exe_dir: &std::path::Path) -> Option<PathBuf> {
     if let Some(parent) = exe_dir.parent() {
         cands.push(parent.join("console"));
     }
-    cands.into_iter().find(|cand| cand.join("index.html").is_file())
+    cands
+        .into_iter()
+        .find(|cand| cand.join("index.html").is_file())
 }
 
 fn open_browser(url: &str) {

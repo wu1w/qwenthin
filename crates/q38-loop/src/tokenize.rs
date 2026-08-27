@@ -10,7 +10,7 @@ static QWEN38: OnceLock<Tokenizer> = OnceLock::new();
 
 pub fn load_tokenizer(family: Family) -> Result<&'static Tokenizer> {
     match family {
-        Family::Qwen38 | Family::Auto => qwen38_tokenizer(),
+        Family::Qwen38 | Family::Qwen38Next | Family::Auto => qwen38_tokenizer(),
         Family::Qwen35 | Family::Qwen36 => Err(Error::Tokenizer(format!(
             "{} tokenizer.json is not vendored yet; prefix accounting is Qwen3.8-27B only",
             family.as_str()

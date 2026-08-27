@@ -90,15 +90,17 @@ pub(crate) fn make_start(
     mode: SessionMode,
     policy: ThinkPolicy,
     channel: &str,
+    home: Option<&std::path::Path>,
 ) -> SessionStart {
     let ws = workspace.display().to_string();
-    let home = Config::home_dir().ok();
+    let home_buf = home
+        .map(|p| p.to_path_buf())
+        .or_else(|| Config::home_dir().ok());
+    let home = home_buf.as_deref();
     let (system, tools) = match mode {
         SessionMode::Chat => (coding_prompt(&ws), Vec::new()),
         SessionMode::Code => (coding_prompt(&ws), code_tools()),
-        SessionMode::Agent | SessionMode::Think => {
-            sidecar_agent_surface(&ws, workspace, home.as_deref())
-        }
+        SessionMode::Agent | SessionMode::Think => sidecar_agent_surface(&ws, workspace, home),
     };
     let mut start = SessionStart::new(id, ws, mode, system, tools_hash(&tools), policy);
     if !channel.is_empty() {
@@ -118,7 +120,7 @@ pub(crate) fn sidecar_agent_surface(
     if memory_ok {
         tools.push(memory_search_tool());
     }
-    let cfg = Config::load_file_or_default();
+    let cfg = isolated_or_disk_config(home);
     let mcp = McpRegistry::load(home, workspace, &cfg.mcp);
     if !mcp.servers.is_empty() {
         tools.push(mcp_tool());
@@ -146,6 +148,26 @@ pub(crate) fn sidecar_agent_surface(
         s
     };
     (system, tools)
+}
+
+/// Isolated `home` (SaaS tenant dir) must not inherit the host `~/.q38-agent/config.toml`.
+fn isolated_or_disk_config(home: Option<&std::path::Path>) -> Config {
+    let Some(home) = home else {
+        return Config::load_file_or_default();
+    };
+    if Config::home_dir()
+        .ok()
+        .as_deref()
+        .is_some_and(|d| d == home)
+    {
+        return Config::load_file_or_default();
+    }
+    let path = home.join("config.toml");
+    if path.is_file() {
+        Config::load_from(&path).unwrap_or_default()
+    } else {
+        Config::default()
+    }
 }
 
 pub(crate) fn slash_policy(cmd: &SlashCmd, caps: &PolicyCaps) -> ThinkPolicy {

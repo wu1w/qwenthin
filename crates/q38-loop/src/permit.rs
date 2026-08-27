@@ -71,6 +71,8 @@ pub enum PermitDecision {
 
 pub struct PermitRequest {
     pub ask: PermitAsk,
+    /// Sidecar / console session id. Empty when the hub was not tagged.
+    pub session: String,
     pub reply: oneshot::Sender<PermitDecision>,
 }
 
@@ -80,6 +82,8 @@ pub struct PermitHub {
     tx: mpsc::UnboundedSender<PermitRequest>,
     mode: Arc<Mutex<ApprovalMode>>,
     always: Arc<Mutex<HashSet<String>>>,
+    /// Console session that should own the ask. Empty = TUI / untagged.
+    session: String,
 }
 
 impl fmt::Debug for PermitHub {
@@ -98,6 +102,7 @@ impl PermitHub {
                 tx,
                 mode: Arc::new(Mutex::new(mode)),
                 always: Arc::new(Mutex::new(HashSet::new())),
+                session: String::new(),
             },
             rx,
         )
@@ -117,6 +122,12 @@ impl PermitHub {
         if let Ok(mut g) = self.always.lock() {
             g.insert(tool.to_string());
         }
+    }
+
+    pub fn with_session(&self, id: impl Into<String>) -> Self {
+        let mut c = self.clone();
+        c.session = id.into();
+        c
     }
 
     pub fn needs_prompt(mode: ApprovalMode, tool: &str) -> bool {
@@ -150,6 +161,7 @@ impl PermitHub {
                     tool: tool.to_string(),
                     preview: preview.to_string(),
                 },
+                session: self.session.clone(),
                 reply,
             })
             .is_err()
@@ -193,5 +205,18 @@ mod tests {
         assert!(!PermitHub::needs_prompt(ApprovalMode::Ask, "read"));
         assert!(PermitHub::needs_prompt(ApprovalMode::Ask, "write"));
         assert!(!PermitHub::needs_prompt(ApprovalMode::Yolo, "bash"));
+    }
+
+    #[tokio::test]
+    async fn check_stamps_session() {
+        let (hub, mut rx) = PermitHub::pair(ApprovalMode::Ask);
+        let hub = hub.with_session("sess-a");
+        let cancel = crate::tool_calls::CancelFlag::new();
+        let waiter = tokio::spawn(async move { hub.check("write", "out.txt", &cancel).await });
+        let req = rx.recv().await.expect("ask");
+        assert_eq!(req.session, "sess-a");
+        assert_eq!(req.ask.tool, "write");
+        let _ = req.reply.send(PermitDecision::Allow);
+        assert_eq!(waiter.await.unwrap(), PermitDecision::Allow);
     }
 }

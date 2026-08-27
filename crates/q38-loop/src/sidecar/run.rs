@@ -65,6 +65,11 @@ pub async fn execute_turn(
         || matches!(req.snapshot.mode, SessionMode::Think | SessionMode::Chat)
         || !req.snapshot.policy.enabled;
     opts.persist_session = req.persist;
+    opts.session_dir = req.snapshot.sessions_dir.clone();
+    opts.home = req.snapshot.home.clone();
+    if let Some(home) = &req.snapshot.home {
+        opts.blob_dir = Some(home.join("blobs"));
+    }
     opts.session_mode = req.snapshot.mode;
     opts.plan_mode = req.snapshot.plan_mode;
     opts.clarify_mode = req.snapshot.clarify_mode;
@@ -80,23 +85,37 @@ pub async fn execute_turn(
     let prompt = req.prompt;
     let parts = req.parts;
     let policy = req.snapshot.policy;
-    let completer = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => return TurnResult::aborted(),
-        c = HttpCompleter::connect(&cfg, policy.clone()) => match c {
-            Ok(c) => c,
-            Err(e) => {
-                return if cancel.is_cancelled() {
-                    TurnResult::aborted()
-                } else {
-                    TurnResult::fail(e.to_string())
-                };
-            }
+    let emit = req.emit.clone();
+    let completer = match crate::llm_http::retry_transient(
+        &cancel,
+        || HttpCompleter::connect(&cfg, policy.clone()),
+        |attempt, wait, err| {
+            emit.append(crate::session::SessionEvent::delta_reset());
+            emit.append(crate::session::SessionEvent::delta_chunk(
+                crate::session::DeltaChannel::Reasoning,
+                crate::llm_http::retry_status_line(attempt, wait),
+            ));
+            eprintln!("[net] connect retry #{attempt} after {wait:?}: {err}");
         },
+    )
+    .await
+    {
+        Ok(c) => {
+            emit.append(crate::session::SessionEvent::delta_reset());
+            c
+        }
+        Err(e) => {
+            return if cancel.is_cancelled() || e.to_string().contains("aborted") {
+                TurnResult::aborted()
+            } else {
+                TurnResult::fail(e.to_string())
+            };
+        }
     };
-    let mut agent = match Agent::new(completer, opts) {
-        Ok(a) => a,
-        Err(e) => return TurnResult::fail(e.to_string()),
+    let mut agent = match tokio::task::spawn_blocking(move || Agent::new(completer, opts)).await {
+        Ok(Ok(a)) => a,
+        Ok(Err(e)) => return TurnResult::fail(e.to_string()),
+        Err(e) => return TurnResult::fail(format!("agent setup: {e}")),
     };
     agent.set_cancel(cancel.clone());
     agent.set_steer(steer);

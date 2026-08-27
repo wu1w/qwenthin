@@ -179,7 +179,7 @@ pub async fn run_probe(cfg: &Config) -> Result<ProbeReport> {
     caps.enable_thinking = enable_thinking;
 
     let mut effort_values = Vec::new();
-    if family == Family::Qwen38 {
+    if !family.effort_values().is_empty() {
         for effort in ["low", "medium", "xhigh"] {
             let mut policy = ThinkPolicy::agent_default();
             policy.effort = crate::policy::Effort::from_config(effort);
@@ -247,7 +247,7 @@ pub async fn run_probe(cfg: &Config) -> Result<ProbeReport> {
         yellow.push("no decode tok/s (engine did not return timings)".into());
     }
 
-    if family != Family::Qwen38 {
+    if !matches!(family, Family::Qwen38 | Family::Qwen38Next | Family::Auto) {
         yellow.push(format!(
             "resolved family is {family}; v1 quality gate is Qwen3.8-27B"
         ));
@@ -978,8 +978,8 @@ fn engine_origin(base_url: &str) -> String {
 fn infer_quant(model: &str) -> String {
     let s = model.to_ascii_lowercase();
     for tag in [
-        "ud-q8", "q8_0", "q6_k", "q5_k", "q4_k", "q4_0", "fp8", "awq", "gptq", "nvfp4", "bf16",
-        "fp16",
+        "ud-q8", "iq3_xxs", "iq3_xs", "iq3_s", "iq3_m", "iq4_xs", "iq4_nl", "q8_0", "q6_k", "q5_k",
+        "q4_k", "q3_k", "q4_0", "fp8", "awq", "gptq", "nvfp4", "bf16", "fp16",
     ] {
         if s.contains(tag) {
             return tag.to_string();
@@ -1056,6 +1056,12 @@ mod tests {
     }
 
     #[test]
+    fn infer_quant_reads_iq3_before_generic_q3() {
+        assert_eq!(infer_quant("Qwen3.8-Flash-Next-UD-IQ3_XXS"), "iq3_xxs");
+        assert_eq!(infer_quant("qwen3.8-27b-ud-q8"), "ud-q8");
+    }
+
+    #[test]
     fn llama_pin_uses_last_slot_when_parallel() {
         assert_eq!(
             llama_probe_pin(EngineProfile::LlamaCpp, Some(4)),
@@ -1075,7 +1081,11 @@ mod tests {
         let (cfg, _) = Config::load_or_init().unwrap();
         let report = run_probe(&cfg).await.expect("probe");
         assert!(report.ok(), "probe red lights: {:?}", report.red);
-        assert_eq!(report.family, "qwen38");
+        assert!(
+            report.family == "qwen38" || report.family == "q38next",
+            "unexpected family {}",
+            report.family
+        );
         assert!(report.enable_thinking);
         assert!(report.effort_values.iter().any(|v| v == "low"));
     }

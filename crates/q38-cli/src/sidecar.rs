@@ -14,7 +14,7 @@ use super::Cli;
 
 pub async fn run(cli: Cli) -> Result<ExitCode> {
     let (cfg, _) = Config::load_or_init().context("load config")?;
-    vendor::verify_qwen38().ok();
+    vendor::verify_vendors().ok();
 
     let workspace = cli
         .workspace
@@ -46,6 +46,8 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
         low_precision: cfg.policy.low_precision,
         workspace_confined: cfg.features.workspace_write_only,
         approvals: ApprovalMode::parse(&cfg.features.approvals).unwrap_or(ApprovalMode::Ask),
+        sessions_dir: None,
+        home: None,
     });
 
     let agents_md = cli.agents_md && !cli.no_agents_md;

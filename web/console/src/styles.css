@@ -1100,6 +1100,7 @@ th.tick input, td.tick input {
 }
 .run-chip.phase-permit.on { background: var(--warn-soft); color: var(--warn); }
 .run-chip.phase-clarify.on { background: var(--warn-soft); color: var(--warn); }
+.run-chip.phase-retrying.on { background: var(--warn-soft); color: var(--warn); }
 .run-chip.phase-stopping.on { background: var(--danger-soft); color: var(--danger); }
 .run-dot {
   width: 7px; height: 7px; border-radius: 50%;
@@ -1113,6 +1114,7 @@ th.tick input, td.tick input {
 .run-dot.lg { width: 9px; height: 9px; flex-basis: 9px; }
 .run-dot.phase-permit { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
 .run-dot.phase-clarify { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
+.run-dot.phase-retrying { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
 .run-dot.phase-stopping { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); animation: none; }
 @keyframes pulse {
   0%, 100% { opacity: 1; }

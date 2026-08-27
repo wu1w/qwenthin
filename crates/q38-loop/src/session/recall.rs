@@ -82,7 +82,11 @@ fn expand_blob(blobs: &BlobStore, id: &str, sha: &str, limits: ToolLimits) -> To
 
 fn format_event(seq: u32, event: &SessionEvent) -> String {
     match event {
-        SessionEvent::User(u) => format!("seq={seq} user\n{}", u.text),
+        SessionEvent::User(u) => {
+            let mut s = format!("seq={seq} user\n{}", u.text);
+            append_media(&mut s, &u.media);
+            s
+        }
         SessionEvent::Assistant(a) => {
             let mut s = format!("seq={seq} assistant\n{}", a.content);
             if let Some(calls) = &a.tool_calls {
@@ -97,6 +101,7 @@ fn format_event(seq: u32, event: &SessionEvent) -> String {
             if let Some(blob) = &t.blob {
                 s.push_str(&format!("\nblob={blob}"));
             }
+            append_media(&mut s, &t.media);
             s
         }
         SessionEvent::Compact(c) => format!(
@@ -104,5 +109,34 @@ fn format_event(seq: u32, event: &SessionEvent) -> String {
             c.until_seq, c.keep_user_seq, c.summary, c.index
         ),
         other => format!("seq={seq} {}", other.type_name()),
+    }
+}
+
+fn append_media(s: &mut String, media: &[crate::session::event::StoredMedia]) {
+    for m in media {
+        s.push_str(&format!("\nmedia={} {}", m.mime, m.url));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::event::{SessionEvent, StoredMedia};
+
+    #[test]
+    fn format_event_prints_full_blob_and_media_paths() {
+        let sha = "a".repeat(64);
+        let ev = SessionEvent::tool_folded("c1", "read", "image ok", Some(sha.clone()), Some(1200))
+            .with_media(vec![StoredMedia {
+                kind: "image".into(),
+                mime: "image/jpeg".into(),
+                url: ".q38-agent/generated/shot.jpg".into(),
+            }]);
+        let text = format_event(9, &ev);
+        assert!(text.contains(&sha), "{text}");
+        assert!(
+            text.contains("media=image/jpeg .q38-agent/generated/shot.jpg"),
+            "{text}"
+        );
     }
 }

@@ -1,0 +1,3 @@
+# q38next  (Qwen3.8-Flash-Next GGUF/Unsloth chat_template; tokenizer.json is the 27B 248320 vocab)
+12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce  chat_template.jinja
+b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27  tokenizer_config.json

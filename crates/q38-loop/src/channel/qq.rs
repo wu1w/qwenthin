@@ -283,9 +283,44 @@ fn native_from_event(ep: &ChannelEndpoint, t: &str, d: &Value) -> Option<NativeP
         return None;
     }
     let text = d["content"].as_str().unwrap_or("").trim().to_string();
-    if text.is_empty() {
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(ContentPart::text(&text));
+    }
+    if let Some(atts) = d.get("attachments").and_then(Value::as_array) {
+        for a in atts {
+            let name = first_str(&[&a["filename"], &a["file_name"], &a["name"]]);
+            let url = first_str(&[&a["url"], &a["content"]]);
+            let ctype = first_str(&[&a["content_type"], &a["contentType"]]).to_ascii_lowercase();
+            if ctype.starts_with("image/")
+                || name.to_ascii_lowercase().ends_with(".png")
+                || name.to_ascii_lowercase().ends_with(".jpg")
+                || name.to_ascii_lowercase().ends_with(".jpeg")
+            {
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    parts.push(ContentPart::Image {
+                        image_url: url,
+                        url: String::new(),
+                        mime: "image/jpeg".into(),
+                    });
+                } else {
+                    parts.push(ContentPart::text("[图片]"));
+                }
+            } else if !name.is_empty() {
+                parts.push(ContentPart::text(format!("[文件] {name}")));
+            } else {
+                parts.push(ContentPart::text("[文件]"));
+            }
+        }
+    }
+    if parts.is_empty() {
         return None;
     }
+    let text = NativePayload {
+        content_parts: parts.clone(),
+        ..NativePayload::default()
+    }
+    .query_text();
     let mut env = NativePayload {
         channel: if ep.kind.is_empty() {
             "qq".into()
@@ -294,7 +329,7 @@ fn native_from_event(ep: &ChannelEndpoint, t: &str, d: &Value) -> Option<NativeP
         },
         sender_id: sender.clone(),
         sender_name: author["username"].as_str().unwrap_or("").to_string(),
-        content_parts: vec![ContentPart::text(&text)],
+        content_parts: parts,
         text,
         ..NativePayload::default()
     };

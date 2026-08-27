@@ -233,7 +233,10 @@ fn extra_path_dirs() -> Vec<PathBuf> {
                 }
             }
         }
-        for raw in crate::config::Config::load_file_or_default().tools.extra_path {
+        for raw in crate::config::Config::load_file_or_default()
+            .tools
+            .extra_path
+        {
             if let Some(p) = expand_dir(&raw) {
                 dirs.push(p);
             }
@@ -311,14 +314,12 @@ fn well_known_bins(home: Option<&Path>) -> Vec<PathBuf> {
     dirs
 }
 
-fn merge_tool_path(
-    current: Option<OsString>,
-    home: Option<&Path>,
-    extra: &[PathBuf],
-) -> OsString {
+fn merge_tool_path(current: Option<OsString>, home: Option<&Path>, extra: &[PathBuf]) -> OsString {
     let mut ordered = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let push = |dir: PathBuf, ordered: &mut Vec<PathBuf>, seen: &mut std::collections::HashSet<PathBuf>| {
+    let push = |dir: PathBuf,
+                ordered: &mut Vec<PathBuf>,
+                seen: &mut std::collections::HashSet<PathBuf>| {
         if dir.as_os_str().is_empty() || !dir.is_dir() {
             return;
         }
@@ -692,20 +693,22 @@ mod tests {
         let home = std::env::temp_dir().join(format!("q38-path-{}", uuid::Uuid::new_v4().simple()));
         let cargo_bin = home.join(".cargo/bin");
         std::fs::create_dir_all(&cargo_bin).unwrap();
-        let merged = merge_tool_path(
-            Some("/usr/bin".into()),
-            Some(home.as_path()),
-            &[],
-        );
+        let merged = merge_tool_path(Some("/usr/bin".into()), Some(home.as_path()), &[]);
         let dirs: Vec<_> = std::env::split_paths(&merged).collect();
-        assert_eq!(dirs.first().map(PathBuf::as_path), Some(cargo_bin.as_path()));
+        assert_eq!(
+            dirs.first().map(PathBuf::as_path),
+            Some(cargo_bin.as_path())
+        );
         assert!(dirs.iter().any(|d| d == Path::new("/usr/bin")));
         let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
     fn tool_path_skips_missing_well_known_dirs() {
-        let home = std::env::temp_dir().join(format!("q38-path-missing-{}", uuid::Uuid::new_v4().simple()));
+        let home = std::env::temp_dir().join(format!(
+            "q38-path-missing-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         std::fs::create_dir_all(&home).unwrap();
         let merged = merge_tool_path(Some("/usr/bin".into()), Some(home.as_path()), &[]);
         let dirs: Vec<_> = std::env::split_paths(&merged).collect();
@@ -716,7 +719,8 @@ mod tests {
 
     #[test]
     fn tool_path_extra_dirs_win_over_well_known() {
-        let root = std::env::temp_dir().join(format!("q38-path-extra-{}", uuid::Uuid::new_v4().simple()));
+        let root =
+            std::env::temp_dir().join(format!("q38-path-extra-{}", uuid::Uuid::new_v4().simple()));
         let extra = root.join("extra");
         let cargo_bin = root.join("home/.cargo/bin");
         std::fs::create_dir_all(&extra).unwrap();

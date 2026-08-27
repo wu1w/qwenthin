@@ -8,7 +8,7 @@ use q38_loop::clarify::{ClarifyDecision, ClarifyHub, ClarifyRequest};
 use q38_loop::config::Config;
 use q38_loop::media::MediaPart;
 use q38_loop::permit::{PermitDecision, PermitHub, PermitRequest};
-use q38_loop::session::SessionEvent;
+use q38_loop::session::{DeltaChannel, SessionEvent};
 use q38_loop::sidecar::{
     execute_turn, Dispatch, EventSink, RpcRequest, SidecarSession, TurnRequest, TurnResult,
 };
@@ -110,13 +110,14 @@ impl AppState {
         agents_md: bool,
         agents_md_head: bool,
     ) -> Result<Self> {
-        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
-        let (bus, _) = broadcast::channel(512);
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
+        // Token deltas are tiny but frequent. 512 filled up around ~30 tool hops
+        // on a slow JSON/React client; RecvError::Lagged then pushed the whole
+        // history over WS and froze the UI.
+        let (bus, _) = broadcast::channel(8192);
         let bus_fwd = bus.clone();
         tokio::spawn(async move {
-            while let Some(ev) = ev_rx.recv().await {
-                let _ = bus_fwd.send(notify("event.append", json!(ev)));
-            }
+            forward_session_events(ev_rx, bus_fwd).await;
         });
         let approvals = session.approvals();
         let (permit, permit_rx) = PermitHub::pair(approvals);
@@ -252,7 +253,7 @@ impl AppState {
         if g.session.session_id() != before {
             let _ = g.bus.send(notify(
                 "history.replace",
-                json!({"events": g.session.events()}),
+                json!({"events": console_events(g.session.events())}),
             ));
         }
         out
@@ -427,25 +428,57 @@ fn spawn_channel_watch(inner: Arc<Mutex<Inner>>) {
                     eprintln!("q38 {}: starting in-process client ({})", ep.kind, ep.id);
                     jobs.push(tokio::spawn(async move {
                         let id = ep.id.clone();
-                        // serve 正常返回或报错都算停摆,同步进 runtime 状态
-                        let detail =
-                            match q38_loop::channel::serve_endpoint(cfg, workspace, ep).await {
-                                Ok(()) => "客户端已退出(无错误信息)".to_string(),
-                                Err(e) => {
-                                    eprintln!("q38 channel: {e}");
-                                    e.to_string()
+                        let kind = ep.kind.clone();
+                        q38_loop::channel::keep_client_watched(
+                            &kind,
+                            &id,
+                            {
+                                let cfg = cfg.clone();
+                                let workspace = workspace.clone();
+                                let ep = ep.clone();
+                                move || {
+                                    q38_loop::channel::serve_endpoint(
+                                        cfg.clone(),
+                                        workspace.clone(),
+                                        ep.clone(),
+                                    )
                                 }
-                            };
-                        let mut g = inner_ep.lock().await;
-                        if g.channel_gen == gen {
-                            g.channel_runtime.insert(
-                                id,
-                                ChannelRuntime {
-                                    state: "error",
-                                    detail: Some(clip_chars(&detail, 300)),
-                                },
-                            );
-                        }
+                            },
+                            {
+                                let inner_ep = inner_ep.clone();
+                                let id = id.clone();
+                                move |st| {
+                                    let inner_ep = inner_ep.clone();
+                                    let id = id.clone();
+                                    async move {
+                                        let (state, detail) = match st {
+                                            q38_loop::channel::ClientWatch::Running => {
+                                                ("running", None)
+                                            }
+                                            q38_loop::channel::ClientWatch::Retry {
+                                                detail,
+                                                wait_secs,
+                                            } => (
+                                                "error",
+                                                Some(clip_chars(
+                                                    &format!("retry in {wait_secs}s: {detail}"),
+                                                    300,
+                                                )),
+                                            ),
+                                            q38_loop::channel::ClientWatch::Fatal { detail } => {
+                                                ("error", Some(clip_chars(&detail, 300)))
+                                            }
+                                        };
+                                        let mut g = inner_ep.lock().await;
+                                        if g.channel_gen == gen {
+                                            g.channel_runtime
+                                                .insert(id, ChannelRuntime { state, detail });
+                                        }
+                                    }
+                                }
+                            },
+                        )
+                        .await;
                     }));
                 }
             }
@@ -456,6 +489,98 @@ fn spawn_channel_watch(inner: Arc<Mutex<Inner>>) {
 
 pub fn notify(method: &str, params: Value) -> Value {
     json!({"jsonrpc": "2.0", "method": method, "params": params})
+}
+
+/// Session events for the console: drop inline `data:` URLs so hello / history
+/// cannot replay screenshots as multi-megabyte JSON.
+pub fn console_events(events: &[SessionEvent]) -> Value {
+    let mut v = serde_json::to_value(events).unwrap_or_else(|_| json!([]));
+    redact_data_uris(&mut v);
+    v
+}
+
+fn redact_data_uris(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            if let Some(Value::String(url)) = map.get_mut("url") {
+                if url.starts_with("data:") {
+                    url.clear();
+                }
+            }
+            for child in map.values_mut() {
+                redact_data_uris(child);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                redact_data_uris(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+const DELTA_FLUSH_MS: u64 = 32;
+const DELTA_FLUSH_CHARS: usize = 4096;
+
+/// Merge consecutive token deltas so one WS frame covers ~32ms of tokens.
+async fn forward_session_events(mut ev_rx: mpsc::UnboundedReceiver<SessionEvent>, bus: Bus) {
+    let mut reason = String::new();
+    let mut content = String::new();
+    loop {
+        let pending = !reason.is_empty() || !content.is_empty();
+        let next = if pending {
+            tokio::select! {
+                ev = ev_rx.recv() => ev,
+                _ = tokio::time::sleep(Duration::from_millis(DELTA_FLUSH_MS)) => {
+                    flush_deltas(&mut reason, &mut content, &bus);
+                    continue;
+                }
+            }
+        } else {
+            ev_rx.recv().await
+        };
+        let Some(ev) = next else {
+            flush_deltas(&mut reason, &mut content, &bus);
+            break;
+        };
+        match ev {
+            SessionEvent::Delta(d) if d.reset => {
+                flush_deltas(&mut reason, &mut content, &bus);
+                let _ = bus.send(notify("event.append", json!(SessionEvent::Delta(d))));
+            }
+            SessionEvent::Delta(d) => {
+                match d.channel {
+                    DeltaChannel::Reasoning => reason.push_str(&d.text),
+                    DeltaChannel::Content => content.push_str(&d.text),
+                }
+                if reason.len() + content.len() >= DELTA_FLUSH_CHARS {
+                    flush_deltas(&mut reason, &mut content, &bus);
+                }
+            }
+            other => {
+                flush_deltas(&mut reason, &mut content, &bus);
+                let _ = bus.send(notify("event.append", json!(other)));
+            }
+        }
+    }
+}
+
+fn flush_deltas(reason: &mut String, content: &mut String, bus: &Bus) {
+    if !reason.is_empty() {
+        let text = std::mem::take(reason);
+        let _ = bus.send(notify(
+            "event.append",
+            json!(SessionEvent::delta_chunk(DeltaChannel::Reasoning, text)),
+        ));
+    }
+    if !content.is_empty() {
+        let text = std::mem::take(content);
+        let _ = bus.send(notify(
+            "event.append",
+            json!(SessionEvent::delta_chunk(DeltaChannel::Content, text)),
+        ));
+    }
 }
 
 pub fn apply_dispatch(inner: &mut Inner, shared: Arc<Mutex<Inner>>, dispatch: Dispatch) -> Value {
@@ -584,8 +709,8 @@ pub fn start_turn(
         messages: Vec::new(),
         steer: inner.session.steer_slot(),
         persist: true,
-        permit: Some(inner.permit.clone()),
-        clarify: Some(inner.clarify.clone()),
+        permit: Some(inner.permit.with_session(inner.session.session_id())),
+        clarify: Some(inner.clarify.with_session(inner.session.session_id())),
     };
     let cfg = inner.cfg.clone();
     let agents_md = inner.agents_md;
@@ -628,7 +753,7 @@ pub fn start_turn(
         // 的客户端才能补回本 turn 的前半段
         let _ = g.bus.send(notify(
             "history.replace",
-            json!({"events": g.session.events()}),
+            json!({"events": console_events(g.session.events())}),
         ));
         let _ = g.bus.send(notify("state", g.session.state_json()));
         if let Some(next) = g.session.pop_follow_up() {
@@ -661,8 +786,9 @@ pub fn redact_key(key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{channels_fingerprint, endpoint_static_runtime, redact_key};
+    use super::{channels_fingerprint, console_events, endpoint_static_runtime, redact_key};
     use q38_loop::config::Config;
+    use q38_loop::session::{SessionEvent, StoredMedia};
     use q38_loop::ChannelEndpoint;
 
     #[test]
@@ -723,5 +849,22 @@ mod tests {
         assert_eq!(endpoint_static_runtime(&ep).state, "running");
         ep.kind = "discord".into(); // 不在进程内的平台
         assert_eq!(endpoint_static_runtime(&ep).state, "off");
+    }
+
+    #[test]
+    fn console_events_drop_inline_data_uris() {
+        let ev = SessionEvent::tool("c1", "view", "Image loaded").with_media(vec![StoredMedia {
+            kind: "image".into(),
+            mime: "image/png".into(),
+            url: "data:image/png;base64,AAAA".into(),
+        }]);
+        let path = SessionEvent::tool("c2", "view", "ok").with_media(vec![StoredMedia {
+            kind: "image".into(),
+            mime: "image/png".into(),
+            url: ".q38/generated/shot.png".into(),
+        }]);
+        let v = console_events(&[ev, path]);
+        assert_eq!(v[0]["media"][0]["url"], "");
+        assert_eq!(v[1]["media"][0]["url"], ".q38/generated/shot.png");
     }
 }

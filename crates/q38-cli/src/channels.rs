@@ -15,7 +15,7 @@ use super::Cli;
 
 pub async fn run(cli: Cli) -> Result<ExitCode> {
     let (cfg, path) = Config::load_or_init().context("load config")?;
-    vendor::verify_qwen38().ok();
+    vendor::verify_vendors().ok();
     eprintln!("config: {}", path.display());
 
     let workspace = cli

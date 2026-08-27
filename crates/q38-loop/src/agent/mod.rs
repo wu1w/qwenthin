@@ -20,11 +20,12 @@
 mod delta;
 mod guard;
 mod http;
+mod verify;
 mod xml_tools;
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -35,7 +36,7 @@ use crate::echo::strip_greeting_echo;
 use crate::error::Result;
 use crate::family::Family;
 use crate::mcp::{card_for as mcp_card, run_mcp, McpConfig, McpRegistry};
-use crate::media::{MediaBins, MediaCaps};
+use crate::media::{MediaBins, MediaCaps, MediaKind};
 use crate::memory::{card_for as memory_card, run_memory_search, MemoryStore};
 use crate::paw_loop::{
     fs_tool_path, DoomLoopGate, Gate, GateCtx, GateDecision, IterationGate, NameStreakGate,
@@ -267,12 +268,28 @@ impl RunOpts {
 
 /// Console-facing channels where a human watches progress live. IM bridges
 /// deliver per-message and would surface narration as chat spam.
-fn interactive_channel(channel: &str) -> bool {
+pub(crate) fn interactive_channel(channel: &str) -> bool {
     matches!(channel, "" | "cli" | "tui" | "web" | "console")
+}
+
+/// Hermes-shaped unattended caps: gateway `max_turns` 500, no hard wall while working.
+pub fn apply_unattended_policy(opts: &mut RunOpts, cfg: &crate::config::Config) {
+    if interactive_channel(&opts.channel) {
+        return;
+    }
+    if cfg.policy.max_steps_unattended > 0 {
+        opts.max_steps = cfg.policy.max_steps_unattended;
+    }
+    opts.max_wall = Duration::from_secs(cfg.policy.max_wall_unattended_seconds);
 }
 
 const DEFAULT_COMPACT_RATIO: f64 = 0.70;
 const TURN_START_COMPACT_PREFIX: u32 = 120_000;
+/// A finished tool-heavy turn should not be replayed as a cold prefill, even
+/// when the cheap byte estimate sits under 120k.
+const TURN_START_COMPACT_TOOLS: usize = 8;
+/// In-memory images from the previous turn. Archive sooner than the wire cap.
+const TURN_START_COMPACT_IMAGES: usize = 4;
 
 fn clamp_generation_reserve(window: u32, reserve: u32) -> u32 {
     if window == 0 {
@@ -316,6 +333,85 @@ fn should_compact_at_user_turn(
     }
     over_soft_threshold(prefix, reserve, working_window, compact_ratio)
         || prefix > TURN_START_COMPACT_PREFIX
+}
+
+fn should_compact_follow_up(
+    prefix: u32,
+    reserve: u32,
+    working_window: u32,
+    compact_ratio: f64,
+    tool_messages: usize,
+    image_parts: usize,
+    tool_threshold: usize,
+) -> bool {
+    if working_window == 0 {
+        return false;
+    }
+    tool_messages >= tool_threshold
+        || image_parts > TURN_START_COMPACT_IMAGES
+        || should_compact_at_user_turn(prefix, reserve, working_window, compact_ratio)
+}
+
+fn live_tool_count(messages: &[ChatMessage]) -> usize {
+    messages.iter().filter(|m| m.role == "tool").count()
+}
+
+fn live_image_count(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .map(|m| {
+            m.parts
+                .iter()
+                .filter(|p| p.kind == MediaKind::Image)
+                .count()
+        })
+        .sum()
+}
+
+/// Cheap compact gate. Skips HuggingFace encode and does not walk data-URI
+/// payloads. English/JSON ≈ 4 bytes/token; CJK still crosses 120k on a 60-tool
+/// fold.
+fn estimate_prefix_tokens(
+    messages: &[ChatMessage],
+    tools: &[serde_json::Value],
+    keep_reasoning: bool,
+) -> u32 {
+    let mut bytes = 0usize;
+    for m in messages {
+        if let Some(c) = &m.content {
+            bytes += charged_text_len(c);
+        }
+        if keep_reasoning {
+            if let Some(r) = &m.reasoning_content {
+                bytes += charged_text_len(r);
+            }
+        }
+        if let Some(calls) = &m.tool_calls {
+            bytes += calls.iter().map(|v| v.to_string().len()).sum::<usize>();
+        }
+        for p in &m.parts {
+            bytes += if p.url.starts_with("data:") {
+                1024
+            } else {
+                p.url.len().min(256)
+            };
+        }
+    }
+    for t in tools {
+        bytes += t.to_string().len();
+    }
+    (bytes / 4) as u32
+}
+
+fn charged_text_len(s: &str) -> usize {
+    if s.starts_with("data:") {
+        return 1024;
+    }
+    if s.len() > 16_384 && (s.contains("data:image") || s.contains(";base64,")) {
+        2048
+    } else {
+        s.len()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -370,6 +466,8 @@ pub struct Agent<C> {
     parse_stop_after: u32,
     /// Last substantial assistant content this user turn. Harness-only.
     last_spoken: Option<String>,
+    /// Substantial hop text even when `last_spoken` was not locked (read-only hops).
+    last_essay: Option<String>,
     /// Paths successfully `read` this user turn. Re-reads after an answer are not progress.
     read_paths: HashSet<String>,
     /// Paths whose content the live transcript has seen (read/view/write/edit).
@@ -550,6 +648,7 @@ impl<C: Completer> Agent<C> {
             low_precision: lossy,
             parse_stop_after: if lossy { 2 } else { 3 },
             last_spoken: None,
+            last_essay: None,
             read_paths: HashSet::new(),
             observed_paths: HashSet::new(),
             window_overlay: opts.working_window_overlay,
@@ -630,6 +729,7 @@ impl<C: Completer> Agent<C> {
         self.physics_nudged = false;
         self.parse_nudged = false;
         self.last_spoken = None;
+        self.last_essay = None;
         self.read_paths.clear();
         self.observed_paths = observed_from_messages(&self.messages, &self.workspace);
         let user = self.last_real_user().to_string();
@@ -697,10 +797,7 @@ impl<C: Completer> Agent<C> {
                         steps += 1;
                         prompt_tokens += t.prompt_tokens;
                         completion_tokens += t.completion_tokens;
-                        if !t.watchdog_hit
-                            || !t.content.is_empty()
-                            || !t.tool_calls.is_empty()
-                        {
+                        if !t.watchdog_hit || !t.content.is_empty() || !t.tool_calls.is_empty() {
                             turn = t;
                         }
                     }
@@ -746,19 +843,29 @@ impl<C: Completer> Agent<C> {
                 turn.content = body;
             }
             let mut trajectory_note = None;
-            if let Some(prev) = self.last_spoken.clone() {
-                if self.is_answer_dump_hop(&prev, &turn) {
+            let dump_anchor = self.last_spoken.clone().or_else(|| self.last_essay.clone());
+            if let Some(prev) = dump_anchor {
+                let quote_dump = turn.tool_calls.is_empty()
+                    && crate::stutter::is_blockquote_heavy(&turn.content)
+                    && crate::stutter::is_substantial_reply(&prev);
+                if quote_dump || self.is_answer_dump_hop(&prev, &turn) {
+                    let keep = self.last_spoken.clone().unwrap_or(prev);
                     if turn.tool_calls.is_empty() {
                         // No tools means the model chose to stop. Keep the first
                         // identical bubble without labelling that choice a
                         // harness failure.
                         self.mark_clean();
-                        return self.finish(prev, None, steps);
+                        return self.finish(keep, None, steps);
                     }
                     trajectory_note = Some(crate::stutter::DUMP_NOTE);
                 }
             }
             self.push_assistant(&turn);
+            if crate::stutter::is_substantial_reply(&turn.content)
+                && !crate::stutter::is_blockquote_heavy(&turn.content)
+            {
+                self.last_essay = Some(turn.content.clone());
+            }
             if Self::hop_locks_spoken(&turn) {
                 self.last_spoken = Some(turn.content.clone());
             }
@@ -1136,17 +1243,17 @@ impl<C: Completer> Agent<C> {
         self.push_hidden_user(note.text());
     }
 
-    /// Sample the suite before any edit so a later red run can be told apart
-    /// from a suite that was already red. Also gives the model a fact it trusts
-    /// more than any instruction: the colour of the tree it just inherited.
+    /// Sample a cheap suite before edits in `--print` only, so a later red run
+    /// can be told apart from a tree that was already red. Interactive turns
+    /// skip this and only run the post-edit scoped oracle.
     async fn snapshot_test_baseline(&mut self) {
         if !self.print || self.plan_mode || self.oracle_cmd.is_some() {
             return;
         }
-        if !wants_test_baseline(self.last_real_user()) {
+        if !verify::workspace_has_tests(self.workspace.root()) {
             return;
         }
-        let Some(cmd) = oracle_unittest_cmd(self.workspace.root()) else {
+        let Some(cmd) = verify::workspace_default_test_cmd(self.workspace.root()) else {
             return;
         };
         let started = std::time::Instant::now();
@@ -1168,24 +1275,32 @@ impl<C: Completer> Agent<C> {
         ));
     }
 
-    /// Unattended `--print`: production changed and the model never ran a test
-    /// runner, so run the suite ourselves and hand back the result as a fact.
+    /// After a successful code edit, run a scoped test command and feed the
+    /// tail back. Not gated on user keywords. Skips office docs, plan mode,
+    /// and turns where the model already ran tests.
     async fn oracle_tests_if_needed(&mut self) {
-        if !self.print || self.pending_stop.is_some() || !self.edit_guard.wants_oracle() {
+        if self.plan_mode || self.pending_stop.is_some() || !self.edit_guard.wants_oracle() {
             return;
         }
-        let Some(cmd) = self.oracle_cmd.clone() else {
+        let cmd = verify::scoped_test_cmd(self.workspace.root(), self.edit_guard.code_paths())
+            .or_else(|| self.oracle_cmd.clone());
+        let Some(cmd) = cmd else {
+            self.edit_guard.mark_oracle_ran();
             return;
         };
         let out = self.run_oracle(&cmd).await;
-        if let Some(note) = self.edit_guard.observe_tool_output("bash", &out) {
+        if let Some(note) = self.edit_guard.observe_oracle_output(&out) {
             self.apply_guard_note(note);
         }
-        // Injected even when the probe found no usable suite: a silent re-run
-        // every round would burn a subprocess per hop and teach nothing.
+        let red = guard::is_test_fail("bash", &out);
+        if red && self.effort.note_test_fail() {
+            self.sync_effort(PolicyReason::Upgrade);
+        } else if !red {
+            self.effort.note_tests_green();
+        }
         self.push_hidden_user(format!("[oracle]\n{}", tail_chars(&out, ORACLE_TAIL_CHARS)));
-        if !guard::is_test_output("bash", &out) {
-            self.oracle_cmd = None;
+        if guard::is_test_output("bash", &out) {
+            self.oracle_cmd = Some(cmd);
         }
     }
 
@@ -1299,9 +1414,7 @@ impl<C: Completer> Agent<C> {
         if self.plan_mode && !sticky::live_has_plan_note(&self.messages) {
             self.push_hidden_user(PLAN_CARD);
         }
-        if (self.plan_mode || self.clarify_mode)
-            && !sticky::live_has_clarify_note(&self.messages)
-        {
+        if (self.plan_mode || self.clarify_mode) && !sticky::live_has_clarify_note(&self.messages) {
             self.push_hidden_user(crate::clarify::CLARIFY_CARD);
         }
         if self.narrate && !sticky::live_has_style_note(&self.messages) {
@@ -1427,16 +1540,55 @@ impl<C: Completer> Agent<C> {
 
     async fn complete_or_abort(&self, tools: Option<&[Value]>) -> Result<Option<ModelTurn>> {
         let prev = self.widen_no_tool_think();
-        self.arm_sink();
-        let result = tokio::select! {
-            biased;
-            _ = self.cancel.cancelled() => Ok(None),
-            turn = self.completer.complete(&self.messages, tools) => Ok(Some(turn?)),
-        };
+        let result = self.complete_resilient(tools).await;
         if let Some(p) = prev {
             self.completer.set_policy(p);
         }
         result
+    }
+
+    /// One model hop. Transient endpoint drops retry with backoff so a flaky
+    /// path continues the same turn (tools already run stay) instead of erroring.
+    async fn complete_resilient(&self, tools: Option<&[Value]>) -> Result<Option<ModelTurn>> {
+        let started = std::time::Instant::now();
+        let mut attempt = 0u32;
+        loop {
+            if self.cancel.is_cancelled() {
+                return Ok(None);
+            }
+            self.arm_sink();
+            let result = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Ok(None),
+                turn = self.completer.complete(&self.messages, tools) => turn,
+            };
+            match result {
+                Ok(turn) => return Ok(Some(turn)),
+                Err(e) if crate::llm_http::is_transient(&e) => {
+                    attempt += 1;
+                    if started.elapsed() >= crate::llm_http::RETRY_BUDGET {
+                        return Err(e);
+                    }
+                    let wait = crate::llm_http::retry_delay(attempt);
+                    self.signal_net_retry(attempt, wait, &e);
+                    tokio::select! {
+                        biased;
+                        _ = self.cancel.cancelled() => return Ok(None),
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn signal_net_retry(&self, attempt: u32, wait: Duration, err: &crate::error::Error) {
+        let line = crate::llm_http::retry_status_line(attempt, wait);
+        self.note(&format!("[net] {line}{err}"));
+        if let Some(sink) = self.live_sink() {
+            sink.reset();
+            sink.reasoning(&line);
+        }
     }
 
     /// A turn that forbids tools spends its whole budget on one answer, so the
@@ -1802,22 +1954,52 @@ impl<C: Completer> Agent<C> {
 
     /// Archive previous turns at the start of a follow-up user message so a
     /// finished long turn is not replayed as a cold prefill.
+    ///
+    /// Do not Jinja+HF-tokenize the fat transcript first. Local llama.cpp
+    /// metering is expensive and sat in front of the first hop with no
+    /// thinking tokens.
     fn compact_at_user_turn(&mut self) {
         if self.working_window == 0 {
             return;
         }
-        let Some(n) = self.prefix_tokens() else {
+        if !self.can_apply_compact() {
             return;
-        };
-        if !should_compact_at_user_turn(
-            n,
+        }
+        if !should_compact_follow_up(
+            self.prefix_tokens_gate(),
             self.generation_reserve,
             self.working_window,
             self.compact_ratio,
+            live_tool_count(&self.messages),
+            live_image_count(&self.messages),
+            self.completer
+                .prefix_meter()
+                .map(|(f, _)| f.follow_up_compact_tools())
+                .unwrap_or(TURN_START_COMPACT_TOOLS),
         ) {
             return;
         }
+        self.signal_preparing();
         let _ = self.apply_compact_pass();
+    }
+
+    fn signal_preparing(&self) {
+        self.note("[compact] preparing follow-up context");
+        if let Some(sink) = self.live_sink() {
+            sink.reasoning("正在整理上下文…\n");
+        }
+    }
+
+    fn can_apply_compact(&self) -> bool {
+        if let Some(log) = &self.log {
+            plan_compact(log.events()).is_some()
+        } else {
+            compact_messages(&self.messages).is_some()
+        }
+    }
+
+    fn prefix_tokens_gate(&self) -> u32 {
+        estimate_prefix_tokens(&self.messages, &self.tools, true)
     }
 
     fn apply_compact_pass(&mut self) -> bool {
@@ -2543,6 +2725,7 @@ fn has_call_ident(user: &str) -> bool {
 
 /// Narrower than `wants_auto_locate`: locating is free, running the suite is
 /// not. "这个函数在哪调用" must not cost a test run.
+#[cfg(test)]
 fn wants_test_baseline(user: &str) -> bool {
     if ["修", "改", "实现", "补", "重构", "优化", "加上"]
         .iter()
@@ -2556,39 +2739,9 @@ fn wants_test_baseline(user: &str) -> bool {
         .any(|p| l.contains(p))
 }
 
-fn oracle_unittest_cmd(root: &Path) -> Option<String> {
-    let python = python_launcher();
-    if root.join("tests").is_dir() {
-        return Some(format!("{python} -B -m unittest discover -s tests -v"));
-    }
-    let has_root = std::fs::read_dir(root).ok()?.any(|e| {
-        let Ok(e) = e else { return false };
-        let n = e.file_name();
-        let s = n.to_string_lossy();
-        s.starts_with("test_") && s.ends_with(".py")
-    });
-    has_root.then(|| format!("{python} -B -m unittest discover -s . -p \"test*.py\" -v"))
-}
-
+#[cfg(test)]
 fn python_launcher() -> &'static str {
-    #[cfg(windows)]
-    {
-        if std::process::Command::new("py")
-            .args(["-3", "--version"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-        {
-            "py -3"
-        } else {
-            "python"
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        "python3"
-    }
+    verify::python_launcher()
 }
 
 enum AgentsMd {
@@ -3442,6 +3595,23 @@ mod tests {
         assert!(!wants_test_baseline("where is page_bounds defined"));
     }
 
+    #[test]
+    fn unattended_im_uses_hermes_caps() {
+        let dir = std::env::temp_dir().join(format!("q38-im-{}", uuid::Uuid::new_v4().simple()));
+        let mut o = opts(&dir);
+        o.channel = "wechat".into();
+        apply_unattended_policy(&mut o, &Config::default());
+        assert_eq!(o.max_steps, 500);
+        assert!(o.max_wall.is_zero());
+        o.channel = "web".into();
+        o.max_steps = 80;
+        o.max_wall = std::time::Duration::from_secs(1800);
+        apply_unattended_policy(&mut o, &Config::default());
+        assert_eq!(o.max_steps, 80);
+        assert_eq!(o.max_wall, std::time::Duration::from_secs(1800));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn search_returns_function_span() {
         let dir =
@@ -3616,7 +3786,10 @@ mod tests {
         assert!(parallel_safe_batch(&[read.clone(), call("q", "ask")]));
         assert!(!parallel_safe_batch(&[read.clone()]));
         assert!(!parallel_safe_batch(&[read.clone(), call("m", "mcp")]));
-        assert!(!parallel_safe_batch(&[call("q", "ask"), call("w", "write")]));
+        assert!(!parallel_safe_batch(&[
+            call("q", "ask"),
+            call("w", "write")
+        ]));
         assert!(!parallel_safe_batch(&[view, call("s", "skill")]));
         assert!(!parallel_safe_batch(&[
             call("a", "read"),
@@ -3683,6 +3856,30 @@ mod tests {
         assert!(!should_compact_at_user_turn(200_000, 0, 0, 0.70));
     }
 
+    #[test]
+    fn follow_up_compacts_tool_heavy_even_under_120k() {
+        assert!(!should_compact_at_user_turn(1_000, 0, 500_000, 0.70));
+        assert!(should_compact_follow_up(1_000, 0, 500_000, 0.70, 8, 0, 8));
+        assert!(!should_compact_follow_up(1_000, 0, 500_000, 0.70, 7, 0, 8));
+        assert!(should_compact_follow_up(1_000, 0, 500_000, 0.70, 6, 0, 6));
+        assert!(should_compact_follow_up(1_000, 0, 500_000, 0.70, 0, 5, 8));
+        assert!(!should_compact_follow_up(1_000, 0, 0, 0.70, 8, 5, 8));
+    }
+
+    #[test]
+    fn estimate_skips_data_uri_payload() {
+        let mut msg = ChatMessage::tool("1", "screenshot ok");
+        msg.parts = vec![crate::media::MediaPart::image_url(format!(
+            "data:image/png;base64,{}",
+            "A".repeat(2_000_000)
+        ))];
+        let n = estimate_prefix_tokens(std::slice::from_ref(&msg), &[], false);
+        assert!(
+            n < 2_000,
+            "data URI must not dominate the compact gate: {n}"
+        );
+    }
+
     #[tokio::test]
     async fn prefix_hard_window_still_budgets() {
         let dir = std::env::temp_dir().join(format!("q38-agent-{}", uuid::Uuid::new_v4().simple()));
@@ -3699,6 +3896,62 @@ mod tests {
         assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
         assert_eq!(out.text, "should not run");
         assert!(out.steps >= 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn follow_up_archives_tool_heavy_turn_without_tokenizer() {
+        let dir = std::env::temp_dir().join(format!("q38-fu-{}", uuid::Uuid::new_v4().simple()));
+        let sess = dir.join("sessions");
+        std::fs::create_dir_all(&sess).unwrap();
+        for i in 0..8 {
+            std::fs::write(dir.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let mut o = opts(&dir);
+        o.persist_session = true;
+        o.session_id = "fu1".into();
+        o.session_dir = Some(sess.clone());
+        o.max_steps = 20;
+        let mut turns = VecDeque::new();
+        for i in 0..8 {
+            turns.push_back(turn_tool_id(
+                &format!("c{i}"),
+                "read",
+                json!({"path": format!("f{i}.txt")}),
+            ));
+        }
+        turns.push_back(turn_text("first done"));
+        turns.push_back(turn_text("second done"));
+        let scripted = Scripted {
+            turns: Mutex::new(turns),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let first = agent.run("read the eight files").await.unwrap();
+        assert_eq!(first.text, "first done", "{:?}", first.stop_reason);
+        let live_tools = agent.messages.iter().filter(|m| m.role == "tool").count();
+        assert!(
+            live_tools >= 8,
+            "first turn should still hold its tools: {live_tools}"
+        );
+        let second = agent.run("what did you find").await.unwrap();
+        assert_eq!(second.text, "second done", "{:?}", second.stop_reason);
+        let live_tools = agent.messages.iter().filter(|m| m.role == "tool").count();
+        assert_eq!(
+            live_tools, 0,
+            "follow-up must archive the previous tool turn, not replay it: {live_tools}"
+        );
+        let log = SessionLog::open_in(&sess, "fu1").unwrap();
+        assert!(
+            log.events()
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Compact(_))),
+            "tool-heavy follow-up should compact without a prefix meter: {:?}",
+            log.events()
+                .iter()
+                .map(|e| e.type_name())
+                .collect::<Vec<_>>()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5153,10 +5406,7 @@ is byte-stable and tools stay frozen. Wiring of skills and mcp is a hidden-card 
         o.peripheral = false;
         o.low_precision = true;
         let scripted = Scripted {
-            turns: Mutex::new(VecDeque::from([
-                turn_text("x\nx\nx\nx\n"),
-                turn_text("ok"),
-            ])),
+            turns: Mutex::new(VecDeque::from([turn_text("x\nx\nx\nx\n"), turn_text("ok")])),
             meter: false,
         };
         let mut agent = Agent::new(scripted, o).unwrap();

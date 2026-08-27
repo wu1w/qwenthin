@@ -77,11 +77,36 @@ pub mod qwen38 {
         "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27";
 }
 
+/// Flash-Next GGUF/Unsloth Jinja. Tokenizer bytes stay the 27B 248320 vocab.
+pub mod q38next {
+    pub const CHAT_TEMPLATE: &str =
+        "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce";
+    pub const TOKENIZER_CONFIG: &str =
+        "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27";
+}
+
 pub fn verify_qwen38() -> Result<()> {
     let dir = family_dir(Family::Qwen38);
     verify_file(&dir.join("chat_template.jinja"), qwen38::CHAT_TEMPLATE)?;
     verify_file(&dir.join("tokenizer.json"), qwen38::TOKENIZER_JSON)?;
     verify_file(&dir.join("tokenizer_config.json"), qwen38::TOKENIZER_CONFIG)?;
+    Ok(())
+}
+
+pub fn verify_q38next() -> Result<()> {
+    let dir = family_dir(Family::Qwen38Next);
+    verify_file(&dir.join("chat_template.jinja"), q38next::CHAT_TEMPLATE)?;
+    verify_file(
+        &dir.join("tokenizer_config.json"),
+        q38next::TOKENIZER_CONFIG,
+    )?;
+    Ok(())
+}
+
+/// Tokenizer (27B) plus Flash-Next Jinja. Packaged `vendor/` ships both.
+pub fn verify_vendors() -> Result<()> {
+    verify_qwen38()?;
+    verify_q38next()?;
     Ok(())
 }
 
@@ -91,7 +116,7 @@ mod tests {
 
     #[test]
     fn qwen38_vendor_hashes() {
-        verify_qwen38().expect("qwen38 vendor set");
+        verify_vendors().expect("qwen38 + q38next vendor set");
     }
 
     #[test]

@@ -133,7 +133,7 @@ async fn state_get(State(st): State<AppState>) -> Json<Value> {
 
 async fn history_get(State(st): State<AppState>) -> Json<Value> {
     let g = st.inner.lock().await;
-    Json(json!({"ok": true, "events": g.session.events()}))
+    Json(json!({"ok": true, "events": crate::hub::console_events(g.session.events())}))
 }
 
 async fn usage_get(State(st): State<AppState>) -> Json<Value> {
@@ -225,7 +225,7 @@ async fn client_ws(mut socket: WebSocket, st: AppState) {
             "method": "hello",
             "params": {
                 "state": g.session.state_json(),
-                "events": g.session.events(),
+                "events": crate::hub::console_events(g.session.events()),
                 "permit": g.pending.front().map(|p| p.json()),
                 "clarify": g.pending_clarify.front().map(|p| p.json()),
             }
@@ -255,9 +255,9 @@ async fn client_ws(mut socket: WebSocket, st: AppState) {
                                 "method": "hello",
                                 "params": {
                                     "state": g.session.state_json(),
-                                    "events": g.session.events(),
+                                    "events": crate::hub::console_events(g.session.events()),
                                     "permit": g.pending.front().map(|p| p.json()),
-                "clarify": g.pending_clarify.front().map(|p| p.json()),
+                                    "clarify": g.pending_clarify.front().map(|p| p.json()),
                                 }
                             })
                         };

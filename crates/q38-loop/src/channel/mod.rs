@@ -12,6 +12,7 @@ mod inbound;
 mod mailbox;
 mod manager;
 mod outbound;
+mod poll_lock;
 mod qq;
 pub mod qrcode;
 mod router;
@@ -23,7 +24,7 @@ mod wecom;
 
 pub use catalog::{catalog_json, endpoint_kind, CATALOG};
 pub use envelope::{ChannelAddress, ContentPart, NativePayload};
-pub use inbound::{serve_endpoint, serve_qq};
+pub use inbound::{keep_client_watched, serve_endpoint, serve_qq, ClientWatch};
 pub use mailbox::{push_steer, take_steer, BusyDecision, BusyPolicy, Mailbox, SteerSlot};
 pub use manager::{ChannelHandler, ChannelManager, IngestResult};
 pub use outbound::{deliver, outbound_notification, parts_to_text, reply_text};

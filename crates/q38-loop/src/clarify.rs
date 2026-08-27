@@ -43,12 +43,15 @@ pub enum ClarifyDecision {
 
 pub struct ClarifyRequest {
     pub ask: ClarifyAsk,
+    /// Sidecar / console session id. Empty when the hub was not tagged.
+    pub session: String,
     pub reply: oneshot::Sender<ClarifyDecision>,
 }
 
 #[derive(Clone)]
 pub struct ClarifyHub {
     tx: mpsc::UnboundedSender<ClarifyRequest>,
+    session: String,
 }
 
 impl fmt::Debug for ClarifyHub {
@@ -60,12 +63,32 @@ impl fmt::Debug for ClarifyHub {
 impl ClarifyHub {
     pub fn pair() -> (Self, mpsc::UnboundedReceiver<ClarifyRequest>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (Self { tx }, rx)
+        (
+            Self {
+                tx,
+                session: String::new(),
+            },
+            rx,
+        )
+    }
+
+    pub fn with_session(&self, id: impl Into<String>) -> Self {
+        let mut c = self.clone();
+        c.session = id.into();
+        c
     }
 
     pub async fn ask(&self, ask: ClarifyAsk, cancel: &CancelFlag) -> ClarifyDecision {
         let (reply, rx) = oneshot::channel();
-        if self.tx.send(ClarifyRequest { ask, reply }).is_err() {
+        if self
+            .tx
+            .send(ClarifyRequest {
+                ask,
+                session: self.session.clone(),
+                reply,
+            })
+            .is_err()
+        {
             return ClarifyDecision::Skip;
         }
         tokio::select! {

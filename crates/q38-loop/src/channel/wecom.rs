@@ -386,17 +386,19 @@ fn extract_text(body: &Value) -> String {
                 if !item.is_object() {
                     continue;
                 }
-                if item
+                let item_type = item
                     .get("msgtype")
                     .and_then(Value::as_str)
                     .unwrap_or("")
-                    .eq_ignore_ascii_case("text")
-                {
+                    .to_ascii_lowercase();
+                if item_type == "text" {
                     let c = js_str(&item["text"]["content"]);
                     let c = c.trim();
                     if !c.is_empty() {
                         parts.push(c.to_string());
                     }
+                } else if item_type == "image" {
+                    parts.push("[图片]".into());
                 }
             }
         }
@@ -412,6 +414,26 @@ fn extract_text(body: &Value) -> String {
         let c = c.trim();
         if !c.is_empty() {
             parts.push(c.to_string());
+        } else {
+            parts.push("[语音]".into());
+        }
+    }
+    if msgtype == "image" {
+        parts.push("[图片]".into());
+    }
+    if msgtype == "file" || msgtype == "video" {
+        let name = js_str(&body[msgtype.as_str()]["filename"]);
+        let name = if name.is_empty() {
+            js_str(&body[msgtype.as_str()]["file_name"])
+        } else {
+            name
+        };
+        if msgtype == "video" {
+            parts.push("[视频]".into());
+        } else if name.is_empty() {
+            parts.push("[文件]".into());
+        } else {
+            parts.push(format!("[文件] {name}"));
         }
     }
     parts.join("\n")
@@ -529,9 +551,11 @@ mod tests {
                 {"msgtype": "text", "text": {"content": "two"}}
             ]}
         });
-        assert_eq!(extract_text(&mixed), "one\ntwo");
+        assert_eq!(extract_text(&mixed), "one\n[图片]\ntwo");
         let voice = json!({"msgtype":"voice","voice":{"content":"said this"}});
         assert_eq!(extract_text(&voice), "said this");
+        let img = json!({"msgtype":"image"});
+        assert_eq!(extract_text(&img), "[图片]");
         let empty = json!({"msgtype":"text","text":{"content":"  "}});
         assert!(extract_text(&empty).is_empty());
     }

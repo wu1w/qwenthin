@@ -957,8 +957,7 @@ mod tests {
             assert!(
                 !halted,
                 "repeat detector must not halt: hidden={hidden:?} reason={:?} text={}",
-                out.stop_reason,
-                out.text
+                out.stop_reason, out.text
             );
         } else {
             eprintln!("  (27B did not loop; doom path not exercised live. unit covers the note.)");

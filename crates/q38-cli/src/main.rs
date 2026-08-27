@@ -157,7 +157,7 @@ async fn real_main() -> Result<ExitCode> {
             profile,
             family,
         }) => {
-            vendor::verify_qwen38().context("qwen38 vendor set")?;
+            vendor::verify_vendors().context("qwen family vendor set")?;
             let (mut cfg, cfg_path) = Config::load_or_init().context("load config")?;
             let overridden =
                 base_url.is_some() || model.is_some() || profile.is_some() || family.is_some();
@@ -249,7 +249,7 @@ async fn real_main() -> Result<ExitCode> {
                 prompt = stdin;
             }
 
-            vendor::verify_qwen38().ok();
+            vendor::verify_vendors().ok();
             let (cfg, _) = Config::load_or_init().context("load config")?;
             let workspace = cli
                 .workspace
@@ -494,6 +494,8 @@ fn intercept_slash(
         low_precision: cfg.policy.low_precision,
         workspace_confined: cfg.features.workspace_write_only,
         approvals: ApprovalMode::parse(&cfg.features.approvals).unwrap_or(ApprovalMode::Ask),
+        sessions_dir: None,
+        home: None,
     });
     let open = rpc(
         1,

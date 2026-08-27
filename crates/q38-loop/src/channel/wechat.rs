@@ -214,10 +214,15 @@ fn native_from_msg(ep: &ChannelEndpoint, msg: &Value) -> Option<NativePayload> {
     if from.is_empty() {
         return None;
     }
-    let text = text_from_items(&msg["item_list"]);
-    if text.is_empty() {
+    let content_parts = parts_from_items(&msg["item_list"]);
+    if content_parts.is_empty() {
         return None;
     }
+    let text = NativePayload {
+        content_parts: content_parts.clone(),
+        ..NativePayload::default()
+    }
+    .query_text();
     let group_id = js_str(&msg["group_id"]);
     let is_group = !group_id.is_empty();
     let chat_id = if is_group { group_id } else { from.clone() };
@@ -228,7 +233,7 @@ fn native_from_msg(ep: &ChannelEndpoint, msg: &Value) -> Option<NativePayload> {
             ep.kind.clone()
         },
         sender_id: from,
-        content_parts: vec![ContentPart::text(&text)],
+        content_parts,
         text,
         ..NativePayload::default()
     };
@@ -241,22 +246,85 @@ fn native_from_msg(ep: &ChannelEndpoint, msg: &Value) -> Option<NativePayload> {
     Some(env)
 }
 
+#[cfg(test)]
 fn text_from_items(item_list: &Value) -> String {
+    parts_from_items(item_list)
+        .iter()
+        .filter_map(ContentPart::as_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// iLink item types: 1 TEXT, 2 IMAGE, 3 VOICE, 4 FILE, 5 VIDEO.
+/// Encrypted CDN blobs have no public URL; those become a caption so the turn
+/// is not dropped. Voice often carries an ASR `text` field.
+fn parts_from_items(item_list: &Value) -> Vec<ContentPart> {
     let Some(arr) = item_list.as_array() else {
-        return String::new();
+        return Vec::new();
     };
     let mut parts = Vec::new();
     for item in arr {
-        if json_i64(&item["type"]) != 1 {
-            continue;
-        }
-        let t = js_str(&item["text_item"]["text"]);
-        let t = t.trim();
-        if !t.is_empty() {
-            parts.push(t.to_string());
+        match json_i64(&item["type"]) {
+            1 => {
+                let t = js_str(&item["text_item"]["text"]);
+                let t = t.trim();
+                if !t.is_empty() {
+                    parts.push(ContentPart::text(t));
+                }
+            }
+            2 => {
+                if let Some(url) = first_http_url(&[
+                    js_str(&item["image_item"]["url"]),
+                    js_str(&item["image_item"]["image_url"]),
+                    js_str(&item["image_item"]["media"]["url"]),
+                ]) {
+                    parts.push(ContentPart::Image {
+                        image_url: url,
+                        url: String::new(),
+                        mime: "image/jpeg".into(),
+                    });
+                } else {
+                    parts.push(ContentPart::text("[图片]"));
+                }
+            }
+            3 => {
+                let t = js_str(&item["voice_item"]["text"]);
+                let t = t.trim();
+                if !t.is_empty() {
+                    parts.push(ContentPart::text(t));
+                } else {
+                    parts.push(ContentPart::text("[语音]"));
+                }
+            }
+            4 => {
+                let name = js_str(&item["file_item"]["file_name"]);
+                let name = if name.is_empty() {
+                    js_str(&item["file_item"]["media"]["file_name"])
+                } else {
+                    name
+                };
+                if name.is_empty() {
+                    parts.push(ContentPart::text("[文件]"));
+                } else {
+                    parts.push(ContentPart::text(format!("[文件] {name}")));
+                }
+            }
+            5 => parts.push(ContentPart::text("[视频]")),
+            _ => {}
         }
     }
-    parts.join("\n")
+    parts
+}
+
+fn first_http_url(cands: &[String]) -> Option<String> {
+    cands.iter().find_map(|s| {
+        let t = s.trim();
+        if t.starts_with("http://") || t.starts_with("https://") || t.starts_with("data:") {
+            Some(t.to_string())
+        } else {
+            None
+        }
+    })
 }
 
 fn js_str(v: &Value) -> String {
@@ -407,8 +475,47 @@ mod tests {
             {"type": 1, "text_item": {"text": ""}},
             {"type": "1", "text_item": {"text": "there"}},
         ]);
-        assert_eq!(text_from_items(&items), "hi\nthere");
+        assert_eq!(text_from_items(&items), "hi\n[图片]\nthere");
         assert!(text_from_items(&json!([])).is_empty());
+    }
+
+    #[test]
+    fn native_ingests_image_voice_file() {
+        let ep = ChannelEndpoint::default();
+        let img = json!({
+            "message_type": 1,
+            "from_user_id": "u",
+            "item_list": [{"type": 2, "image_item": {}}],
+        });
+        let env = native_from_msg(&ep, &img).expect("image-only");
+        assert_eq!(env.text, "[图片]");
+        let with_url = json!({
+            "message_type": 1,
+            "from_user_id": "u",
+            "item_list": [{
+                "type": 2,
+                "image_item": {"url": "https://cdn.example/p.jpg"}
+            }],
+        });
+        let env = native_from_msg(&ep, &with_url).expect("image url");
+        assert!(env
+            .media_parts()
+            .iter()
+            .any(|m| m.url.contains("cdn.example")));
+        let voice = json!({
+            "message_type": 1,
+            "from_user_id": "u",
+            "item_list": [{"type": 3, "voice_item": {"text": "打开灯"}}],
+        });
+        let env = native_from_msg(&ep, &voice).expect("voice asr");
+        assert_eq!(env.text, "打开灯");
+        let file = json!({
+            "message_type": 1,
+            "from_user_id": "u",
+            "item_list": [{"type": 4, "file_item": {"file_name": "a.pdf"}}],
+        });
+        let env = native_from_msg(&ep, &file).expect("file");
+        assert_eq!(env.text, "[文件] a.pdf");
     }
 
     #[test]

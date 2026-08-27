@@ -2,6 +2,7 @@
 
 use crate::error::{Error, Result};
 
+use super::inbound::keep_client_watched;
 use super::manager::{ChannelHandler, ChannelManager};
 use super::router::SessionRouter;
 use super::ChannelsConfig;
@@ -29,52 +30,88 @@ where
         let mgr = mgr.clone();
         match kind.as_str() {
             "telegram" => {
+                let id = ep.id.clone();
                 joins.push(tokio::spawn(async move {
-                    if let Err(e) = super::telegram::run_long_poll(ep, mgr).await {
-                        eprintln!("q38 telegram: {e}");
-                    }
+                    keep_client_watched(
+                        "telegram",
+                        &id,
+                        || super::telegram::run_long_poll(ep.clone(), mgr.clone()),
+                        |_| async {},
+                    )
+                    .await;
                 }));
             }
             "webhook" | "http" | "console" => {
+                let id = ep.id.clone();
+                let label = kind.clone();
                 joins.push(tokio::spawn(async move {
-                    if let Err(e) = super::webhook::serve(ep, mgr).await {
-                        eprintln!("q38 webhook: {e}");
-                    }
+                    keep_client_watched(
+                        &label,
+                        &id,
+                        || super::webhook::serve(ep.clone(), mgr.clone()),
+                        |_| async {},
+                    )
+                    .await;
                 }));
             }
             "qq" => {
+                let id = ep.id.clone();
                 joins.push(tokio::spawn(async move {
-                    if let Err(e) = super::qq::run_gateway(ep, mgr).await {
-                        eprintln!("q38 qq: {e}");
-                    }
+                    keep_client_watched(
+                        "qq",
+                        &id,
+                        || super::qq::run_gateway(ep.clone(), mgr.clone()),
+                        |_| async {},
+                    )
+                    .await;
                 }));
             }
             "wechat" => {
+                let id = ep.id.clone();
                 joins.push(tokio::spawn(async move {
-                    if let Err(e) = super::wechat::run_poll(ep, mgr).await {
-                        eprintln!("q38 wechat: {e}");
-                    }
+                    keep_client_watched(
+                        "wechat",
+                        &id,
+                        || super::wechat::run_poll(ep.clone(), mgr.clone()),
+                        |_| async {},
+                    )
+                    .await;
                 }));
             }
             "wecom" => {
+                let id = ep.id.clone();
                 joins.push(tokio::spawn(async move {
-                    if let Err(e) = super::wecom::run_gateway(ep, mgr).await {
-                        eprintln!("q38 wecom: {e}");
-                    }
+                    keep_client_watched(
+                        "wecom",
+                        &id,
+                        || super::wecom::run_gateway(ep.clone(), mgr.clone()),
+                        |_| async {},
+                    )
+                    .await;
                 }));
             }
             "dingtalk" => {
+                let id = ep.id.clone();
                 joins.push(tokio::spawn(async move {
-                    if let Err(e) = super::dingtalk::run_gateway(ep, mgr).await {
-                        eprintln!("q38 dingtalk: {e}");
-                    }
+                    keep_client_watched(
+                        "dingtalk",
+                        &id,
+                        || super::dingtalk::run_gateway(ep.clone(), mgr.clone()),
+                        |_| async {},
+                    )
+                    .await;
                 }));
             }
             "feishu" => {
+                let id = ep.id.clone();
                 joins.push(tokio::spawn(async move {
-                    if let Err(e) = super::feishu::run_ws(ep, mgr).await {
-                        eprintln!("q38 feishu: {e}");
-                    }
+                    keep_client_watched(
+                        "feishu",
+                        &id,
+                        || super::feishu::run_ws(ep.clone(), mgr.clone()),
+                        |_| async {},
+                    )
+                    .await;
                 }));
             }
             other => {

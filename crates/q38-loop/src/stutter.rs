@@ -47,6 +47,38 @@ pub fn is_restated_reply(prev: &str, next: &str) -> bool {
     trigram_jaccard(&a, &b) >= RESTATE_JACCARD
 }
 
+/// Markdown quote wall of earlier text (user paste or tool output).
+/// Three quoted lines at ≥50% of the hop is enough — five-line recaps were
+/// slipping through the old six-line / two-thirds gate.
+pub fn is_blockquote_heavy(s: &str) -> bool {
+    let lines: Vec<&str> = s
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if lines.len() < 3 {
+        return false;
+    }
+    let quoted = lines
+        .iter()
+        .filter(|l| l.trim_start().starts_with('>'))
+        .count();
+    quoted >= 3 && quoted * 2 >= lines.len()
+}
+
+/// One layer of markdown quote markers. Nested `>>` becomes `>`.
+pub fn strip_blockquote_prefix(s: &str) -> String {
+    s.lines()
+        .map(|line| {
+            let rest = line.trim_start();
+            rest.strip_prefix("> ")
+                .or_else(|| rest.strip_prefix('>'))
+                .unwrap_or(rest)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// `rm` / `unlink` plus inspect/`echo` (the 27B often `ls && cat && rm`).
 /// `rm && cargo test` is still work.
 pub fn is_cleanup_bash(command: &str) -> bool {
@@ -377,5 +409,24 @@ This is a different task from architecture review and names different files on p
         assert!(promote_dumped_reply("ok", &[body.as_str()]).is_none());
         let code = "fn main() { println!(\"hi\"); }\n".repeat(8);
         assert!(promote_dumped_reply(ESSAY, &[code.as_str()]).is_none());
+    }
+
+    #[test]
+    fn markdown_quote_wall_is_blockquote_heavy() {
+        let lines = [
+            "I studied the q38 agent loop in detail.",
+            "The core crate is q38-loop.",
+            "It runs a ReAct cycle with frozen tools.",
+            "Template rendering uses the official chat template.",
+        ];
+        let quoted = lines
+            .iter()
+            .map(|l| format!("> {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(is_blockquote_heavy(&quoted));
+        assert!(!is_blockquote_heavy(&lines.join("\n")));
+        assert_eq!(strip_blockquote_prefix(&quoted), lines.join("\n"));
+        assert!(!is_blockquote_heavy("> one\n> two\nplain"));
     }
 }

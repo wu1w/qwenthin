@@ -69,6 +69,7 @@ impl SidecarSession {
             self.mode,
             self.policy.clone(),
             &self.channel,
+            self.home.as_deref(),
         );
         let events = self.bind_store(start);
         self.opened = true;
@@ -83,7 +84,7 @@ impl SidecarSession {
 
     pub(crate) fn session_list(&self, params: Option<&Value>) -> Dispatch {
         let p: SessionSearchParams = parse_params(params).unwrap_or_default();
-        match catalog::list(match SessionLog::sessions_dir() {
+        match catalog::list(match self.persist_dir() {
             Ok(d) => d,
             Err(e) => return Dispatch::Error(RpcError::internal(e.to_string())),
         }) {
@@ -109,7 +110,7 @@ impl SidecarSession {
     }
 
     pub(crate) fn reply_sessions(&self, search: Option<&str>) -> Dispatch {
-        let dir = match SessionLog::sessions_dir() {
+        let dir = match self.persist_dir() {
             Ok(d) => d,
             Err(_) => return self.reply_text("**Sessions**\n\n(no persist dir)".into()),
         };
@@ -143,7 +144,7 @@ impl SidecarSession {
         if self.turn_in_flight {
             return Dispatch::Error(RpcError::internal("turn in progress"));
         }
-        let dir = match SessionLog::sessions_dir() {
+        let dir = match self.persist_dir() {
             Ok(d) => d,
             Err(e) => return Dispatch::Error(RpcError::internal(e.to_string())),
         };
@@ -160,6 +161,7 @@ impl SidecarSession {
             self.mode,
             self.policy.clone(),
             &self.channel,
+            self.home.as_deref(),
         );
         let events = self.bind_store(start);
         self.refresh_surface();
@@ -191,7 +193,7 @@ impl SidecarSession {
             .filter(|s| !s.is_empty())
         {
             if id != self.session_id {
-                let dir = match SessionLog::sessions_dir() {
+                let dir = match self.persist_dir() {
                     Ok(d) => d,
                     Err(e) => return Dispatch::Error(RpcError::internal(e.to_string())),
                 };
@@ -233,7 +235,7 @@ impl SidecarSession {
         if drop_open && self.turn_in_flight {
             return Dispatch::Error(RpcError::internal("turn in progress"));
         }
-        let dir = match SessionLog::sessions_dir() {
+        let dir = match self.persist_dir() {
             Ok(d) => d,
             Err(e) => return Dispatch::Error(RpcError::internal(e.to_string())),
         };
@@ -308,7 +310,7 @@ impl SidecarSession {
     pub(crate) fn set_title(&mut self, title: &str) -> Dispatch {
         self.title = title.trim().to_string();
         if self.persist {
-            if let Ok(dir) = SessionLog::sessions_dir() {
+            if let Ok(dir) = self.persist_dir() {
                 let _ = catalog::set_title(&dir, &self.session_id, &self.title);
             }
         }
@@ -326,7 +328,7 @@ impl SidecarSession {
         }
         self.title = title;
         if self.persist {
-            if let Ok(dir) = SessionLog::sessions_dir() {
+            if let Ok(dir) = self.persist_dir() {
                 let _ = catalog::set_title(&dir, &self.session_id, &self.title);
             }
         }
@@ -338,7 +340,7 @@ impl SidecarSession {
         }
         if save_memory {
             if let Some(plan) = crate::session::plan_compact(self.events()) {
-                if let Ok(home) = Config::home_dir() {
+                if let Some(home) = self.agent_home() {
                     if let Ok(mem) = MemoryStore::open(home) {
                         let _ = mem.write_compact_note(
                             &self.session_id,
@@ -358,11 +360,12 @@ impl SidecarSession {
             self.mode,
             self.policy.clone(),
             &self.channel,
+            self.home.as_deref(),
         );
         let events = self.bind_store(start);
         self.refresh_surface();
         if !self.title.is_empty() && self.persist {
-            if let Ok(dir) = SessionLog::sessions_dir() {
+            if let Ok(dir) = self.persist_dir() {
                 let _ = catalog::set_title(&dir, &self.session_id, &self.title);
             }
         }
@@ -386,7 +389,7 @@ impl SidecarSession {
             Some(h) => plan.with_hint(h),
             None => plan,
         };
-        if let Ok(home) = Config::home_dir() {
+        if let Some(home) = self.agent_home() {
             if let Ok(mem) = MemoryStore::open(home) {
                 let _ =
                     mem.write_compact_note(&self.session_id, plan.until_seq, &plan.archive_body());
@@ -456,7 +459,7 @@ impl SidecarSession {
     }
 
     pub(crate) fn skill_catalog(&self) -> SkillCatalog {
-        let home = Config::home_dir().ok();
+        let home = self.agent_home();
         SkillCatalog::load(
             home.as_deref().unwrap_or_else(|| std::path::Path::new("")),
             &self.workspace,
@@ -464,13 +467,13 @@ impl SidecarSession {
     }
 
     pub(crate) fn mcp_registry(&self) -> crate::mcp::McpRegistry {
-        let home = Config::home_dir().ok();
-        let base = Config::load_file_or_default().mcp;
+        let home = self.agent_home();
+        let base = crate::config::Config::default().mcp;
         crate::mcp::McpRegistry::load(home.as_deref(), &self.workspace, &base)
     }
 
     pub fn refresh_surface(&mut self) {
-        let home = Config::home_dir().ok();
+        let home = self.agent_home();
         let (_, tools) = match self.mode {
             SessionMode::Chat => (String::new(), Vec::new()),
             SessionMode::Code => (String::new(), code_tools()),
@@ -500,7 +503,7 @@ impl SidecarSession {
         if !self.persist {
             return;
         }
-        if let Ok(dir) = SessionLog::sessions_dir() {
+        if let Ok(dir) = self.persist_dir() {
             self.title = catalog::title_of(&dir, &self.session_id);
         }
     }
@@ -509,7 +512,7 @@ impl SidecarSession {
         if !self.persist || self.session_id.is_empty() {
             return;
         }
-        if let Ok(dir) = SessionLog::sessions_dir() {
+        if let Ok(dir) = self.persist_dir() {
             let _ = catalog::remember(&dir, &self.session_id);
         }
     }
@@ -613,34 +616,44 @@ impl SidecarSession {
             self.store = EventStore::Memory(vec![event.clone()]);
             return vec![event];
         }
-        match SessionLog::open(&self.session_id) {
-            Ok(log) => {
-                if let Some(p) = log.policy() {
-                    if !self.effort_locked {
-                        self.policy = p;
-                    }
-                }
-                if let Some(s) = log.start() {
-                    self.mode = s.mode;
-                    self.session_id = s.id.clone();
-                    if !s.workspace.is_empty() {
-                        self.workspace = PathBuf::from(&s.workspace);
-                    }
-                }
-                self.store = EventStore::Log(log);
-                Vec::new()
+        match self.persist_dir() {
+            Err(e) => {
+                eprintln!("q38: session JSONL unavailable ({e}); this session stays in memory");
+                let event = SessionEvent::Start(start);
+                self.store = EventStore::Memory(vec![event.clone()]);
+                return vec![event];
             }
-            Err(_) => match SessionLog::create(start.clone()) {
+            Ok(dir) => match SessionLog::open_in(&dir, &self.session_id) {
                 Ok(log) => {
+                    if let Some(p) = log.policy() {
+                        if !self.effort_locked {
+                            self.policy = p;
+                        }
+                    }
+                    if let Some(s) = log.start() {
+                        self.mode = s.mode;
+                        self.session_id = s.id.clone();
+                        if !s.workspace.is_empty() {
+                            self.workspace = PathBuf::from(&s.workspace);
+                        }
+                    }
                     self.store = EventStore::Log(log);
-                    vec![SessionEvent::Start(start)]
+                    Vec::new()
                 }
-                Err(e) => {
-                    eprintln!("q38: session JSONL unavailable ({e}); this session stays in memory");
-                    let event = SessionEvent::Start(start);
-                    self.store = EventStore::Memory(vec![event.clone()]);
-                    vec![event]
-                }
+                Err(_) => match SessionLog::create_in(&dir, start.clone()) {
+                    Ok(log) => {
+                        self.store = EventStore::Log(log);
+                        vec![SessionEvent::Start(start)]
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "q38: session JSONL unavailable ({e}); this session stays in memory"
+                        );
+                        let event = SessionEvent::Start(start);
+                        self.store = EventStore::Memory(vec![event.clone()]);
+                        vec![event]
+                    }
+                },
             },
         }
     }

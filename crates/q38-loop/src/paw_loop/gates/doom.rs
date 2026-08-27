@@ -246,7 +246,11 @@ mod tests {
                 hop(&gate, iter, &[a.clone()]),
                 GateDecision::Continue { .. }
             ));
-            assert_eq!(gate.continuation("s"), "", "no repeated note at hits={iter}");
+            assert_eq!(
+                gate.continuation("s"),
+                "",
+                "no repeated note at hits={iter}"
+            );
         }
     }
 
@@ -337,10 +341,7 @@ mod tests {
             hop(&gate, 7, &[a.clone()]),
             GateDecision::Continue { .. }
         ));
-        assert!(matches!(
-            hop(&gate, 8, &[a]),
-            GateDecision::Continue { .. }
-        ));
+        assert!(matches!(hop(&gate, 8, &[a]), GateDecision::Continue { .. }));
         assert_eq!(gate.continuation("s"), "");
     }
 }

@@ -64,6 +64,8 @@ pub struct SidecarSession {
     pub(crate) approvals: ApprovalMode,
     pub(crate) low_precision: bool,
     pub(crate) workspace_confined: bool,
+    pub(crate) sessions_dir: Option<PathBuf>,
+    pub(crate) home: Option<PathBuf>,
 }
 
 impl SidecarSession {
@@ -94,7 +96,23 @@ impl SidecarSession {
             approvals: opts.approvals,
             low_precision: opts.low_precision,
             workspace_confined: opts.workspace_confined,
+            sessions_dir: opts.sessions_dir,
+            home: opts.home,
         }
+    }
+
+    pub(crate) fn persist_dir(&self) -> crate::error::Result<PathBuf> {
+        if let Some(dir) = &self.sessions_dir {
+            std::fs::create_dir_all(dir)?;
+            return Ok(dir.clone());
+        }
+        SessionLog::sessions_dir()
+    }
+
+    pub(crate) fn agent_home(&self) -> Option<PathBuf> {
+        self.home
+            .clone()
+            .or_else(|| crate::config::Config::home_dir().ok())
     }
 
     pub fn set_model(&mut self, name: impl Into<String>) {
@@ -158,6 +176,40 @@ impl SidecarSession {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Idle copy of surface settings so the console can park this session
+    /// and open another without cancelling a live turn.
+    pub fn idle_twin(&self) -> Self {
+        let mut mailbox = crate::channel::Mailbox::default();
+        mailbox.busy = self.mailbox.busy;
+        Self {
+            opened: self.opened,
+            turn_in_flight: false,
+            session_id: String::new(),
+            workspace: self.workspace.clone(),
+            mode: self.mode,
+            policy: self.policy.clone(),
+            caps: self.caps.clone(),
+            persist: self.persist,
+            effort_locked: self.effort_locked,
+            store: EventStore::Memory(Vec::new()),
+            mailbox,
+            model: self.model.clone(),
+            family: self.family,
+            window: self.window,
+            channels: self.channels.clone(),
+            channel: self.channel.clone(),
+            title: String::new(),
+            tools: self.tools.clone(),
+            plan_mode: self.plan_mode,
+            clarify_mode: self.clarify_mode,
+            approvals: self.approvals,
+            low_precision: self.low_precision,
+            workspace_confined: self.workspace_confined,
+            sessions_dir: self.sessions_dir.clone(),
+            home: self.home.clone(),
+        }
     }
 
     pub fn window(&self) -> u32 {
@@ -246,6 +298,8 @@ impl SidecarSession {
             approvals: self.approvals,
             low_precision: self.low_precision,
             workspace_confined: self.workspace_confined,
+            sessions_dir: self.sessions_dir.clone(),
+            home: self.home.clone(),
         }
     }
 
@@ -316,6 +370,35 @@ mod tests {
     }
 
     #[test]
+    fn persist_dir_override_writes_jsonl_outside_q38_home() {
+        let root =
+            std::env::temp_dir().join(format!("q38-persist-{}", uuid::Uuid::new_v4().as_simple()));
+        let sessions = root.join("sessions");
+        let home = root.join("home");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let mut session = SidecarSession::new(SidecarOpts {
+            session_id: "s-custom".into(),
+            workspace: ws,
+            persist: true,
+            sessions_dir: Some(sessions.clone()),
+            home: Some(home),
+            ..Default::default()
+        });
+        let open = parse_request_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"session.open","params":{"session":"s-custom","workspace":"/tmp/ws","mode":"agent"}}"#,
+        )
+        .unwrap();
+        match session.handle(&open) {
+            Dispatch::Result { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(sessions.join("s-custom.jsonl").is_file());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn serialize_notification_has_no_id() {
         let line = encode_notification(&SessionEvent::user("hello"));
         let v: Value = serde_json::from_str(&line).unwrap();
@@ -341,6 +424,17 @@ mod tests {
         assert_eq!(v["params"]["text"], "ab");
         assert_eq!(v["params"]["delta"], true);
         assert!(v["params"].get("reset").is_none());
+    }
+
+    #[test]
+    fn idle_twin_is_not_in_flight() {
+        let mut session = SidecarSession::new(SidecarOpts::default());
+        session.begin_turn();
+        let twin = session.idle_twin();
+        assert!(!twin.turn_in_flight());
+        assert!(twin.session_id().is_empty());
+        assert_eq!(twin.workspace(), session.workspace());
+        assert!(session.turn_in_flight());
     }
 
     #[test]

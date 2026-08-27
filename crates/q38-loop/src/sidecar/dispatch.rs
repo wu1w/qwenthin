@@ -240,6 +240,7 @@ impl SidecarSession {
             mode,
             policy.clone(),
             &self.channel,
+            self.home.as_deref(),
         );
         let fork = SessionEvent::fork(&from_id);
 
@@ -353,6 +354,7 @@ impl SidecarSession {
                 self.mode,
                 self.policy.clone(),
                 &self.channel,
+                self.home.as_deref(),
             );
             let _ = self.bind_store(start);
             self.refresh_surface();

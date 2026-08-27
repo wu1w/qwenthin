@@ -3,8 +3,11 @@
 //! Soft trigger: `n + reserve > working_window * compact_ratio` (ratio clamped
 //! 0.10..=1.0) — try compact. Hard trigger: `n + reserve > working_window` —
 //! `budget:context` after compact cannot shrink enough. A new user turn also
-//! tries PreviousTurns compact when prefix is over soft **or** above 120k, so a
-//! finished 160k audit is not replayed cold on the follow-up.
+//! tries PreviousTurns compact when prefix is over soft **or** above 120k **or**
+//! the previous turn had ≥8 tool results (Flash-Next: 6 — 1-slot cold prefill
+//! is expensive), so a finished tool-heavy round is not replayed cold.
+//! The index keeps the first tools as well as the latest (same shape as
+//! Current State) and prints full blob SHAs so `recall(blob=)` can expand.
 //!
 //! Compaction rewrites the *shape* of the live prefix (one cache miss,
 //! `cache_invalidated=compact`) while normal turns preserve historical think.
@@ -24,6 +27,8 @@ use crate::session::event::{CompactEvent, OpenAiToolCall, SessionEvent, ToolEven
 use crate::template::{is_hidden_user_text, wrap_tool_response, ChatMessage};
 
 const INDEX_LINES: usize = 80;
+/// Keep the first tools as well as the latest — same shape as Current State.
+const INDEX_HEAD: usize = 20;
 const CLIP: usize = 120;
 const ARCHIVE_CHARS: usize = 4000;
 const STATE_CAP: usize = 10;
@@ -437,7 +442,7 @@ fn merge_index(prev: &str, new: &str) -> String {
         .filter(|l| !l.is_empty())
         .collect();
     if lines.len() > INDEX_LINES {
-        lines = lines.split_off(lines.len() - INDEX_LINES);
+        lines = head_tail(lines, INDEX_LINES, INDEX_HEAD);
     }
     lines.join("\n")
 }
@@ -621,7 +626,10 @@ fn extract(
     summary.push_str(&format_open_work(&already, keep_user <= until));
     summary.push('\n');
 
-    (summary, take_last(lines, INDEX_LINES).join("\n"))
+    (
+        summary,
+        head_tail(lines, INDEX_LINES, INDEX_HEAD).join("\n"),
+    )
 }
 
 fn collect_tool_states(events: &[SessionEvent], from: usize, until: usize) -> Vec<String> {
@@ -788,18 +796,24 @@ fn is_tool_announcement(think: &str, calls: Option<&[OpenAiToolCall]>) -> bool {
     })
 }
 
-fn short_blob(blob: &str) -> &str {
-    &blob[..blob.len().min(12)]
+fn media_bits(t: &ToolEvent) -> String {
+    if t.media.is_empty() {
+        return String::new();
+    }
+    let urls: Vec<&str> = t.media.iter().map(|m| m.url.as_str()).collect();
+    format!(" media={}", urls.join(","))
 }
 
 fn tool_state_line(label: &str, t: &ToolEvent) -> String {
     let snippet = clip(&t.output, 72);
+    let media = media_bits(t);
     match (&t.blob, t.original_chars) {
         (Some(blob), Some(n)) => {
-            format!("{label} → {snippet} blob={} chars={n}", short_blob(blob))
+            format!("{label} → {snippet} blob={blob} chars={n}{media}")
         }
-        (Some(blob), None) => format!("{label} → {snippet} blob={}", short_blob(blob)),
-        (None, Some(n)) if n > 200 => format!("{label} → {snippet} chars={n}"),
+        (Some(blob), None) => format!("{label} → {snippet} blob={blob}{media}"),
+        (None, Some(n)) if n > 200 => format!("{label} → {snippet} chars={n}{media}"),
+        _ if !media.is_empty() => format!("{label} → {snippet}{media}"),
         _ => format!("{label} → {snippet}"),
     }
 }
@@ -808,13 +822,14 @@ fn tool_line(label: &str, t: &ToolEvent) -> String {
     let mut s = format!("tool {label} ");
     if let Some(blob) = &t.blob {
         s.push_str("blob=");
-        s.push_str(short_blob(blob));
+        s.push_str(blob);
         s.push(' ');
     }
     if let Some(n) = t.original_chars {
         s.push_str(&format!("chars={n} "));
     }
     s.push_str(&clip(&t.output, 48));
+    s.push_str(&media_bits(t));
     s
 }
 
@@ -1448,7 +1463,9 @@ mod tests {
             plan.summary
         );
         assert!(
-            !constraints.to_ascii_lowercase().contains("continue working"),
+            !constraints
+                .to_ascii_lowercase()
+                .contains("continue working"),
             "hidden continue must not become Prior User: {}",
             plan.summary
         );
@@ -1830,5 +1847,67 @@ mod tests {
             "{}",
             last_user.content.as_deref().unwrap_or("")
         );
+    }
+
+    #[test]
+    fn index_keeps_full_blob_sha_and_media_paths() {
+        let sha = "b".repeat(64);
+        let events = vec![
+            start(),
+            SessionEvent::user("look at the screenshot"),
+            SessionEvent::assistant("", "", Some(vec![read_call("c1", "shot.png")])),
+            SessionEvent::tool_folded("c1", "read", "image ok", Some(sha.clone()), Some(4000))
+                .with_media(vec![crate::session::event::StoredMedia {
+                    kind: "image".into(),
+                    mime: "image/jpeg".into(),
+                    url: ".q38-agent/generated/shot.jpg".into(),
+                }]),
+            SessionEvent::user("click it"),
+        ];
+        let plan = plan_compact(&events).expect("compact");
+        assert!(
+            plan.index.contains(&sha),
+            "recall(blob=) needs the full sha:\n{}",
+            plan.index
+        );
+        assert!(
+            plan.index.contains(".q38-agent/generated/shot.jpg"),
+            "media path missing:\n{}",
+            plan.index
+        );
+        assert!(
+            plan.summary.contains(&sha) || plan.summary.contains("shot.jpg"),
+            "{}",
+            plan.summary
+        );
+    }
+
+    #[test]
+    fn index_keeps_head_and_tail_across_a_long_turn() {
+        let mut events = vec![start(), SessionEvent::user("old")];
+        for i in 0..90 {
+            let id = format!("c{i}");
+            let path = format!("early-{i}.rs");
+            events.push(SessionEvent::assistant(
+                "",
+                "",
+                Some(vec![read_call(&id, &path)]),
+            ));
+            events.push(SessionEvent::tool(&id, "read", format!("body {i}")));
+        }
+        events.push(SessionEvent::user("next"));
+        let plan = plan_compact(&events).expect("compact");
+        assert!(
+            plan.index.contains("early-0.rs"),
+            "head of index dropped:\n{}",
+            plan.index
+        );
+        assert!(
+            plan.index.contains("early-89.rs"),
+            "tail of index dropped:\n{}",
+            plan.index
+        );
+        let n = plan.index.lines().filter(|l| !l.trim().is_empty()).count();
+        assert!(n <= INDEX_LINES, "index grew to {n} lines:\n{}", plan.index);
     }
 }

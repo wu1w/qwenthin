@@ -250,7 +250,25 @@ fn chatbot_text(data: &Value) -> String {
         Value::Object(_) => js_str(&text["content"]),
         _ => String::new(),
     };
-    content.trim().to_string()
+    let content = content.trim().to_string();
+    if !content.is_empty() {
+        return content;
+    }
+    let msgtype = first_str(data, &["msgtype", "msgType"]).to_ascii_lowercase();
+    match msgtype.as_str() {
+        "picture" | "image" | "photo" => "[图片]".into(),
+        "video" => "[视频]".into(),
+        "audio" | "voice" => "[语音]".into(),
+        "file" => {
+            let n = first_str(data, &["fileName", "filename", "file_name"]);
+            if n.is_empty() {
+                "[文件]".into()
+            } else {
+                format!("[文件] {n}")
+            }
+        }
+        _ => String::new(),
+    }
 }
 
 fn session_webhook(data: &Value) -> String {
