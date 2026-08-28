@@ -1166,13 +1166,16 @@ impl<C: Completer> Agent<C> {
             .is_some_and(|(f, _)| f.silent_final_channel())
     }
 
-    /// Empty visible hop with leftover think, or a short reply cut off by
-    /// the shared think+answer token budget. Do not dump unfinished CoT.
+    /// Empty visible hop: leftover think, or a naked empty stop with nothing
+    /// already spoken. Do not dump unfinished CoT; do not deliver `""`.
     fn needs_channel_rescue(&self, turn: &ModelTurn) -> bool {
-        if !turn.tool_calls.is_empty() {
+        if !turn.tool_calls.is_empty() || !turn.content.trim().is_empty() {
             return false;
         }
-        turn.content.trim().is_empty() && !turn.reasoning.trim().is_empty()
+        if !turn.reasoning.trim().is_empty() {
+            return true;
+        }
+        self.visible_stop_text().is_empty()
     }
 
     /// Lift a finished answer that landed only in `reasoning_content`.
@@ -1218,7 +1221,7 @@ impl<C: Completer> Agent<C> {
     ) -> Result<AgentOutcome> {
         let text = if content.trim().is_empty() {
             let kept = self.visible_stop_text();
-            if kept.is_empty() && self.channel_nudged {
+            if kept.is_empty() {
                 EMPTY_STOP_FALLBACK.to_string()
             } else {
                 kept
@@ -2570,9 +2573,9 @@ const PHYSICS_WRAP_NOTE: &str = "[trajectory] 本轮已接近步数、时间或�
 const PARSE_REPAIR_NOTE: &str = "[trajectory] 上一跳工具调用未能解析。\
 改用完整原生 tool call，或直接给出可见结论。";
 
-/// Flash-Next (and cousins) sometimes stop with empty `content` while the
-/// answer or leftover plan is still in the think channel. One wrap-up hop.
-const EMPTY_CHANNEL_NOTE: &str = "[trajectory] 上一跳没有给用户可见回复，结论还在思考通道里。\
+/// Flash-Next (and cousins) sometimes stop with empty `content` — think still
+/// running, or both channels blank. One wrap-up hop; never deliver `""`.
+const EMPTY_CHANNEL_NOTE: &str = "[trajectory] 上一跳没有给用户可见回复。\
 把完整结论写到正常回复；思考通道用户看不见。若任务没做完，调用工具。不要再交空回复。";
 
 /// Interactive 27B narrates tool hops; Flash-Next often does not. One observation.
@@ -3240,6 +3243,26 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
         let out = agent.run("对照习惯").await.unwrap();
         assert_eq!(out.text, EMPTY_STOP_FALLBACK);
         assert_eq!(out.steps, 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn dual_empty_stop_wraps_then_fallback() {
+        let dir = std::env::temp_dir().join(format!("q38-bare-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([turn_text(""), turn_text("")])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+        let out = agent.run("hi").await.unwrap();
+        assert_eq!(out.text, EMPTY_STOP_FALLBACK);
+        assert_eq!(out.steps, 2);
+        assert!(agent.messages.iter().any(|m| m
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains(EMPTY_CHANNEL_NOTE)));
         let _ = std::fs::remove_dir_all(dir);
     }
 
