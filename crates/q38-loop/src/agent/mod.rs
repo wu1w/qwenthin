@@ -1673,6 +1673,12 @@ impl<C: Completer> Agent<C> {
                 return Ok(None);
             }
             self.arm_sink();
+            if attempt == 0 {
+                if let Some(sink) = self.live_sink() {
+                    sink.reset();
+                    sink.reasoning(crate::llm_http::CONNECT_HINT);
+                }
+            }
             let result = tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(None),
@@ -6047,7 +6053,7 @@ is byte-stable and tools stay frozen. Wiring of skills and mcp is a hidden-card 
             .expect("assistant");
         assert!(delta_at < assistant_at, "{kinds:?}");
         assert!(saw_reset);
-        assert_eq!(reasoning, "hmm");
+        assert_eq!(reasoning.replace(crate::llm_http::CONNECT_HINT, ""), "hmm");
         assert_eq!(content, "hello");
         let log = SessionLog::open_in(&sess, "delta1").unwrap();
         let persisted: Vec<_> = log.events().iter().map(|e| e.type_name()).collect();

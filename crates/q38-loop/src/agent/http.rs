@@ -1181,6 +1181,37 @@ mod tests {
     }
 
     #[test]
+    fn empty_plural_tool_calls_is_parse_fail() {
+        let v = json!({
+            "choices": [{
+                "message": {
+                    "content": "先确认上传文件是否存在。\n\n<tool_calls>\n</tool_calls>\n\n<tool_result>\n</tool_result>\n\n文件存在，读取内容。"
+                }
+            }]
+        });
+        let o = parse_turn(&v).unwrap();
+        assert!(o.parse_fail);
+        assert!(o.turn.tool_calls.is_empty());
+        assert_eq!(o.turn.content, "先确认上传文件是否存在。\n\n<tool_calls>\n</tool_calls>\n\n<tool_result>\n</tool_result>\n\n文件存在，读取内容。");
+    }
+
+    #[test]
+    fn plural_tool_calls_with_function_extracts() {
+        let v = json!({
+            "choices": [{
+                "message": {
+                    "content": "先读。\n<tool_calls>\n<function=read>\n<parameter=path>\na.pdf\n</parameter>\n</function>\n</tool_calls>"
+                }
+            }]
+        });
+        let o = parse_turn(&v).unwrap();
+        assert!(!o.parse_fail);
+        assert_eq!(o.turn.tool_calls.len(), 1);
+        assert_eq!(o.turn.tool_calls[0].name, "read");
+        assert_eq!(o.turn.content, "先读。");
+    }
+
+    #[test]
     fn unclosed_tool_call_in_think_is_not_executed() {
         let v = json!({
             "choices": [{

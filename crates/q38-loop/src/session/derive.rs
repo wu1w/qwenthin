@@ -91,15 +91,16 @@ fn assistant_message(a: &AssistantEvent) -> ChatMessage {
 }
 
 /// Live policy is the last `policy` event, else the `session/start` snapshot.
+/// Old JSONL with `preserve: false` is lifted onto the official keep-think path.
 pub fn live_policy(events: &[SessionEvent]) -> Option<ThinkPolicy> {
     if let Some(policy) = events.iter().rev().find_map(|e| match e {
         SessionEvent::Policy(p) => Some(p.policy.clone()),
         _ => None,
     }) {
-        return Some(policy);
+        return Some(policy.with_preserved_thinking());
     }
     match events.first() {
-        Some(SessionEvent::Start(s)) => Some(s.policy.clone()),
+        Some(SessionEvent::Start(s)) => Some(s.policy.clone().with_preserved_thinking()),
         _ => None,
     }
 }

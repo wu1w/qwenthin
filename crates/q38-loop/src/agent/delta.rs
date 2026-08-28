@@ -8,11 +8,17 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use super::xml_tools::first_tool_markup_start;
 use crate::session::{DeltaChannel, SessionEvent};
 use crate::sidecar::EventSink;
 
-const TAGS: [&str; 3] = ["<think>", "</think>", "<tool_call>"];
-const TOOL_OPEN: &str = "<tool_call>";
+const TAGS: [&str; 5] = [
+    "<think>",
+    "</think>",
+    "<tool_call>",
+    "<tool_result>",
+    "<tool_results>",
+];
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
@@ -233,7 +239,7 @@ fn split_think_live(content: &str) -> (String, String) {
 }
 
 fn before_tool(s: &str) -> &str {
-    match s.find(TOOL_OPEN) {
+    match first_tool_markup_start(s) {
         Some(i) => &s[..i],
         None => s,
     }
@@ -334,5 +340,19 @@ mod tests {
         ]);
         assert_eq!(texts(&events, DeltaChannel::Content), "I'll read\n");
         assert!(!texts(&events, DeltaChannel::Content).contains("function"));
+    }
+
+    #[test]
+    fn plural_tool_calls_markup_is_not_answer_text() {
+        let events = paint_events(&[(
+            "",
+            "先确认上传文件是否存在。\n\n<tool_calls>\n</tool_calls>\n\n<tool_result>\n</tool_result>",
+            false,
+        )]);
+        assert_eq!(
+            texts(&events, DeltaChannel::Content),
+            "先确认上传文件是否存在。\n\n"
+        );
+        assert!(!texts(&events, DeltaChannel::Content).contains("tool_"));
     }
 }

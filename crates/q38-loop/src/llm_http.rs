@@ -20,10 +20,14 @@ pub const RETRY_BUDGET: Duration = Duration::from_secs(600);
 
 const BACKOFF_CAP_S: u64 = 20;
 const TCP_KEEPALIVE_S: u64 = 30;
+#[cfg(not(windows))]
 const H2_KEEPALIVE_S: u64 = 15;
 
 /// Live/status copy. Console treats this think text as the reconnecting phase.
 pub const NET_RETRY_HINT: &str = "网络不稳，正在重连";
+/// Painted before Agent::new / the first HTTP hop so the UI isn't silent.
+pub const PREPARE_HINT: &str = "正在准备工作区…\n";
+pub const CONNECT_HINT: &str = "正在连接模型…\n";
 
 pub fn retry_status_line(attempt: u32, wait: Duration) -> String {
     format!(
@@ -67,16 +71,26 @@ pub fn probe_client(connect_s: u64, timeout_s: u64) -> Result<Client> {
 }
 
 pub fn build_client(connect_s: u64, timeout_s: u64) -> Result<Client> {
-    Client::builder()
+    let mut b = Client::builder()
         .connect_timeout(Duration::from_secs(connect_s.max(1)))
         .timeout(Duration::from_secs(timeout_s.max(5)))
         .tcp_nodelay(true)
-        .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_S))
-        .http2_keep_alive_interval(Duration::from_secs(H2_KEEPALIVE_S))
-        .http2_keep_alive_timeout(Duration::from_secs(H2_KEEPALIVE_S))
-        .http2_keep_alive_while_idle(true)
-        .build()
-        .map_err(|e| Error::Http(e.to_string()))
+        .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_S));
+    // rustls + HTTP/2 on Windows can sit on an established socket with no
+    // headers until read_timeout. HTTP/1.1 fails fast and the transient
+    // retry paints "正在重连" instead of a silent wait.
+    #[cfg(windows)]
+    {
+        b = b.http1_only();
+    }
+    #[cfg(not(windows))]
+    {
+        b = b
+            .http2_keep_alive_interval(Duration::from_secs(H2_KEEPALIVE_S))
+            .http2_keep_alive_timeout(Duration::from_secs(H2_KEEPALIVE_S))
+            .http2_keep_alive_while_idle(true);
+    }
+    b.build().map_err(|e| Error::Http(e.to_string()))
 }
 
 pub fn is_transient(err: &Error) -> bool {

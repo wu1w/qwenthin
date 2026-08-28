@@ -102,7 +102,14 @@ pub(crate) fn make_start(
         SessionMode::Code => (coding_prompt(&ws), code_tools()),
         SessionMode::Agent | SessionMode::Think => sidecar_agent_surface(&ws, workspace, home),
     };
-    let mut start = SessionStart::new(id, ws, mode, system, tools_hash(&tools), policy);
+    let mut start = SessionStart::new(
+        id,
+        ws,
+        mode,
+        system,
+        tools_hash(&tools),
+        policy.with_preserved_thinking(),
+    );
     if !channel.is_empty() {
         start.channel = channel.to_string();
     }

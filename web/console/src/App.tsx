@@ -1,6 +1,7 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { api, connectEvents, rpc, type Clarify, type Permit, type SessionEvent, type Snap } from "./api";
 import { ChatPage, ClarifyModal, PermitModal, RunChip, runPhase } from "./Chat";
+import { applyHistoryIncoming, nextLive, preferFresherHistory } from "./chat-live";
 import {
   ChannelsPage,
   CronPage,
@@ -188,6 +189,8 @@ export function App() {
   const [details, setDetails] = useState(initialDetails);
   const [wsUp, setWsUp] = useState(true);
   const [snap, setSnap] = useState<Snap>({});
+  const sessionRef = useRef(snap.session || "");
+  if (snap.session) sessionRef.current = snap.session;
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [live, setLive] = useState({ think: "", content: "" });
   const [permit, setPermit] = useState<Permit>(null);
@@ -204,13 +207,17 @@ export function App() {
   };
 
   const onReload = async () => {
+    const prevSess = sessionRef.current;
     const st = await api<Snap>("/state");
+    if (st.session) sessionRef.current = st.session;
     setSnap(st);
     setPermit(st.permit ?? null);
     setClarify(st.clarify ?? null);
     const h = await api<{ events: SessionEvent[] }>("/history");
-    setEvents(h.events || []);
-    setLive({ think: "", content: "" });
+    const incoming = h.events || [];
+    const switched = !!st.session && !!prevSess && st.session !== prevSess;
+    setEvents((cur) => applyHistoryIncoming(cur, incoming, switched));
+    setLive((l) => (switched ? { think: "", content: "" } : nextLive(incoming, l)));
   };
 
   const busy = !!snap.turn_in_flight;
@@ -247,15 +254,25 @@ export function App() {
             clarify?: Clarify;
           };
           setSnap(p.state || {});
+          if (p.state?.session) sessionRef.current = p.state.session;
           setEvents(p.events || []);
           setPermit(p.permit ?? null);
           setClarify(p.clarify ?? null);
           // 重连后的基线里没有断线前的旧增量，清掉避免流式文本重复。
           setLive({ think: "", content: "" });
         } else if (msg.method === "history.replace") {
-          const p = msg.params as { events?: SessionEvent[] };
-          setEvents(p.events || []);
-          setLive({ think: "", content: "" });
+          const p = msg.params as { events?: SessionEvent[]; session?: string; reset?: boolean };
+          if (p.reset) {
+            if (p.session) sessionRef.current = p.session;
+            setEvents(p.events || []);
+            setLive({ think: "", content: "" });
+            return;
+          }
+          if (p.session && sessionRef.current && p.session !== sessionRef.current) return;
+          if (p.events) {
+            setEvents((cur) => preferFresherHistory(cur, p.events || []));
+            setLive((l) => nextLive(p.events || [], l));
+          }
         } else if (msg.method === "event.append") {
           const e = msg.params as SessionEvent;
           if (e.type === "delta") {
@@ -266,8 +283,20 @@ export function App() {
             });
             return;
           }
-          // assistant 事件带来完整正文；stop 表示本轮已收束（含 abort），残留的流式缓冲都该清。
-          if (e.type === "assistant" || e.type === "stop") setLive({ think: "", content: "" });
+          if (e.type === "assistant") {
+            setEvents((xs) => {
+              for (let i = xs.length - 1; i >= 0; i--) {
+                if (xs[i].type !== "assistant") continue;
+                if ((xs[i].content || "") === (e.content || "") && (e.content || "").trim()) return xs;
+                break;
+              }
+              return [...xs, e];
+            });
+            if ((e.content || "").trim()) setLive({ think: "", content: "" });
+            return;
+          }
+          // stop 只收束转盘，不清 live：assistant / history.replace 还没带上正文时
+          // 清掉缓冲会让回复从页面上消失，要切页再回来才看得到。
           setEvents((xs) => [...xs, e]);
         } else if (msg.method === "permit.ask") {
           setPermit(msg.params as Permit);
@@ -278,7 +307,9 @@ export function App() {
         } else if (msg.method === "clarify.clear") {
           setClarify(null);
         } else if (msg.method === "state") {
-          setSnap(msg.params as Snap);
+          const st = msg.params as Snap;
+          if (st.session) sessionRef.current = st.session;
+          setSnap(st);
         }
       },
       (up) => setWsUp(up),

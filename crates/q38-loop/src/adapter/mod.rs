@@ -187,6 +187,32 @@ mod tests {
     }
 
     #[test]
+    fn chat_body_echoes_reasoning_on_tool_hops() {
+        let caps = EndpointCaps::qwen38_llamacpp();
+        let policy = ThinkPolicy::agent_default();
+        let msgs = vec![
+            ChatMessage::user("fix it"),
+            ChatMessage::assistant_reply(
+                None,
+                Some("The user wants a fix.".into()),
+                Some(vec![json!({
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": {"path": "a.rs"}}
+                })]),
+            ),
+        ];
+        let body = build_chat_body(&spec(&caps, &policy, &msgs, None));
+        let asst = &body["messages"][1];
+        assert_eq!(asst["reasoning_content"], "The user wants a fix.");
+        assert_eq!(asst["reasoning"], "The user wants a fix.");
+        assert_eq!(
+            body["chat_template_kwargs"]["preserve_thinking"],
+            json!(true)
+        );
+    }
+
+    #[test]
     fn llamacpp_pins_slot_and_cache_prompt() {
         let caps = EndpointCaps::qwen38_llamacpp();
         let policy = ThinkPolicy::agent_default();

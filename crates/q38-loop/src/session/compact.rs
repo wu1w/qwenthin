@@ -757,7 +757,8 @@ fn think_note(reasoning: &str, calls: Option<&[OpenAiToolCall]>) -> Option<Strin
 }
 
 fn is_task_restatement(s: &str) -> bool {
-    let t = s.trim().to_ascii_lowercase();
+    let raw = s.trim();
+    let t = raw.to_ascii_lowercase();
     t.starts_with("the user ")
         || t.starts_with("the task ")
         || t.starts_with("user wants")
@@ -765,6 +766,14 @@ fn is_task_restatement(s: &str) -> bool {
         || t.starts_with("ok, ")
         || t.starts_with("okay, ")
         || t.starts_with("ok the ")
+        || raw.starts_with("用户想")
+        || raw.starts_with("用户问")
+        || raw.starts_with("用户让")
+        || raw.starts_with("用户说")
+        || raw.starts_with("用户要")
+        || raw.starts_with("用户希望")
+        || raw.starts_with("用户提到")
+        || raw.starts_with("好的，用户")
 }
 
 /// "I'll read X" / "Now I need to run bash" with no extra plan is noise
@@ -1124,6 +1133,20 @@ mod tests {
             "{}",
             plan.summary
         );
+
+        let zh = vec![
+            start(),
+            SessionEvent::user("把登录页标题改了"),
+            SessionEvent::assistant(
+                "",
+                "用户想把登录页标题改成 ixiaotao。",
+                Some(vec![read_call("z", "auth.tsx")]),
+            ),
+            SessionEvent::tool("z", "read", "export function Auth"),
+            SessionEvent::user("继续"),
+        ];
+        let plan = plan_compact(&zh).expect("zh restatement");
+        assert!(!plan.summary.contains("用户想把登录页"), "{}", plan.summary);
     }
 
     #[test]

@@ -14,6 +14,7 @@ import {
   type Uploaded,
 } from "./api";
 import { turnArtifacts } from "./artifacts";
+import { stripLeakedToolMarkup, stripThinkRestatement } from "./chat-live";
 import { MdText } from "./md";
 import { Empty, Icon, Overlay, uiConfirm } from "./ui";
 
@@ -198,6 +199,12 @@ export function ChatPage({
       if (turns[i].user !== undefined) return turns[i].key;
     }
     return null;
+  }, [turns]);
+  const lastUserText = useMemo(() => {
+    for (let i = turns.length - 1; i >= 0; i--) {
+      if (turns[i].user) return turns[i].user || "";
+    }
+    return "";
   }, [turns]);
   const userTurnCount = useMemo(() => turns.filter((t) => t.user !== undefined).length, [turns]);
 
@@ -480,8 +487,9 @@ export function ChatPage({
   /** 把流式中的思考/正文合并进最后一轮：思考进轨迹块，正文在下方流式生长。 */
   const withLive = (blocks: Block[]): Block[] => {
     let out = blocks;
-    if (live.think) {
-      const step: Step = { kind: "think", text: live.think, live: !live.content };
+    const think = stripThinkRestatement(lastUserText, live.think);
+    if (think) {
+      const step: Step = { kind: "think", text: think, live: !live.content };
       const last = out[out.length - 1];
       if (last && last.kind === "activity") {
         out = [...out.slice(0, -1), { kind: "activity", steps: [...last.steps, step] }];
@@ -490,8 +498,16 @@ export function ChatPage({
       }
     }
     if (live.content) {
-      out = [...out, { kind: "text", text: live.content, live: true }];
-    } else if (busy && !live.think) {
+      const liveText = stripLeakedToolMarkup(live.content);
+      const last = out[out.length - 1];
+      if (liveText && last && last.kind === "text" && (last.text.includes(liveText) || liveText.startsWith(last.text))) {
+        if (liveText.length > last.text.length) {
+          out = [...out.slice(0, -1), { ...last, text: liveText, live: true }];
+        }
+      } else if (liveText) {
+        out = [...out, { kind: "text", text: liveText, live: true }];
+      }
+    } else if (busy && !think) {
       const last = out[out.length - 1];
       if (!last || last.kind !== "activity") out = [...out, { kind: "activity", steps: [] }];
     }
@@ -1185,10 +1201,14 @@ function buildTurns(events: SessionEvent[]): TurnGroup[] {
       }
       case "assistant": {
         noteDecode(e);
-        if (e.reasoning) activity().steps.push({ kind: "think", text: e.reasoning });
-        if (e.content) {
+        if (e.reasoning) {
+          const think = stripThinkRestatement(cur?.user || "", e.reasoning);
+          if (think) activity().steps.push({ kind: "think", text: think });
+        }
+        const spoken = stripLeakedToolMarkup(e.content || "");
+        if (spoken) {
           act = undefined;
-          turn().blocks.push({ kind: "text", text: e.content });
+          turn().blocks.push({ kind: "text", text: spoken });
         }
         (e.tool_calls || []).forEach((c, j) => {
           activity().steps.push({

@@ -91,6 +91,42 @@ mod tests {
     }
 
     #[test]
+    fn derive_keeps_reasoning_on_tool_hops() {
+        let dir = tmp_dir();
+        let mut log =
+            SessionLog::create_in(&dir, start("s-think", SessionMode::Agent, "sys")).unwrap();
+        log.append(SessionEvent::user("fix paging")).unwrap();
+        log.append(SessionEvent::assistant(
+            "先看 paging.rs",
+            "The user wants me to fix paging.",
+            Some(vec![OpenAiToolCall::function(
+                "c1",
+                "read",
+                r#"{"path":"paging.rs"}"#,
+            )]),
+        ))
+        .unwrap();
+        let msgs = derive_messages(log.events());
+        let asst = msgs.iter().find(|m| m.role == "assistant").unwrap();
+        assert_eq!(
+            asst.reasoning_content.as_deref(),
+            Some("The user wants me to fix paging.")
+        );
+        assert!(asst.tool_calls.as_ref().is_some_and(|c| !c.is_empty()));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn live_policy_lifts_stripped_preserve() {
+        let mut p = ThinkPolicy::native_with(&crate::policy::ThinkBudget::default());
+        p.preserve = false;
+        let start = SessionStart::new("id", "/tmp", SessionMode::Agent, "sys", "h", p);
+        let events = vec![SessionEvent::Start(start)];
+        let live = live_policy(&events).unwrap();
+        assert!(live.preserve);
+    }
+
+    #[test]
     fn derive_skips_undone_range() {
         let dir = tmp_dir();
         let mut log =

@@ -524,11 +524,14 @@ impl SidecarSession {
         }
     }
 
-    pub(crate) fn reload(&mut self) {
+    pub fn reload(&mut self) {
         if !self.persist || self.session_id.is_empty() {
             return;
         }
-        if let Ok(log) = SessionLog::open(&self.session_id) {
+        let Ok(dir) = self.persist_dir() else {
+            return;
+        };
+        if let Ok(log) = SessionLog::open_in(&dir, &self.session_id) {
             if let Some(p) = log.policy() {
                 if !self.effort_locked {
                     self.policy = p;

@@ -253,7 +253,7 @@ impl AppState {
         if g.session.session_id() != before {
             let _ = g.bus.send(notify(
                 "history.replace",
-                json!({"events": console_events(g.session.events())}),
+                history_replace_params(g.session.events(), g.session.session_id(), true),
             ));
         }
         out
@@ -489,6 +489,17 @@ fn spawn_channel_watch(inner: Arc<Mutex<Inner>>) {
 
 pub fn notify(method: &str, params: Value) -> Value {
     json!({"jsonrpc": "2.0", "method": method, "params": params})
+}
+
+/// Focused-session transcript. `reset: true` means the console must drop the
+/// on-screen events (session.new / resume), not keep a "fresher" transcript
+/// from the previous chat.
+fn history_replace_params(events: &[SessionEvent], session: &str, reset: bool) -> Value {
+    json!({
+        "events": console_events(events),
+        "session": session,
+        "reset": reset,
+    })
 }
 
 /// Session events for the console: drop inline `data:` URLs so hello / history
@@ -753,7 +764,7 @@ pub fn start_turn(
         // 的客户端才能补回本 turn 的前半段
         let _ = g.bus.send(notify(
             "history.replace",
-            json!({"events": console_events(g.session.events())}),
+            history_replace_params(g.session.events(), g.session.session_id(), false),
         ));
         let _ = g.bus.send(notify("state", g.session.state_json()));
         if let Some(next) = g.session.pop_follow_up() {
@@ -786,7 +797,10 @@ pub fn redact_key(key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{channels_fingerprint, console_events, endpoint_static_runtime, redact_key};
+    use super::{
+        channels_fingerprint, console_events, endpoint_static_runtime, history_replace_params,
+        redact_key,
+    };
     use q38_loop::config::Config;
     use q38_loop::session::{SessionEvent, StoredMedia};
     use q38_loop::ChannelEndpoint;
@@ -866,5 +880,16 @@ mod tests {
         let v = console_events(&[ev, path]);
         assert_eq!(v[0]["media"][0]["url"], "");
         assert_eq!(v[1]["media"][0]["url"], ".q38/generated/shot.png");
+    }
+
+    #[test]
+    fn session_switch_history_replace_sets_reset() {
+        let ev = SessionEvent::user("hi");
+        let reset = history_replace_params(&[ev.clone()], "sess-new", true);
+        assert_eq!(reset["reset"], true);
+        assert_eq!(reset["session"], "sess-new");
+        assert_eq!(reset["events"][0]["type"], "user");
+        let keep = history_replace_params(&[ev], "sess-new", false);
+        assert_eq!(keep["reset"], false);
     }
 }

@@ -31,12 +31,18 @@ impl Effort {
     }
 }
 
+fn default_preserve() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ThinkPolicy {
     pub enabled: bool,
     /// `None` when thinking is off — the request builder omits `reasoning_effort`.
     pub effort: Option<Effort>,
     pub max_think_tokens: u32,
+    /// Official Qwen 3.6+ default. Missing JSONL fields must not silently strip.
+    #[serde(default = "default_preserve")]
     pub preserve: bool,
     pub max_tokens: u32,
 }
@@ -201,6 +207,14 @@ impl ThinkPolicy {
         self
     }
 
+    /// Official agent path: keep historical `<think>` so later hops continue
+    /// instead of restating the user turn. Compact clips old think; do not
+    /// strip via this flag.
+    pub fn with_preserved_thinking(mut self) -> Self {
+        self.preserve = true;
+        self
+    }
+
     /// Kwargs that this endpoint's template actually understands. Unknown keys stay omitted.
     pub fn template_kwargs(&self, caps: &EndpointCaps) -> TemplateKwargs {
         let enable_thinking = Some(self.enabled);
@@ -215,8 +229,11 @@ impl ThinkPolicy {
                     .then(|| s.to_string())
             })
         };
+        // Always `true` on the wire when the family supports the kwarg.
+        // `preserve: false` only exists for local Jinja tests; sending it on
+        // an agent loop makes every new user turn restate the task.
         let preserve_thinking = if caps.preserve_thinking {
-            Some(self.preserve)
+            Some(true)
         } else {
             None
         };
@@ -459,6 +476,21 @@ mod tests {
         assert_eq!(kw.enable_thinking, Some(false));
         assert!(kw.reasoning_effort.is_none());
         assert_eq!(kw.preserve_thinking, Some(true));
+    }
+
+    #[test]
+    fn wire_kwargs_keep_think_even_if_policy_field_is_false() {
+        let caps = EndpointCaps::qwen38_llamacpp();
+        let mut p = ThinkPolicy::native_with(&ThinkBudget::default());
+        p.preserve = false;
+        let kw = p.template_kwargs(&caps);
+        assert_eq!(kw.preserve_thinking, Some(true));
+        assert_eq!(kw.reasoning_effort.as_deref(), Some("medium"));
+        let missing: ThinkPolicy = serde_json::from_str(
+            r#"{"enabled":true,"effort":"medium","max_think_tokens":4096,"max_tokens":8192}"#,
+        )
+        .unwrap();
+        assert!(missing.preserve);
     }
 
     #[test]

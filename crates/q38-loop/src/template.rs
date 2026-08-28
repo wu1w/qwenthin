@@ -127,6 +127,19 @@ impl ChatMessage {
 
     fn to_wire(&self, jinja: bool) -> serde_json::Value {
         let mut v = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
+        // vLLM ≥ 0.20 reads `reasoning` and strips `reasoning_content` before
+        // Jinja. Official Qwen templates still look up `reasoning_content`.
+        // Echo both so tool hops keep the think block (Qwen 3.6+ agent path).
+        if let Some(r) = self
+            .reasoning_content
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("reasoning".into(), serde_json::Value::String(r.to_string()));
+            }
+        }
         if jinja {
             // Flash-Next / Unsloth Jinja raises if function.arguments is a JSON string.
             if let Some(calls) = v.get_mut("tool_calls").and_then(|c| c.as_array_mut()) {
@@ -534,10 +547,41 @@ mod tests {
         let t2 = vec![ChatMessage::user("ping"), asst, ChatMessage::user("pong")];
         let kept = qwen38(&t2, None, ThinkPolicy::agent_default());
         assert!(kept.contains("secret-plan"), "{kept}");
-        let mut no_preserve = ThinkPolicy::agent_default();
-        no_preserve.preserve = false;
-        let stripped = qwen38(&t2, None, no_preserve);
+        // Jinja still honors false; the wire path never sends it (compact clips).
+        let stripped = render(&RenderOpts {
+            family: Family::Qwen38,
+            messages: &t2,
+            tools: None,
+            add_generation_prompt: true,
+            kwargs: TemplateKwargs {
+                enable_thinking: Some(true),
+                reasoning_effort: Some("low".into()),
+                preserve_thinking: Some(false),
+            },
+        })
+        .unwrap()
+        .text;
         assert!(!stripped.contains("secret-plan"), "{stripped}");
+    }
+
+    #[test]
+    fn wire_echoes_reasoning_for_vllm_and_qwen_jinja() {
+        let msg = ChatMessage::assistant_reply(
+            None,
+            Some("The user wants a fix.".into()),
+            Some(vec![serde_json::json!({
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "read", "arguments": {"path": "a.rs"}}
+            })]),
+        );
+        let api = msg.to_api_value();
+        assert_eq!(api["reasoning_content"], "The user wants a fix.");
+        assert_eq!(api["reasoning"], "The user wants a fix.");
+        let jinja = msg.to_jinja_value();
+        assert_eq!(jinja["reasoning_content"], "The user wants a fix.");
+        assert_eq!(jinja["reasoning"], "The user wants a fix.");
+        assert!(jinja["tool_calls"][0]["function"]["arguments"].is_object());
     }
 
     #[test]

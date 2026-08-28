@@ -102,6 +102,10 @@ pub async fn execute_turn(
     {
         Ok(c) => {
             emit.append(crate::session::SessionEvent::delta_reset());
+            emit.append(crate::session::SessionEvent::delta_chunk(
+                crate::session::DeltaChannel::Reasoning,
+                crate::llm_http::PREPARE_HINT,
+            ));
             c
         }
         Err(e) => {

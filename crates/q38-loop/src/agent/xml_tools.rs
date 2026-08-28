@@ -1,5 +1,7 @@
 //! Qwen XML tool-call surface (`<tool_call><function=…>`), plus JSON inside
-//! `<tool_call>`.
+//! `<tool_call>`. Some GGUF / Flash-Next templates emit the plural wrappers
+//! `<tool_calls>` and `<tool_result>` instead; those are the same channel and
+//! must not leak into the visible reply.
 //!
 //! Matches QwenPaw `tag_parser.py`: JSON first, then strict XML, then lenient
 //! XML (missing `</parameter>` / `</function>`). This extractor is think-unaware;
@@ -13,11 +15,19 @@ use serde_json::{json, Map, Value};
 use crate::tool_calls::ToolCall;
 
 const TOOL_OPEN: &str = "<tool_call>";
-const TOOL_CLOSE: &str = "</tool_call>";
 const FN_OPEN: &str = "<function=";
 const FN_CLOSE: &str = "</function>";
 const PARAM_OPEN: &str = "<parameter=";
 const PARAM_CLOSE: &str = "</parameter>";
+
+/// `(open, close, is_call)`. Longer tags first in the scan so `<tool_call>`
+/// does not steal `<tool_calls>`. Result wrappers are strip-only.
+const BLOCKS: &[(&str, &str, bool)] = &[
+    ("<tool_calls>", "</tool_calls>", true),
+    ("<tool_call>", "</tool_call>", true),
+    ("<tool_results>", "</tool_results>", false),
+    ("<tool_result>", "</tool_result>", false),
+];
 
 #[derive(Debug, Default)]
 pub(super) struct XmlExtract {
@@ -46,21 +56,18 @@ impl XmlExtract {
 pub(super) fn extract_xml_tools(content: &str) -> XmlExtract {
     let mut out = XmlExtract::default();
     let mut search = 0usize;
-    while let Some(rel) = content[search..].find(TOOL_OPEN) {
-        let start = search + rel;
-        if in_markdown_code(content, start) {
-            search = start + TOOL_OPEN.len();
-            continue;
-        }
-        let inner_at = start + TOOL_OPEN.len();
-        match content[inner_at..].find(TOOL_CLOSE) {
+    while let Some((start, open, close, is_call)) = next_open(content, search) {
+        let inner_at = start + open.len();
+        match content[inner_at..].find(close) {
             Some(rel_end) => {
                 let inner_end = inner_at + rel_end;
-                let end = inner_end + TOOL_CLOSE.len();
+                let end = inner_end + close.len();
                 out.ranges.push(start..end);
-                match parse_tool_inner(content[inner_at..inner_end].trim()) {
-                    Ok(mut calls) => out.calls.append(&mut calls),
-                    Err(()) => out.malformed = true,
+                if is_call {
+                    match parse_tool_inner(content[inner_at..inner_end].trim()) {
+                        Ok(mut calls) => out.calls.append(&mut calls),
+                        Err(()) => out.malformed = true,
+                    }
                 }
                 search = end;
             }
@@ -72,6 +79,38 @@ pub(super) fn extract_xml_tools(content: &str) -> XmlExtract {
         }
     }
     out
+}
+
+/// Byte index of the first tool markup the live painter must hide.
+pub(super) fn first_tool_markup_start(s: &str) -> Option<usize> {
+    next_open(s, 0).map(|(start, _, _, _)| start)
+}
+
+fn next_open(content: &str, search: usize) -> Option<(usize, &'static str, &'static str, bool)> {
+    let mut best: Option<(usize, &'static str, &'static str, bool)> = None;
+    for &(open, close, is_call) in BLOCKS {
+        let mut from = search;
+        while let Some(rel) = content[from..].find(open) {
+            let start = from + rel;
+            if open == TOOL_OPEN && content[start..].starts_with("<tool_calls>") {
+                from = start + 1;
+                continue;
+            }
+            if open == "<tool_result>" && content[start..].starts_with("<tool_results>") {
+                from = start + 1;
+                continue;
+            }
+            if in_markdown_code(content, start) {
+                from = start + open.len();
+                continue;
+            }
+            if best.map(|(at, _, _, _)| start < at).unwrap_or(true) {
+                best = Some((start, open, close, is_call));
+            }
+            break;
+        }
+    }
+    best
 }
 
 /// Citations like `` `<tool_call>` `` in an analysis must not eat the rest of
@@ -115,6 +154,12 @@ fn parse_tool_inner(inner: &str) -> Result<Vec<ToolCall>, ()> {
     }
     if trimmed.contains(FN_OPEN) {
         return parse_function_tools(trimmed);
+    }
+    if trimmed.contains(TOOL_OPEN) {
+        let nested = extract_xml_tools(trimmed);
+        if !nested.calls.is_empty() {
+            return Ok(nested.calls);
+        }
     }
     Err(())
 }
@@ -497,5 +542,54 @@ y
         assert_eq!(x.calls.len(), 1);
         assert_eq!(x.calls[0].name, "read");
         assert_eq!(text_before_first(content, &x.ranges), "先读文件。");
+    }
+
+    #[test]
+    fn empty_plural_wrappers_are_malformed_not_prose() {
+        let content = "\
+先确认上传文件是否存在。
+
+<tool_calls>
+</tool_calls>
+
+<tool_result>
+</tool_result>
+
+文件存在，读取内容。
+
+<tool_calls>
+</tool_calls>";
+        let x = extract_xml_tools(content);
+        assert!(x.had_tag());
+        assert!(x.malformed);
+        assert!(x.parse_fail(false));
+        assert!(x.calls.is_empty());
+        assert_eq!(
+            text_before_first(content, &x.ranges),
+            "先确认上传文件是否存在。"
+        );
+        assert_eq!(
+            first_tool_markup_start(content),
+            content.find("<tool_calls>")
+        );
+    }
+
+    #[test]
+    fn tool_call_prefix_does_not_steal_tool_calls() {
+        let content = "<tool_calls>\n<function=read>\n<parameter=path>\na.pdf\n</parameter>\n</function>\n</tool_calls>";
+        let x = extract_xml_tools(content);
+        assert!(!x.parse_fail(false));
+        assert_eq!(x.calls.len(), 1);
+        assert_eq!(x.calls[0].name, "read");
+        assert_eq!(x.calls[0].arguments["path"], "a.pdf");
+    }
+
+    #[test]
+    fn nested_tool_call_inside_plural_wrapper() {
+        let content = "<tool_calls>\n<tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}</tool_call>\n</tool_calls>";
+        let x = extract_xml_tools(content);
+        assert_eq!(x.calls.len(), 1);
+        assert_eq!(x.calls[0].name, "bash");
+        assert_eq!(x.calls[0].arguments["command"], "ls");
     }
 }
