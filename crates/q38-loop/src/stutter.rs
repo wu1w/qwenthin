@@ -21,8 +21,71 @@ pub fn is_stutter(content: &str, reasoning: &str) -> bool {
 }
 
 /// Long enough to be a user-visible answer, not a one-line status.
+/// Units are English-equivalent: CJK counts 2.5, Latin 1. A ~70-character
+/// Chinese wrap-up matches a 160-character English essay. Sub-40-character
+/// 边做边说 lines stay below the line so they cannot freeze `last_essay`.
 pub fn is_substantial_reply(s: &str) -> bool {
-    normalize_reply(s).chars().count() >= MIN_RESTATE_CHARS
+    reply_units(s) >= MIN_RESTATE_CHARS
+}
+
+/// Thinking that is still planning, not a finished user-facing answer.
+/// Flash-Next often stops with this still in `reasoning_content`.
+pub fn is_scratch_think(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    const EN: &[&str] = &[
+        "let me ",
+        "let's ",
+        "i need to",
+        "i should",
+        "i will ",
+        "i'll ",
+        "need to check",
+        "need to find",
+        "need to look",
+        "need to verify",
+        "need to read",
+        "i didn't see",
+        "didn't find",
+        "search for",
+        "grep for",
+        "where is ",
+        "wait —",
+        "but wait",
+    ];
+    if EN.iter().any(|m| l.contains(m)) {
+        return true;
+    }
+    zh_planning_opens(s)
+}
+
+/// Chinese planning collocations at a sentence start. Bare `让我` / `我再` /
+/// `还要` match finished prose ("这让我想到", "我再强调").
+fn zh_planning_opens(s: &str) -> bool {
+    const HEAD: &[&str] = &[
+        "接下来我",
+        "接下来看",
+        "接下来查",
+        "接下来读",
+        "先看",
+        "再查",
+        "再看一下",
+        "再看这",
+        "让我看",
+        "让我查",
+        "让我读",
+        "让我检查",
+        "需要检查",
+        "需要看",
+        "待查",
+        "我再看",
+        "我再查",
+        "我再读",
+    ];
+    s.split(|c: char| matches!(c, '\n' | '。' | '！' | '？' | ';' | '；'))
+        .any(|sent| {
+            let t = sent.trim();
+            HEAD.iter().any(|m| t.starts_with(m))
+        })
 }
 
 /// Same essay restated on a later hop (pi-style answer stagnation).
@@ -30,8 +93,8 @@ pub fn is_substantial_reply(s: &str) -> bool {
 pub fn is_restated_reply(prev: &str, next: &str) -> bool {
     let a = normalize_reply(prev);
     let b = normalize_reply(next);
-    let na = a.chars().count();
-    let nb = b.chars().count();
+    let na = a.chars().map(char_units).sum::<usize>() / 2;
+    let nb = b.chars().map(char_units).sum::<usize>() / 2;
     if na < MIN_RESTATE_CHARS || nb < MIN_RESTATE_CHARS {
         return false;
     }
@@ -178,7 +241,35 @@ fn command_head(p: &str) -> &str {
     t.split_whitespace().next().unwrap_or("")
 }
 
+/// English-equivalent units. CJK counts 2.5 (integer 5/2), Latin 1.
+/// A ~70-character Chinese wrap-up matches a 160-character English essay.
+/// Live 边做边说 stays ~20–35 CJK and remains below the line.
 const MIN_RESTATE_CHARS: usize = 160;
+
+fn reply_units(s: &str) -> usize {
+    normalize_reply(s).chars().map(char_units).sum::<usize>() / 2
+}
+
+fn char_units(c: char) -> usize {
+    if is_cjk(c) {
+        5
+    } else {
+        2
+    }
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(
+        c,
+        '\u{4e00}'..='\u{9fff}'
+            | '\u{3400}'..='\u{4dbf}'
+            | '\u{f900}'..='\u{faff}'
+            | '\u{3040}'..='\u{30ff}'
+            | '\u{ac00}'..='\u{d7af}'
+            | '\u{3000}'..='\u{303f}'
+            | '\u{ff00}'..='\u{ffef}'
+    )
+}
 const RESTATE_JACCARD: f32 = 0.82;
 const GRAM_SCAN: usize = 800;
 
@@ -345,6 +436,37 @@ is byte-stable and tools stay frozen.";
     fn short_status_is_not_a_restate() {
         assert!(!is_restated_reply("好的，我继续读。", "好的，我继续读。"));
         assert!(!is_substantial_reply("好的，我继续读。"));
+        assert!(!is_substantial_reply("在。有什么要做的？"));
+        assert!(!is_substantial_reply(
+            "主循环读完，看 http.rs 推理恢复与流式管线（上次中断处）。"
+        ));
+    }
+
+    #[test]
+    fn chinese_paragraph_is_substantial() {
+        let body =
+            "修得没问题。复查通过。c2f9bca 跳过 URL 端口里的三位数字，不再误判成 HTTP 状态码。\
+网关软上限与空回复路径已经对齐。用户可见结论写在这里，没有未完成的计划。";
+        assert!(is_substantial_reply(body));
+        assert!(!is_scratch_think(body));
+    }
+
+    #[test]
+    fn scratch_think_is_still_planning() {
+        assert!(is_scratch_think(
+            "Need to check the vendored q38next jinja: does it respect enable_thinking?"
+        ));
+        assert!(is_scratch_think(
+            "Let me look at lines 570-660 of http.rs and the completion streaming pipeline."
+        ));
+        assert!(is_scratch_think("接下来我再看一下 agent/mod.rs 的主循环。"));
+        assert!(is_scratch_think("先看 family.rs 再决定。"));
+        assert!(!is_scratch_think(
+            "修得没问题。复查通过。c2f9bca 跳过 URL 端口里的三位数字，不再误判成 HTTP 状态码。"
+        ));
+        assert!(!is_scratch_think("这让我想到 finish 路径的空回复问题。"));
+        assert!(!is_scratch_think("我再强调：c2f9bca 已经修好了。"));
+        assert!(!is_scratch_think("让我总结一下：空回复必须有兜底。"));
     }
 
     #[test]

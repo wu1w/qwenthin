@@ -63,6 +63,13 @@ impl Family {
         }
     }
 
+    /// Flash-Next parks plans and sometimes the final answer in
+    /// `reasoning_content`, then stops with empty `content`. 27B still
+    /// writes a visible wrap-up on the same tasks.
+    pub fn silent_final_channel(self) -> bool {
+        matches!(self, Self::Qwen38Next)
+    }
+
     /// Best-effort parse of a `/v1/models` id. Unknown Qwen-like ids return `None`
     /// so the builder will not inject 3.8 `xhigh` into a 3.5 template.
     pub fn detect(model_id: &str) -> Option<Self> {
@@ -295,6 +302,8 @@ mod tests {
         assert!(Family::Qwen38.effort_values().contains(&"xhigh"));
         assert!(Family::Qwen38Next.effort_values().contains(&"xhigh"));
         assert_eq!(Family::Qwen38Next.follow_up_compact_tools(), 6);
+        assert!(Family::Qwen38Next.silent_final_channel());
+        assert!(!Family::Qwen38.silent_final_channel());
         assert!(Family::Qwen35.effort_values().is_empty());
         assert!(Family::Qwen36.effort_values().is_empty());
     }

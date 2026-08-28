@@ -12,7 +12,7 @@ pub const STUB_AFTER_USERS: usize = 2;
 /// Interactive narration. Re-injected each real user turn once the old copy
 /// stubs, so the instruction stays one live card (~30 tokens) at any time.
 pub const STYLE_CARD: &str =
-    "[style] 边做边说：每个阶段动手前，先用一句话（中文，≤20字）说明接下来做什么，再调用工具。收尾只报结果。";
+    "[style] 边做边说：每个阶段动手前，先用一句话（中文，≤20字）说明接下来做什么，再调用工具。给用户看的话写在正常回复里，思考通道用户看不见。收尾只报结果，不要交空回复。";
 pub const SKILL_BODY_MAX_TOKENS: u32 = 400;
 pub const AGENTS_MD_MAX_TOKENS: u32 = 400;
 pub const MEMORY_HOT_MAX_LINES: usize = 12;

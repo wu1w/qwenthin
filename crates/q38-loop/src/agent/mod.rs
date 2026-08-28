@@ -6,7 +6,9 @@
 //!    empty, recover complete `<tool_call>` XML from that thought (QwenPaw)
 //! 3. if tools: gates — TERMINATE with reason is deferred; execute via ToolCoordinator
 //! 4. if text: gates — Stop ends the turn. Continue is not turned into a
-//!    lecture; empty Continue is treated as Stop.
+//!    lecture; empty Continue is treated as Stop. Empty `content` with leftover
+//!    think gets one wrap-up hop so Flash-Next cannot park the answer in
+//!    `reasoning_content` and go silent.
 //!
 //! Parse failures and think-cap hits retry the same messages (kwargs only).
 //! Trajectory detectors (doom / name / path / stutter / dump) inject one
@@ -489,6 +491,12 @@ pub struct Agent<C> {
     physics_nudged: bool,
     /// Parse-fail cap already got one repair observation.
     parse_nudged: bool,
+    /// Empty visible reply (answer parked in reasoning) already got one wrap-up.
+    channel_nudged: bool,
+    /// Consecutive tool hops with empty `content` this user turn.
+    silent_tool_hops: u32,
+    /// Flash-Next silent-tool streak already received one style observation.
+    silent_tool_nudged: bool,
 }
 
 impl<C: Completer> Agent<C> {
@@ -658,6 +666,9 @@ impl<C: Completer> Agent<C> {
             stutter_nudged: false,
             physics_nudged: false,
             parse_nudged: false,
+            channel_nudged: false,
+            silent_tool_hops: 0,
+            silent_tool_nudged: false,
         })
     }
 
@@ -728,6 +739,9 @@ impl<C: Completer> Agent<C> {
         self.stutter_nudged = false;
         self.physics_nudged = false;
         self.parse_nudged = false;
+        self.channel_nudged = false;
+        self.silent_tool_hops = 0;
+        self.silent_tool_nudged = false;
         self.last_spoken = None;
         self.last_essay = None;
         self.read_paths.clear();
@@ -842,6 +856,19 @@ impl<C: Completer> Agent<C> {
             if let Some(body) = Self::promote_write_reply(&turn) {
                 turn.content = body;
             }
+            if let Some(body) = Self::promote_reasoning_reply(&turn) {
+                turn.content = body;
+            }
+            if self.needs_channel_rescue(&turn) {
+                if !self.channel_nudged {
+                    self.channel_nudged = true;
+                    self.note("[channel] empty visible reply; one wrap-up");
+                    self.push_hidden_user(EMPTY_CHANNEL_NOTE);
+                    continue;
+                }
+                self.mark_clean();
+                return self.finish_visible(String::new(), None, steps);
+            }
             let mut trajectory_note = None;
             let dump_anchor = self.last_spoken.clone().or_else(|| self.last_essay.clone());
             if let Some(prev) = dump_anchor {
@@ -872,10 +899,16 @@ impl<C: Completer> Agent<C> {
             let decision = self.gate_decision(&turn, steps, prompt_tokens, completion_tokens);
 
             if !turn.tool_calls.is_empty() {
+                if turn.content.trim().is_empty() {
+                    self.silent_tool_hops += 1;
+                } else {
+                    self.silent_tool_hops = 0;
+                }
                 // Defer TERMINATE until after this tool batch. A gate Continue
                 // with text is a one-shot trajectory observation after the
                 // batch's results; later repeats stay silent.
                 let mut gate_note = None;
+                let mut silent_note = None;
                 match &decision {
                     GateDecision::Stop { reason } if is_physics_stop(reason) => {
                         if !self.physics_nudged {
@@ -895,6 +928,14 @@ impl<C: Completer> Agent<C> {
                     }
                     _ => {}
                 }
+                if self.silent_final_channel()
+                    && !self.silent_tool_nudged
+                    && self.silent_tool_hops >= SILENT_TOOL_STREAK
+                {
+                    self.silent_tool_nudged = true;
+                    self.note("[channel] silent tool streak; one style observation");
+                    silent_note = Some(SILENT_TOOL_NOTE.to_string());
+                }
                 let calls = std::mem::take(&mut turn.tool_calls);
                 if trajectory_note.is_some() {
                     // Do not execute a cleanup/write batch before the model has
@@ -905,6 +946,9 @@ impl<C: Completer> Agent<C> {
                     self.execute_tools(calls).await;
                 }
                 if let Some(note) = gate_note {
+                    self.push_hidden_user(note);
+                }
+                if let Some(note) = silent_note {
                     self.push_hidden_user(note);
                 }
                 if let Some(note) = trajectory_note {
@@ -925,26 +969,26 @@ impl<C: Completer> Agent<C> {
                     } else {
                         Some(continuation)
                     };
-                    return self.finish(turn.content, stop_reason, steps);
+                    return self.finish_visible(turn.content, stop_reason, steps);
                 }
                 GateDecision::Stop { reason } => {
                     self.mark_clean();
                     if is_physics_stop(&reason) {
                         self.note(&reason);
-                        return self.finish(turn.content, None, steps);
+                        return self.finish_visible(turn.content, None, steps);
                     }
                     let stop_reason = if reason.is_empty() {
                         None
                     } else {
                         Some(reason)
                     };
-                    return self.finish(turn.content, stop_reason, steps);
+                    return self.finish_visible(turn.content, stop_reason, steps);
                 }
                 // Handler swallows per-gate Bypass; keep this arm so a future
                 // handler contract change cannot panic the loop.
                 GateDecision::Bypass => {
                     self.mark_clean();
-                    return self.finish(turn.content, None, steps);
+                    return self.finish_visible(turn.content, None, steps);
                 }
             }
         }
@@ -1114,6 +1158,75 @@ impl<C: Completer> Agent<C> {
             .filter_map(|c| c.arguments.get("content").and_then(|v| v.as_str()))
             .collect();
         crate::stutter::promote_dumped_reply(&turn.content, &bodies)
+    }
+
+    fn silent_final_channel(&self) -> bool {
+        self.completer
+            .prefix_meter()
+            .is_some_and(|(f, _)| f.silent_final_channel())
+    }
+
+    /// Empty visible hop with leftover think, or a short reply cut off by
+    /// the shared think+answer token budget. Do not dump unfinished CoT.
+    fn needs_channel_rescue(&self, turn: &ModelTurn) -> bool {
+        if !turn.tool_calls.is_empty() {
+            return false;
+        }
+        turn.content.trim().is_empty() && !turn.reasoning.trim().is_empty()
+    }
+
+    /// Lift a finished answer that landed only in `reasoning_content`.
+    /// Scratch plans and long CoT stay in think and get a wrap-up hop.
+    fn promote_reasoning_reply(turn: &ModelTurn) -> Option<String> {
+        if !turn.tool_calls.is_empty() || !turn.content.trim().is_empty() {
+            return None;
+        }
+        let r = turn.reasoning.trim();
+        if crate::stutter::is_scratch_think(r) {
+            return None;
+        }
+        if !crate::stutter::is_substantial_reply(r) {
+            return None;
+        }
+        if r.chars().count() > PROMOTE_REASONING_MAX {
+            return None;
+        }
+        Some(r.to_string())
+    }
+
+    fn visible_stop_text(&self) -> String {
+        self.last_spoken
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                self.last_essay
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+    }
+
+    fn finish_visible(
+        &mut self,
+        content: String,
+        stop_reason: Option<String>,
+        steps: u32,
+    ) -> Result<AgentOutcome> {
+        let text = if content.trim().is_empty() {
+            let kept = self.visible_stop_text();
+            if kept.is_empty() && self.channel_nudged {
+                EMPTY_STOP_FALLBACK.to_string()
+            } else {
+                kept
+            }
+        } else {
+            content
+        };
+        self.finish(text, stop_reason, steps)
     }
 
     fn gate_decision(
@@ -2457,6 +2570,24 @@ const PHYSICS_WRAP_NOTE: &str = "[trajectory] 本轮已接近步数、时间或�
 const PARSE_REPAIR_NOTE: &str = "[trajectory] 上一跳工具调用未能解析。\
 改用完整原生 tool call，或直接给出可见结论。";
 
+/// Flash-Next (and cousins) sometimes stop with empty `content` while the
+/// answer or leftover plan is still in the think channel. One wrap-up hop.
+const EMPTY_CHANNEL_NOTE: &str = "[trajectory] 上一跳没有给用户可见回复，结论还在思考通道里。\
+把完整结论写到正常回复；思考通道用户看不见。若任务没做完，调用工具。不要再交空回复。";
+
+/// Interactive 27B narrates tool hops; Flash-Next often does not. One observation.
+const SILENT_TOOL_NOTE: &str = "[trajectory] 连续几跳工具调用没有对用户说话。\
+接下来动手前用一句中文（≤20字）说明，再调工具；不要把说明只写在思考通道。";
+
+const EMPTY_STOP_FALLBACK: &str = "这一步停在了空回复上。请再说一次，或换个问法。";
+
+/// Consecutive empty-content tool hops before the Flash-Next style observation.
+const SILENT_TOOL_STREAK: u32 = 4;
+
+/// Upper bound for promoting think-channel text into the visible reply.
+/// Longer blobs are unfinished CoT, not an answer.
+const PROMOTE_REASONING_MAX: usize = 800;
+
 fn is_physics_stop(reason: &str) -> bool {
     reason.starts_with("budget:context")
         || reason.contains("Max iterations")
@@ -2819,6 +2950,32 @@ mod tests {
         }
     }
 
+    struct ScriptedFamily {
+        inner: Scripted,
+        family: Family,
+    }
+
+    impl Completer for ScriptedFamily {
+        async fn complete(
+            &self,
+            messages: &[ChatMessage],
+            tools: Option<&[Value]>,
+        ) -> Result<ModelTurn> {
+            self.inner.complete(messages, tools).await
+        }
+
+        fn prefix_meter(&self) -> Option<(Family, TemplateKwargs)> {
+            Some((
+                self.family,
+                TemplateKwargs {
+                    enable_thinking: Some(true),
+                    reasoning_effort: Some("medium".into()),
+                    preserve_thinking: Some(true),
+                },
+            ))
+        }
+    }
+
     struct Delayed {
         inner: Scripted,
         delay: Duration,
@@ -2873,6 +3030,12 @@ mod tests {
             cached_tokens: None,
             decode_tok_s: None,
         }
+    }
+
+    fn turn_think(reasoning: &str) -> ModelTurn {
+        let mut t = turn_text("");
+        t.reasoning = reasoning.into();
+        t
     }
 
     fn turn_tool(name: &str, args: Value) -> ModelTurn {
@@ -2983,6 +3146,172 @@ mod tests {
             .find(|m| m.role == "assistant")
             .unwrap();
         assert_eq!(asst.reasoning_content.as_deref(), Some("brief"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn think_only_scratch_gets_one_wrap_up() {
+        let dir = std::env::temp_dir().join(format!("q38-chan-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_think(
+                    "Need to check the core loop. Let me look at agent/mod.rs next and verify finish(turn.content).",
+                ),
+                turn_text("核心循环缺空回复兜底，已记下。"),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+        let out = agent.run("再查核心循环").await.unwrap();
+        assert_eq!(out.text, "核心循环缺空回复兜底，已记下。");
+        assert_eq!(out.steps, 2);
+        let hidden: Vec<_> = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.clone().unwrap_or_default())
+            .filter(|c| crate::template::is_hidden_user_text(c))
+            .collect();
+        assert!(
+            hidden.iter().any(|c| c.contains(EMPTY_CHANNEL_NOTE)),
+            "wrap-up note missing: {hidden:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn think_only_finished_answer_is_promoted() {
+        let dir = std::env::temp_dir().join(format!("q38-promo-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body =
+            "修得没问题。复查通过。c2f9bca 跳过 URL 端口里的三位数字，不再误判成 HTTP 状态码。\
+网关软上限与空回复路径已经对齐。用户可见结论写在这里，没有未完成的计划。";
+        assert!(crate::stutter::is_substantial_reply(body));
+        assert!(!crate::stutter::is_scratch_think(body));
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([turn_think(body)])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+        let out = agent.run("复查修复").await.unwrap();
+        assert_eq!(out.text, body);
+        assert_eq!(out.steps, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn empty_finish_keeps_last_essay() {
+        let dir = std::env::temp_dir().join(format!("q38-keep-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let essay = "I studied the q-harness agent loop in detail. The core crate is q38-loop. \
+It runs a ReAct cycle with frozen tools read write edit bash. Template rendering uses the \
+official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_said(
+                    essay,
+                    "read",
+                    json!({"path": "crates/q38-loop/src/agent/mod.rs"}),
+                ),
+                turn_text(""),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+        let out = agent.run("read the loop").await.unwrap();
+        assert_eq!(out.text, essay);
+        assert_eq!(out.steps, 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn empty_channel_second_hop_uses_fallback() {
+        let dir = std::env::temp_dir().join(format!("q38-fb-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_think("Let me check finish() and the gate Continue path."),
+                turn_think("Still need to look at inbound.rs for empty IM replies."),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+        let out = agent.run("对照习惯").await.unwrap();
+        assert_eq!(out.text, EMPTY_STOP_FALLBACK);
+        assert_eq!(out.steps, 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn flash_next_silent_tools_get_one_note() {
+        let dir = std::env::temp_dir().join(format!("q38-sil-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inner = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("read", json!({"path": "a.rs"})),
+                turn_tool("read", json!({"path": "b.rs"})),
+                turn_tool("read", json!({"path": "c.rs"})),
+                turn_tool("read", json!({"path": "d.rs"})),
+                turn_text("读完了。"),
+            ])),
+            meter: false,
+        };
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let mut agent = Agent::new(
+            ScriptedFamily {
+                inner,
+                family: Family::Qwen38Next,
+            },
+            o,
+        )
+        .unwrap();
+        std::fs::write(dir.join("a.rs"), "a").unwrap();
+        std::fs::write(dir.join("b.rs"), "b").unwrap();
+        std::fs::write(dir.join("c.rs"), "c").unwrap();
+        std::fs::write(dir.join("d.rs"), "d").unwrap();
+        let out = agent.run("read four files").await.unwrap();
+        assert_eq!(out.text, "读完了。");
+        let notes = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.clone().unwrap_or_default())
+            .filter(|c| c.contains(SILENT_TOOL_NOTE))
+            .count();
+        assert_eq!(notes, 1, "silent-tool observation must land once");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn qwen38_silent_tools_do_not_nudge() {
+        let dir = std::env::temp_dir().join(format!("q38-27b-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("read", json!({"path": "a.rs"})),
+                turn_tool("read", json!({"path": "b.rs"})),
+                turn_tool("read", json!({"path": "c.rs"})),
+                turn_tool("read", json!({"path": "d.rs"})),
+                turn_text("done"),
+            ])),
+            meter: true,
+        };
+        std::fs::write(dir.join("a.rs"), "a").unwrap();
+        std::fs::write(dir.join("b.rs"), "b").unwrap();
+        std::fs::write(dir.join("c.rs"), "c").unwrap();
+        std::fs::write(dir.join("d.rs"), "d").unwrap();
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("read four files").await.unwrap();
+        assert_eq!(out.text, "done");
+        assert!(agent.messages.iter().all(|m| !m
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains(SILENT_TOOL_NOTE)));
         let _ = std::fs::remove_dir_all(dir);
     }
 
