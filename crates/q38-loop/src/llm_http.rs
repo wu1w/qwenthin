@@ -151,6 +151,13 @@ fn http_status_in(s: &str) -> Option<u16> {
             && (i == 0 || !bytes[i - 1].is_ascii_digit())
             && (i + 3 == bytes.len() || !bytes[i + 3].is_ascii_digit())
         {
+            // `:443` / `.443` / `/443` are ports and path segments, not statuses.
+            // Hitting 443 here used to return immediately and skip NEEDLES, so a
+            // timed-out `https://host:443/...` lost every transient retry.
+            if i > 0 && matches!(bytes[i - 1], b':' | b'.' | b'/') {
+                i += 1;
+                continue;
+            }
             let n = (bytes[i] - b'0') as u16 * 100
                 + (bytes[i + 1] - b'0') as u16 * 10
                 + (bytes[i + 2] - b'0') as u16;
@@ -264,6 +271,24 @@ mod tests {
             "400 Bad Request: model not found".into()
         )));
         assert!(!is_transient(&Error::Watchdog));
+    }
+
+    #[test]
+    fn explicit_tls_port_does_not_kill_transient_retry() {
+        let timeout = "error sending request for url (https://api.example.com:443/v1/chat/completions): operation timed out";
+        assert_eq!(http_status_in(timeout), None);
+        assert!(is_transient(&Error::Http(timeout.into())));
+        assert!(is_transient(&Error::Http(
+            "error sending request for url (https://api.example.com:443/v1): connection reset by peer"
+                .into()
+        )));
+        assert_eq!(
+            http_status_in("https://api.example.com:443/v1 502 Bad Gateway"),
+            Some(502)
+        );
+        assert!(!is_transient(&Error::Http(
+            "https://api.example.com:443/v1 400 Bad Request: model not found".into()
+        )));
     }
 
     #[test]
