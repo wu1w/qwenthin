@@ -14,7 +14,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 
 use super::delta::StreamPaint;
-use super::xml_tools::{extract_xml_tools, text_before_first};
+use super::xml_tools::{calls_leak_channel_markup, extract_xml_tools, text_before_first};
 use super::{Completer, ModelTurn, TokenSink};
 use crate::adapter::{build_chat_body, ChatRequestSpec};
 use crate::config::Config;
@@ -417,6 +417,13 @@ fn parse_turn_opts(v: &Value, truncated: bool) -> Result<ParseOutcome> {
             }
             reasoning = text_before_first(&reasoning, &from_think.ranges);
         }
+    }
+
+    // Native llama.cpp arguments can swallow `</think>` + the next XML call.
+    // Do not execute; empty-plural / truncated paths stay as they are.
+    if !truncated && calls_leak_channel_markup(&tool_calls) {
+        parse_fail = true;
+        tool_calls.clear();
     }
 
     if !parse_fail && had_xml {
@@ -1209,6 +1216,53 @@ mod tests {
         assert_eq!(o.turn.tool_calls.len(), 1);
         assert_eq!(o.turn.tool_calls[0].name, "read");
         assert_eq!(o.turn.content, "先读。");
+    }
+
+    #[test]
+    fn native_bash_args_with_think_close_are_parse_fail() {
+        let v = json!({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "9epb8FKpEkKV3RHlKZLhXbu4JOJOVFjw",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": "{\"command\":\"cd /Users/william/q-harness\\n</think>\\n\\n<tool_call>\\n<function=bash>\\n<parameter=command>\\ncd /Users/william/q-harness && grep -n \\\"extract_xml_tools\\\" crates/q38-loop/src -r\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let o = parse_turn(&v).unwrap();
+        assert!(o.parse_fail);
+        assert!(o.turn.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn native_grep_for_think_tag_still_runs() {
+        let v = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": "{\"command\":\"grep -n \\\"</think>\\\" crates/q38-loop/src/agent/delta.rs\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let o = parse_turn(&v).unwrap();
+        assert!(!o.parse_fail);
+        assert_eq!(o.turn.tool_calls.len(), 1);
+        assert!(o.turn.tool_calls[0].arguments["command"]
+            .as_str()
+            .unwrap()
+            .contains("</think>"));
     }
 
     #[test]

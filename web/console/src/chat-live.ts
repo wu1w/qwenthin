@@ -30,13 +30,39 @@ export function lastAssistantInCurrentTurn(events: SessionEvent[]): string {
   return "";
 }
 
+function controlSig(events: SessionEvent[]): { n: number; compactUntil: number; undoUntil: number } {
+  let n = 0;
+  let compactUntil = -1;
+  let undoUntil = -1;
+  for (const e of events) {
+    if (e.type === "session/compact") {
+      n++;
+      compactUntil = Math.max(compactUntil, Number(e.until_seq ?? 0));
+    } else if (e.type === "session/undo") {
+      n++;
+      undoUntil = Math.max(undoUntil, Number(e.until_seq ?? 0));
+    }
+  }
+  return { n, compactUntil, undoUntil };
+}
+
+function incomingHasNewerControl(current: SessionEvent[], incoming: SessionEvent[]): boolean {
+  const a = controlSig(current);
+  const b = controlSig(incoming);
+  if (b.n > a.n) return true;
+  if (b.n < a.n) return false;
+  return b.compactUntil > a.compactUntil || b.undoUntil > a.undoUntil;
+}
+
 /**
  * Keep the on-screen stream if the refetch is missing the just-finished reply.
- * Never use this across a session switch — empty incoming history would keep
- * the previous transcript on screen.
+ * Compact/undo rewrites are the source of truth even when the live transcript
+ * still has the evicted assistant. Never use this across a session switch —
+ * empty incoming history would keep the previous transcript on screen.
  */
 export function preferFresherHistory(current: SessionEvent[], incoming: SessionEvent[]): SessionEvent[] {
   if (!incoming.length && current.length) return current;
+  if (incomingHasNewerControl(current, incoming)) return incoming;
   const a = lastAssistantInCurrentTurn(current);
   const b = lastAssistantInCurrentTurn(incoming);
   if (a && !b) return current;
@@ -120,6 +146,21 @@ export function stripThinkRestatement(user: string, think: string): string {
 
 const TOOL_MARKUP = ["<tool_calls>", "<tool_call>", "<tool_results>", "<tool_result>"] as const;
 
+/** Same scan as Rust `in_markdown_code`: tags inside `…` or ```…``` are citations. */
+function inMarkdownCode(text: string, at: number): boolean {
+  let fence = false;
+  let inline = false;
+  for (let i = 0; i < at; i++) {
+    if (!inline && text.startsWith("```", i)) {
+      fence = !fence;
+      i += 2;
+      continue;
+    }
+    if (!fence && text[i] === "`") inline = !inline;
+  }
+  return fence || inline;
+}
+
 function markupAt(text: string, open: string, from: number): number {
   let i = from;
   while (i < text.length) {
@@ -130,6 +171,10 @@ function markupAt(text: string, open: string, from: number): number {
       continue;
     }
     if (open === "<tool_result>" && text.startsWith("<tool_results>", at)) {
+      i = at + 1;
+      continue;
+    }
+    if (inMarkdownCode(text, at)) {
       i = at + 1;
       continue;
     }

@@ -56,6 +56,22 @@ assert.equal(lastAssistantInCurrentTurn([user]), "");
   assert.deepEqual(preferFresherHistory(prior, prior), prior);
 }
 
+{
+  const cur = [user, asst];
+  const compacted: SessionEvent[] = [
+    { type: "session/compact", until_seq: 2 },
+    { type: "user", text: "把登录页标题改成 ixiaotao" },
+  ];
+  assert.deepEqual(preferFresherHistory(cur, compacted), compacted);
+  const undone: SessionEvent[] = [
+    { type: "session/undo", from_seq: 1, until_seq: 2 },
+    { type: "user", text: "把登录页标题改成 ixiaotao" },
+  ];
+  assert.deepEqual(preferFresherHistory(cur, undone), undone);
+  assert.deepEqual(preferFresherHistory(cur, [user]), cur);
+  assert.deepEqual(applyHistoryIncoming(cur, compacted, true), compacted);
+}
+
 assert.equal(
   stripLeakedToolMarkup(
     "先确认上传文件是否存在。\n\n<tool_calls>\n</tool_calls>\n\n<tool_result>\n</tool_result>\n\n文件存在，读取内容。",
@@ -63,6 +79,20 @@ assert.equal(
   "先确认上传文件是否存在。",
 );
 assert.equal(stripLeakedToolMarkup("正常回复，没有工具标记。"), "正常回复，没有工具标记。");
+
+{
+  const cited =
+    "P5 前端 `stripLeakedToolMarkup` 缺围栏豁免 → 我提 `<tool_result>` 时被截断。\n- P6 空壳一律判 parse_fail。\n- P7 `probe_client` 没跟上。";
+  assert.equal(stripLeakedToolMarkup(cited), cited);
+  assert.equal(
+    stripLeakedToolMarkup("分析里写 `<tool_call>` 是引用。\n\n<tool_calls>\n</tool_calls>\n后面是泄漏。"),
+    "分析里写 `<tool_call>` 是引用。",
+  );
+  assert.equal(
+    stripLeakedToolMarkup("围栏里的不算：\n```\n<tool_result>\n</tool_result>\n```\n正文继续。"),
+    "围栏里的不算：\n```\n<tool_result>\n</tool_result>\n```\n正文继续。",
+  );
+}
 
 assert.equal(
   stripThinkRestatement("把登录页标题改成 ixiaotao", "用户想把登录页标题改成 ixiaotao。\n先改 auth.tsx。"),

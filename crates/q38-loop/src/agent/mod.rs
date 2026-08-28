@@ -28,6 +28,7 @@ mod xml_tools;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -493,6 +494,8 @@ pub struct Agent<C> {
     parse_nudged: bool,
     /// Empty visible reply (answer parked in reasoning) already got one wrap-up.
     channel_nudged: bool,
+    /// Live "正在连接模型…" is once per user turn, not once per hop.
+    connect_hinted: AtomicBool,
     /// Consecutive tool hops with empty `content` this user turn.
     silent_tool_hops: u32,
     /// Flash-Next silent-tool streak already received one style observation.
@@ -667,6 +670,7 @@ impl<C: Completer> Agent<C> {
             physics_nudged: false,
             parse_nudged: false,
             channel_nudged: false,
+            connect_hinted: AtomicBool::new(false),
             silent_tool_hops: 0,
             silent_tool_nudged: false,
         })
@@ -740,6 +744,7 @@ impl<C: Completer> Agent<C> {
         self.physics_nudged = false;
         self.parse_nudged = false;
         self.channel_nudged = false;
+        self.connect_hinted.store(false, Ordering::Relaxed);
         self.silent_tool_hops = 0;
         self.silent_tool_nudged = false;
         self.last_spoken = None;
@@ -1219,17 +1224,7 @@ impl<C: Completer> Agent<C> {
         stop_reason: Option<String>,
         steps: u32,
     ) -> Result<AgentOutcome> {
-        let text = if content.trim().is_empty() {
-            let kept = self.visible_stop_text();
-            if kept.is_empty() {
-                EMPTY_STOP_FALLBACK.to_string()
-            } else {
-                kept
-            }
-        } else {
-            content
-        };
-        self.finish(text, stop_reason, steps)
+        self.finish(content, stop_reason, steps)
     }
 
     fn gate_decision(
@@ -1676,7 +1671,9 @@ impl<C: Completer> Agent<C> {
             if attempt == 0 {
                 if let Some(sink) = self.live_sink() {
                     sink.reset();
-                    sink.reasoning(crate::llm_http::CONNECT_HINT);
+                    if !self.connect_hinted.swap(true, Ordering::Relaxed) {
+                        sink.reasoning(crate::llm_http::CONNECT_HINT);
+                    }
                 }
             }
             let result = tokio::select! {
@@ -2036,6 +2033,16 @@ impl<C: Completer> Agent<C> {
         if stop_reason.as_deref() == Some("aborted") {
             self.coordinator.cancel_background();
         }
+        let text = if stop_reason.as_deref() != Some("aborted") && text.trim().is_empty() {
+            let kept = self.visible_stop_text();
+            if kept.is_empty() {
+                EMPTY_STOP_FALLBACK.to_string()
+            } else {
+                kept
+            }
+        } else {
+            text
+        };
         self.mark_clean();
         let reason = stop_reason.clone().unwrap_or_else(|| "stop".into());
         self.log_event(SessionEvent::stop(reason));
@@ -3273,6 +3280,36 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
     }
 
     #[tokio::test]
+    async fn parse_exhausted_without_speech_uses_fallback() {
+        let dir = std::env::temp_dir().join(format!("q38-pe-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        o.low_precision = true;
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_parse_fail("<tool_call>nope</tool_call>"),
+                turn_parse_fail("<tool_call>still-bad</tool_call>"),
+                turn_parse_fail("<tool_call>still-bad</tool_call>"),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("hi").await.unwrap();
+        assert_eq!(out.text, EMPTY_STOP_FALLBACK);
+        assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
+        let notes = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.clone().unwrap_or_default())
+            .filter(|c| c.contains(PARSE_REPAIR_NOTE))
+            .count();
+        assert_eq!(notes, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn flash_next_silent_tools_get_one_note() {
         let dir = std::env::temp_dir().join(format!("q38-sil-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4496,7 +4533,7 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
         let seen = watch.seen.clone();
         let mut agent = Agent::new(watch, opts(&dir)).unwrap();
         let out = agent.run("hi").await.unwrap();
-        assert!(out.text.is_empty(), "{}", out.text);
+        assert_eq!(out.text, EMPTY_STOP_FALLBACK);
         assert_eq!(out.stop_reason, None);
         let seen = seen.lock().expect("seen").clone();
         assert_eq!(
@@ -4603,7 +4640,7 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
         let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
         let out = agent.run("hi").await.unwrap();
         assert_eq!(out.stop_reason, None);
-        assert!(out.text.is_empty(), "{}", out.text);
+        assert_eq!(out.text, EMPTY_STOP_FALLBACK);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -6058,6 +6095,39 @@ is byte-stable and tools stay frozen. Wiring of skills and mcp is a hidden-card 
         let log = SessionLog::open_in(&sess, "delta1").unwrap();
         let persisted: Vec<_> = log.events().iter().map(|e| e.type_name()).collect();
         assert_eq!(persisted, ["session/start", "user", "assistant", "stop"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn connect_hint_once_across_two_hops() {
+        let dir = std::env::temp_dir().join(format!("q38-hint-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("note.txt"), "ok").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_said("", "read", json!({"path": "note.txt"})),
+                turn_text("done"),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+        agent.set_emit(crate::sidecar::EventSink { tx });
+        let out = agent.run("hi").await.unwrap();
+        assert_eq!(out.text, "done");
+        let mut reasoning = String::new();
+        while let Ok(e) = rx.try_recv() {
+            if let SessionEvent::Delta(d) = e {
+                if !d.reset && d.channel == crate::session::DeltaChannel::Reasoning {
+                    reasoning.push_str(&d.text);
+                }
+            }
+        }
+        assert_eq!(
+            reasoning.matches(crate::llm_http::CONNECT_HINT).count(),
+            1,
+            "{reasoning:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

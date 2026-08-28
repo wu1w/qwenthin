@@ -65,7 +65,13 @@ pub(super) fn extract_xml_tools(content: &str) -> XmlExtract {
                 out.ranges.push(start..end);
                 if is_call {
                     match parse_tool_inner(content[inner_at..inner_end].trim()) {
-                        Ok(mut calls) => out.calls.append(&mut calls),
+                        Ok(mut calls) => {
+                            if calls.iter().any(call_leaks_channel_markup) {
+                                out.malformed = true;
+                            } else {
+                                out.calls.append(&mut calls);
+                            }
+                        }
                         Err(()) => out.malformed = true,
                     }
                 }
@@ -347,6 +353,66 @@ fn parse_parameters_lenient(body: &str) -> Value {
     Value::Object(map)
 }
 
+/// Native or XML `arguments` that swallowed the rest of the generation:
+/// a think closer as its own line, or a new `<tool_call>` / `<function=` after
+/// a real parameter. Quoted greps like `grep "</think>"` stay one line and
+/// pass. `write` / `edit` bodies may cite the tags; those tools are skipped.
+pub(super) fn calls_leak_channel_markup(calls: &[ToolCall]) -> bool {
+    calls.iter().any(call_leaks_channel_markup)
+}
+
+fn call_leaks_channel_markup(call: &ToolCall) -> bool {
+    if matches!(call.name.as_str(), "write" | "edit") {
+        return false;
+    }
+    value_leaks_channel_markup(&call.arguments)
+}
+
+fn value_leaks_channel_markup(v: &Value) -> bool {
+    match v {
+        Value::String(s) => string_leaks_channel_markup(s),
+        Value::Array(a) => a.iter().any(value_leaks_channel_markup),
+        Value::Object(m) => m.values().any(value_leaks_channel_markup),
+        _ => false,
+    }
+}
+
+fn string_leaks_channel_markup(s: &str) -> bool {
+    let mut seen_payload = false;
+    for line in s.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if is_think_line(t) {
+            return true;
+        }
+        if seen_payload && is_tool_xml_line(t) {
+            return true;
+        }
+        if !is_tool_xml_line(t) {
+            seen_payload = true;
+        }
+    }
+    false
+}
+
+fn is_think_line(t: &str) -> bool {
+    t == "<think>" || t == "</think>"
+}
+
+fn is_tool_xml_line(t: &str) -> bool {
+    t.starts_with("<tool_call>")
+        || t.starts_with("<tool_calls>")
+        || t.starts_with("</tool_call")
+        || t.starts_with("<tool_result")
+        || t.starts_with("</tool_result")
+        || t.starts_with("<function=")
+        || t == "</function>"
+        || t.starts_with("<parameter=")
+        || t == "</parameter>"
+}
+
 fn coerce_param(raw: &str) -> Value {
     if (raw.starts_with('{') && raw.ends_with('}')) || (raw.starts_with('[') && raw.ends_with(']'))
     {
@@ -591,5 +657,54 @@ y
         assert_eq!(x.calls.len(), 1);
         assert_eq!(x.calls[0].name, "bash");
         assert_eq!(x.calls[0].arguments["command"], "ls");
+    }
+
+    #[test]
+    fn think_close_swallowed_into_bash_is_parse_fail() {
+        let content = "\
+<tool_call>
+<function=bash>
+<parameter=command>
+cd /Users/william/q-harness
+</think>
+
+<tool_call>
+<function=bash>
+<parameter=command>
+cd /Users/william/q-harness && grep -n \"extract_xml_tools\" crates/q38-loop/src
+</parameter>
+</function>
+</tool_call>";
+        let x = extract_xml_tools(content);
+        assert!(x.parse_fail(false));
+        assert!(x.calls.is_empty());
+    }
+
+    #[test]
+    fn quoted_think_tag_in_grep_is_not_a_leak() {
+        let content = "\
+<tool_call>
+<function=bash>
+<parameter=command>
+grep -n \"</think>\" crates/q38-loop/src/agent/delta.rs
+</parameter>
+</function>
+</tool_call>";
+        let x = extract_xml_tools(content);
+        assert!(!x.parse_fail(false));
+        assert_eq!(x.calls.len(), 1);
+        assert!(x.calls[0].arguments["command"]
+            .as_str()
+            .unwrap()
+            .contains("</think>"));
+    }
+
+    #[test]
+    fn write_body_may_cite_tool_markup() {
+        let content = r#"<tool_call>{"name":"write","arguments":{"path":"t.rs","contents":"</think>\n\n<tool_call>\n<function=bash>\n"}}</tool_call>"#;
+        let x = extract_xml_tools(content);
+        assert!(!x.parse_fail(false));
+        assert_eq!(x.calls.len(), 1);
+        assert_eq!(x.calls[0].name, "write");
     }
 }
