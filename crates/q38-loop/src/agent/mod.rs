@@ -78,6 +78,8 @@ pub enum ToolSet {
     #[default]
     Agent,
     Code,
+    /// SaaS / Chat: `web` search-and-fetch only (no bash / write).
+    Web,
 }
 
 #[derive(Clone, Debug)]
@@ -92,7 +94,8 @@ pub struct ModelTurn {
     pub parse_fail: bool,
     /// Prefix cache hits. `None` if the engine omitted the field.
     pub cached_tokens: Option<u64>,
-    /// llama.cpp `timings.predicted_per_second` (decode tok/s). `None` if omitted.
+    /// llama.cpp `timings.predicted_per_second` (decode tok/s), else HTTP
+    /// wall-clock over streamed completion tokens. `None` if omitted.
     pub decode_tok_s: Option<f64>,
 }
 
@@ -2503,6 +2506,13 @@ fn bind_periphery(
             t
         }
         ToolSet::Code => code_tools(),
+        ToolSet::Web => {
+            if opts.web.enabled {
+                vec![crate::tools_schema::web_tool()]
+            } else {
+                Vec::new()
+            }
+        }
     };
     if extra_tools {
         if memory.is_some() {
@@ -6151,6 +6161,31 @@ is byte-stable and tools stay frozen. Wiring of skills and mcp is a hidden-card 
         assert!(names.contains(&"search"));
         assert!(names.contains(&"view"));
         assert!(!names.contains(&"memory_search"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn web_set_is_search_only() {
+        let dir =
+            std::env::temp_dir().join(format!("q38-webset-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut o = opts(&dir);
+        o.tool_set = ToolSet::Web;
+        o.web.enabled = true;
+        o.peripheral = true;
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([turn_text("done")])),
+            meter: false,
+        };
+        let agent = Agent::new(scripted, o).unwrap();
+        let names: Vec<_> = agent
+            .tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["web"]);
+        assert!(!names.contains(&"bash"));
+        assert!(!names.contains(&"write"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -33,11 +33,18 @@ pub fn build_chat_body(spec: &ChatRequestSpec<'_>) -> Value {
     let mut root = Map::new();
 
     insert(&mut root, "model", Value::String(spec.model.to_string()));
-    let msgs: Vec<Value> = spec
+    let mut msgs: Vec<Value> = spec
         .messages
         .iter()
         .map(ChatMessage::to_api_value)
         .collect();
+    // llama.cpp Unsloth Jinja iterates `arguments` as an object. vLLM (and
+    // OpenAI-schema engines) reject that with HTTP 400 — they want a string.
+    if openai_string_tool_args(profile) {
+        for msg in &mut msgs {
+            stringify_tool_arguments(msg);
+        }
+    }
     insert(&mut root, "messages", Value::Array(msgs));
     insert(&mut root, "stream", Value::Bool(spec.stream));
     if spec.stream {
@@ -104,6 +111,28 @@ fn insert_local_sampling(map: &mut Map<String, Value>, s: &Sampling) {
     insert(map, "top_k", json!(s.top_k));
     insert(map, "min_p", json!(s.min_p));
     insert(map, "repetition_penalty", json!(s.repetition_penalty));
+}
+
+fn openai_string_tool_args(profile: EngineProfile) -> bool {
+    matches!(
+        profile,
+        EngineProfile::Vllm | EngineProfile::Sglang | EngineProfile::Generic
+    )
+}
+
+fn stringify_tool_arguments(msg: &mut Value) {
+    let Some(calls) = msg.get_mut("tool_calls").and_then(|c| c.as_array_mut()) else {
+        return;
+    };
+    for call in calls {
+        let Some(args) = call.pointer_mut("/function/arguments") else {
+            continue;
+        };
+        if args.is_string() {
+            continue;
+        }
+        *args = Value::String(args.to_string());
+    }
 }
 
 fn insert_kwargs_object(map: &mut Map<String, Value>, key: &str, kwargs: &TemplateKwargs) {
@@ -210,6 +239,58 @@ mod tests {
             body["chat_template_kwargs"]["preserve_thinking"],
             json!(true)
         );
+        assert!(asst["tool_calls"][0]["function"]["arguments"].is_object());
+    }
+
+    fn tool_hop_msgs() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::user("fix it"),
+            ChatMessage::assistant_reply(
+                None,
+                Some("The user wants a fix.".into()),
+                Some(vec![json!({
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": {"path": "a.rs"}}
+                })]),
+            ),
+        ]
+    }
+
+    #[test]
+    fn vllm_stringifies_tool_arguments() {
+        let mut caps = EndpointCaps::qwen38_llamacpp();
+        caps.profile = EngineProfile::Vllm;
+        let policy = ThinkPolicy::agent_default();
+        let msgs = tool_hop_msgs();
+        let body = build_chat_body(&spec(&caps, &policy, &msgs, None));
+        let args = &body["messages"][1]["tool_calls"][0]["function"]["arguments"];
+        assert!(args.is_string(), "{args}");
+        assert_eq!(args.as_str().unwrap(), r#"{"path":"a.rs"}"#);
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn sglang_and_generic_also_stringify_tool_arguments() {
+        let policy = ThinkPolicy::agent_default();
+        let msgs = tool_hop_msgs();
+        for profile in [EngineProfile::Sglang, EngineProfile::Generic] {
+            let caps = EndpointCaps::for_family(Family::Qwen38, profile);
+            let body = build_chat_body(&spec(&caps, &policy, &msgs, None));
+            let args = &body["messages"][1]["tool_calls"][0]["function"]["arguments"];
+            assert!(args.is_string(), "{profile:?} {args}");
+            assert_eq!(args.as_str().unwrap(), r#"{"path":"a.rs"}"#);
+        }
+    }
+
+    #[test]
+    fn llamacpp_keeps_tool_argument_objects() {
+        let caps = EndpointCaps::qwen38_llamacpp();
+        let policy = ThinkPolicy::agent_default();
+        let msgs = tool_hop_msgs();
+        let body = build_chat_body(&spec(&caps, &policy, &msgs, None));
+        let args = &body["messages"][1]["tool_calls"][0]["function"]["arguments"];
+        assert_eq!(args, &json!({"path": "a.rs"}));
     }
 
     #[test]

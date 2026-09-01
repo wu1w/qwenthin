@@ -245,7 +245,8 @@ pub struct AssistantEvent {
     /// or llama.cpp `timings.cache_n`). `None` = the endpoint did not report it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u64>,
-    /// llama.cpp `timings.predicted_per_second`. Weighted into the turn footer.
+    /// Decode tok/s: llama.cpp `timings.predicted_per_second`, else wall-clock
+    /// over the streamed completion (vLLM has no timings object).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decode_tok_s: Option<f64>,
 }

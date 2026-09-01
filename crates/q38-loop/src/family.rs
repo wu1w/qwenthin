@@ -307,4 +307,32 @@ mod tests {
         assert!(Family::Qwen35.effort_values().is_empty());
         assert!(Family::Qwen36.effort_values().is_empty());
     }
+
+    #[test]
+    fn engine_detect_uses_owned_by() {
+        assert_eq!(
+            EngineProfile::detect(
+                "https://llm.example.com/v1",
+                "Qwen3.8-27B-W8A8",
+                Some("vllm")
+            ),
+            EngineProfile::Vllm
+        );
+        assert_eq!(
+            EngineProfile::detect(
+                "https://llm.example.com/v1",
+                "Qwen3.8-27B-UD-Q8",
+                Some("llamacpp")
+            ),
+            EngineProfile::LlamaCpp
+        );
+        assert_eq!(
+            EngineProfile::Auto.resolve(
+                "https://llm.example.com/v1",
+                "Qwen3.8-27B-W8A8",
+                Some("vllm")
+            ),
+            EngineProfile::Vllm
+        );
+    }
 }

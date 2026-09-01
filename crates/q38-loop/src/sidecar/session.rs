@@ -475,7 +475,7 @@ impl SidecarSession {
     pub fn refresh_surface(&mut self) {
         let home = self.agent_home();
         let (_, tools) = match self.mode {
-            SessionMode::Chat => (String::new(), Vec::new()),
+            SessionMode::Chat => (String::new(), crate::tools_schema::web_only_tools()),
             SessionMode::Code => (String::new(), code_tools()),
             SessionMode::Agent | SessionMode::Think => sidecar_agent_surface(
                 &self.workspace.display().to_string(),
@@ -486,9 +486,6 @@ impl SidecarSession {
         self.tools = tools;
         if matches!(self.mode, SessionMode::Code) {
             self.tools = code_tools();
-        }
-        if matches!(self.mode, SessionMode::Chat) {
-            self.tools.clear();
         }
         self.sync_ask();
     }

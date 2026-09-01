@@ -39,8 +39,13 @@ pub async fn execute_turn(
     opts.agents_md_head = agents_md_head;
     match req.snapshot.mode {
         SessionMode::Chat => {
-            opts.with_tools = false;
-            opts.tool_set = ToolSet::None;
+            if cfg.web.enabled {
+                opts.with_tools = true;
+                opts.tool_set = ToolSet::Web;
+            } else {
+                opts.with_tools = false;
+                opts.tool_set = ToolSet::None;
+            }
         }
         SessionMode::Code => {
             opts.with_tools = true;

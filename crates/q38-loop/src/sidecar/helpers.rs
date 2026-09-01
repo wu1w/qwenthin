@@ -12,7 +12,7 @@ use crate::prompt::{coding_prompt, periphery_section, session_prompt};
 use crate::session::{tools_hash, SessionMode, SessionStart, SlashCmd};
 use crate::skills::SkillCatalog;
 use crate::tools_schema::{
-    agent_tools, code_tools, mcp_tool, memory_search_tool, search_tool, view_tool,
+    agent_tools, code_tools, mcp_tool, memory_search_tool, search_tool, view_tool, web_only_tools,
 };
 
 use super::types::{PolicyCaps, RpcError};
@@ -98,7 +98,7 @@ pub(crate) fn make_start(
         .or_else(|| Config::home_dir().ok());
     let home = home_buf.as_deref();
     let (system, tools) = match mode {
-        SessionMode::Chat => (coding_prompt(&ws), Vec::new()),
+        SessionMode::Chat => (coding_prompt(&ws), web_only_tools()),
         SessionMode::Code => (coding_prompt(&ws), code_tools()),
         SessionMode::Agent | SessionMode::Think => sidecar_agent_surface(&ws, workspace, home),
     };

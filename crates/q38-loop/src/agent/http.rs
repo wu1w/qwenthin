@@ -9,6 +9,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -43,13 +44,16 @@ pub struct HttpCompleter {
 impl HttpCompleter {
     pub async fn connect(cfg: &Config, policy: ThinkPolicy) -> Result<Self> {
         let client = crate::llm_http::stream_client(cfg)?;
-        let (model, owned) = match configured_chat_model(cfg) {
-            Some(model) => (model, None),
-            None => {
-                // GET /models must not inherit the 30-minute stream timeout.
-                let probe = crate::llm_http::probe_client(cfg.server.connect_timeout_s.min(5), 15)?;
-                fetch_model(&probe, cfg).await?
-            }
+        // Always GET /models for `owned_by` so Auto can tell vLLM from llama.cpp
+        // even when `server.model` is already set. Fall back to the configured
+        // id if the catalog is down.
+        let probe = crate::llm_http::probe_client(cfg.server.connect_timeout_s.min(5), 15)?;
+        let (model, owned) = match fetch_model(&probe, cfg).await {
+            Ok(pair) => pair,
+            Err(e) => match configured_chat_model(cfg) {
+                Some(model) => (model, None),
+                None => return Err(e),
+            },
         };
         let caps = caps_for(cfg, &model, owned.as_deref());
         let total_slots = if should_probe_slots(caps.profile) {
@@ -128,7 +132,17 @@ impl HttpCompleter {
         if !self.api_key.is_empty() {
             req = req.bearer_auth(&self.api_key);
         }
-        Ok(req.send().await?.error_for_status()?)
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            let clip: String = text.chars().take(800).collect();
+            return Err(Error::Http(format!(
+                "HTTP status client error ({status}) for url ({}): {clip}",
+                self.url
+            )));
+        }
+        Ok(resp)
     }
 }
 
@@ -146,6 +160,7 @@ impl Completer for HttpCompleter {
             None
         };
         let stream = sink.is_some() || watchdog.is_some();
+        let started = Instant::now();
         let mut resp = self.post(messages, tools, stream).await?;
         if stream {
             let ct = resp
@@ -155,7 +170,8 @@ impl Completer for HttpCompleter {
                 .unwrap_or("");
             if ct.contains("application/json") {
                 let v: Value = resp.json().await?;
-                let turn = turn_from_json(&v, false)?;
+                let mut turn = turn_from_json(&v, false)?;
+                apply_wall_decode(&mut turn, started);
                 paint_clean(sink, &turn);
                 return Ok(turn);
             }
@@ -169,7 +185,8 @@ impl Completer for HttpCompleter {
             }
         }
         let v: Value = resp.json().await?;
-        let turn = turn_from_json(&v, false)?;
+        let mut turn = turn_from_json(&v, false)?;
+        apply_wall_decode(&mut turn, started);
         paint_clean(sink, &turn);
         Ok(turn)
     }
@@ -210,21 +227,52 @@ impl Completer for HttpCompleter {
 }
 
 fn caps_for(cfg: &Config, model: &str, owned: Option<&str>) -> EndpointCaps {
-    if let Ok(path) = Config::probe_path() {
-        if let Ok(raw) = std::fs::read_to_string(path) {
-            if let Ok(report) = serde_json::from_str::<ProbeReport>(&raw) {
-                if report.red.is_empty() {
-                    return report.to_caps();
-                }
-            }
-        }
-    }
     let family = cfg.server.family.resolve(model);
-    let profile = cfg
+    let live = cfg
         .server
         .profile
         .resolve(&cfg.server.base_url, model, owned);
-    EndpointCaps::for_family(family, profile)
+    let mut caps = if let Ok(path) = Config::probe_path() {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<ProbeReport>(&raw).ok())
+            .filter(|r| r.red.is_empty())
+            .map(|r| r.to_caps())
+            .unwrap_or_else(|| EndpointCaps::for_family(family, live))
+    } else {
+        EndpointCaps::for_family(family, live)
+    };
+    overlay_live_engine(
+        &mut caps,
+        cfg.server.profile,
+        cfg.server.family,
+        family,
+        live,
+    );
+    caps
+}
+
+/// Probe.json is a capability cache, not the live engine. A leftover
+/// `llamacpp` report must not keep sending Unsloth object-args after the
+/// gateway switches to vLLM (`owned_by=vllm`).
+fn overlay_live_engine(
+    caps: &mut EndpointCaps,
+    cfg_profile: EngineProfile,
+    cfg_family: Family,
+    family: Family,
+    live: EngineProfile,
+) {
+    if cfg_profile != EngineProfile::Auto {
+        caps.profile = cfg_profile;
+    } else if matches!(
+        live,
+        EngineProfile::Vllm | EngineProfile::Sglang | EngineProfile::LlamaCpp
+    ) {
+        caps.profile = live;
+    }
+    if cfg_family != Family::Auto {
+        caps.family = family;
+    }
 }
 
 fn configured_chat_model(cfg: &Config) -> Option<String> {
@@ -497,6 +545,7 @@ pub fn parse_completion_tokens(v: &Value) -> u64 {
 }
 
 /// llama.cpp `timings.predicted_per_second`, else `predicted_n / predicted_ms`.
+/// vLLM has no timings object; the HTTP layer fills tok/s from wall clock.
 pub fn parse_decode_tok_s(v: &Value) -> Option<f64> {
     let direct = v
         .pointer("/timings/predicted_per_second")
@@ -514,6 +563,23 @@ pub fn parse_decode_tok_s(v: &Value) -> Option<f64> {
     }
 }
 
+fn decode_tok_s_from_secs(completion: u64, secs: f64) -> Option<f64> {
+    let n = completion as f64;
+    if n < 1.0 || !secs.is_finite() || secs < 0.02 {
+        return None;
+    }
+    let rate = n / secs;
+    (rate.is_finite() && rate > 0.0).then_some(rate)
+}
+
+fn apply_wall_decode(turn: &mut ModelTurn, started: Instant) {
+    if turn.decode_tok_s.is_some() {
+        return;
+    }
+    turn.decode_tok_s =
+        decode_tok_s_from_secs(turn.completion_tokens, started.elapsed().as_secs_f64());
+}
+
 fn json_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Number(n) => n.as_f64(),
@@ -522,11 +588,14 @@ fn json_f64(v: &Value) -> Option<f64> {
     }
 }
 
-/// OpenAI `prompt_tokens_details.cached_tokens`, llama.cpp `timings.cache_n`.
+/// OpenAI / vLLM `prompt_tokens_details.cached_tokens`, llama.cpp `timings.cache_n`.
 pub fn parse_cached_tokens(v: &Value) -> Option<u64> {
     let n = pointer_u64(v, "/usage/prompt_tokens_details/cached_tokens")
+        .or_else(|| pointer_u64(v, "/usage/prompt_tokens_details/num_cached_tokens"))
         .or_else(|| pointer_u64(v, "/usage/cached_tokens"))
+        .or_else(|| pointer_u64(v, "/usage/num_cached_tokens"))
         .or_else(|| pointer_u64(v, "/usage/cache_n"))
+        .or_else(|| pointer_u64(v, "/num_cached_tokens"))
         .or_else(|| pointer_u64(v, "/timings/cache_n"));
     let prompt = parse_prompt_tokens(v);
     n.map(|c| if prompt > 0 { c.min(prompt) } else { c })
@@ -640,6 +709,10 @@ impl StreamAcc {
             cached_tokens: None,
             timings: None,
         }
+    }
+
+    fn has_visible_output(&self) -> bool {
+        !self.content.is_empty() || !self.reasoning.is_empty() || !self.tool_calls.is_empty()
     }
 
     fn apply(&mut self, chunk: &Value) {
@@ -774,6 +847,7 @@ async fn read_sse(
     let mut paint = sink.map(StreamPaint::new);
     let mut sse = SseBuf::default();
     let mut pending = Vec::new();
+    let mut decode_started: Option<Instant> = None;
     loop {
         let chunk = match resp.chunk().await {
             Ok(Some(bytes)) => bytes,
@@ -796,6 +870,9 @@ async fn read_sse(
                 return Err(Error::Http(err.to_string()));
             }
             acc.apply(&event);
+            if decode_started.is_none() && acc.has_visible_output() {
+                decode_started = Some(Instant::now());
+            }
             if let Some(p) = paint.as_mut() {
                 p.push_raw(&acc.reasoning, &acc.content, !acc.tool_calls.is_empty());
             }
@@ -810,6 +887,9 @@ async fn read_sse(
             return Err(Error::Http(err.to_string()));
         }
         acc.apply(&event);
+        if decode_started.is_none() && acc.has_visible_output() {
+            decode_started = Some(Instant::now());
+        }
         if let Some(p) = paint.as_mut() {
             p.push_raw(&acc.reasoning, &acc.content, !acc.tool_calls.is_empty());
         }
@@ -817,7 +897,11 @@ async fn read_sse(
             return Err(Error::Watchdog);
         }
     }
-    turn_from_json(&acc.into_message_json(), false)
+    let mut turn = turn_from_json(&acc.into_message_json(), false)?;
+    if let Some(t0) = decode_started {
+        apply_wall_decode(&mut turn, t0);
+    }
+    Ok(turn)
 }
 
 fn watchdog_hit(family: Family, cap: Option<u32>, acc: &StreamAcc) -> bool {
@@ -920,6 +1004,47 @@ fn parse_sse_event(raw: &str) -> Option<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stale_llamacpp_probe_yields_to_vllm_owned_by() {
+        let mut caps = EndpointCaps::qwen38_llamacpp();
+        overlay_live_engine(
+            &mut caps,
+            EngineProfile::Auto,
+            Family::Auto,
+            Family::Qwen38,
+            EngineProfile::Vllm,
+        );
+        assert_eq!(caps.profile, EngineProfile::Vllm);
+        assert_eq!(caps.family, Family::Qwen38);
+        assert!(caps.preserve_thinking);
+    }
+
+    #[test]
+    fn explicit_profile_wins_over_live_detect() {
+        let mut caps = EndpointCaps::qwen38_llamacpp();
+        overlay_live_engine(
+            &mut caps,
+            EngineProfile::LlamaCpp,
+            Family::Auto,
+            Family::Qwen38,
+            EngineProfile::Vllm,
+        );
+        assert_eq!(caps.profile, EngineProfile::LlamaCpp);
+    }
+
+    #[test]
+    fn generic_live_keeps_probe_llamacpp() {
+        let mut caps = EndpointCaps::qwen38_llamacpp();
+        overlay_live_engine(
+            &mut caps,
+            EngineProfile::Auto,
+            Family::Auto,
+            Family::Qwen38,
+            EngineProfile::Generic,
+        );
+        assert_eq!(caps.profile, EngineProfile::LlamaCpp);
+    }
 
     #[test]
     fn parses_openai_tool_call() {
@@ -1337,6 +1462,32 @@ mod tests {
         });
         let rate = parse_turn(&from_ms).unwrap().turn.decode_tok_s.unwrap();
         assert!((rate - 40.0).abs() < 1e-6, "{rate}");
+
+        assert_eq!(decode_tok_s_from_secs(80, 2.0), Some(40.0));
+        assert_eq!(decode_tok_s_from_secs(0, 2.0), None);
+        assert_eq!(decode_tok_s_from_secs(80, 0.001), None);
+        let mut timed = parse_turn(&with_rate).unwrap().turn;
+        apply_wall_decode(&mut timed, Instant::now());
+        assert_eq!(timed.decode_tok_s, Some(40.0), "engine timings win");
+
+        let vllm_cache = json!({
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 8,
+                "num_cached_tokens": 70
+            }
+        });
+        assert_eq!(parse_cached_tokens(&vllm_cache), Some(70));
+        assert_eq!(
+            parse_cached_tokens(&json!({
+                "usage": {
+                    "prompt_tokens": 50,
+                    "prompt_tokens_details": {"num_cached_tokens": 40}
+                }
+            })),
+            Some(40)
+        );
 
         let mut acc = StreamAcc::new();
         acc.apply(&json!({"choices":[{"delta":{"content":"3"}}]}));

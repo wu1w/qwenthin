@@ -75,6 +75,11 @@ pub fn web_tool() -> Value {
     parse(WEB)
 }
 
+/// Chat / SaaS local: search and fetch only.
+pub fn web_only_tools() -> Vec<Value> {
+    vec![web_tool()]
+}
+
 /// Session-level; append when `/plan` or `/clarify` is on. Do not splice into
 /// [`agent_tools`].
 pub fn ask_tool() -> Value {
@@ -154,6 +159,9 @@ mod tests {
         assert_eq!(serde_json::to_string(&view_tool()).unwrap(), VIEW);
         assert_eq!(serde_json::to_string(&search_tool()).unwrap(), SEARCH);
         assert_eq!(serde_json::to_string(&web_tool()).unwrap(), WEB);
+        let web_only = web_only_tools();
+        assert_eq!(web_only.len(), 1);
+        assert_eq!(web_only[0]["function"]["name"], "web");
         assert_eq!(serde_json::to_string(&ask_tool()).unwrap(), ASK);
         assert!(!has_tool(&tools, "ask"));
         assert!(!has_tool(&tools, "memory_search"));
