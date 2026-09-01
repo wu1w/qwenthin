@@ -10,7 +10,10 @@
 //!    think gets one wrap-up hop so Flash-Next cannot park the answer in
 //!    `reasoning_content` and go silent.
 //!
-//! Parse failures and think-cap hits retry the same messages (kwargs only).
+//! Parse failures retry the same messages (kwargs only). A think-cap hit
+//! keeps the partial stream (pi `stopReason=length`): truncated tool calls
+//! are failed, not executed; an empty cap after tools gets one wrap-up hop
+//! instead of using the last tool narration as the answer.
 //! Trajectory detectors (doom / name / path / stutter / dump) inject one
 //! hidden observation and then stay silent. Step, time, and context budgets
 //! get the same treatment: one wrap-up hop, then a quiet finish that keeps
@@ -503,6 +506,12 @@ pub struct Agent<C> {
     silent_tool_hops: u32,
     /// Flash-Next silent-tool streak already received one style observation.
     silent_tool_nudged: bool,
+    /// Consecutive think-cap / length-truncated hops this user turn (pi #8111).
+    length_truncations: u32,
+    /// Any tool batch was committed this user turn (executed or failed-truncated).
+    tools_this_turn: bool,
+    /// One roomy think-cap retry already ran this user turn.
+    watchdog_roomy_tried: bool,
 }
 
 impl<C: Completer> Agent<C> {
@@ -676,6 +685,9 @@ impl<C: Completer> Agent<C> {
             connect_hinted: AtomicBool::new(false),
             silent_tool_hops: 0,
             silent_tool_nudged: false,
+            length_truncations: 0,
+            tools_this_turn: false,
+            watchdog_roomy_tried: false,
         })
     }
 
@@ -750,6 +762,9 @@ impl<C: Completer> Agent<C> {
         self.connect_hinted.store(false, Ordering::Relaxed);
         self.silent_tool_hops = 0;
         self.silent_tool_nudged = false;
+        self.length_truncations = 0;
+        self.tools_this_turn = false;
+        self.watchdog_roomy_tried = false;
         self.last_spoken = None;
         self.last_essay = None;
         self.read_paths.clear();
@@ -804,31 +819,52 @@ impl<C: Completer> Agent<C> {
             prompt_tokens += turn.prompt_tokens;
             completion_tokens += turn.completion_tokens;
 
-            if turn.watchdog_hit {
-                // A cap hit is evidence of a runaway trajectory, not evidence
-                // that thinking itself should be disabled. Give the model one
-                // concise side observation and more room to choose a course.
+            if turn.watchdog_hit
+                && turn.tool_calls.is_empty()
+                && !crate::stutter::is_substantial_reply(&turn.content)
+                && !self.watchdog_roomy_tried
+            {
+                // Think-only cap: one roomy retry (unchanged). Partial tools
+                // skip this and fail-not-execute below (pi length).
+                self.watchdog_roomy_tried = true;
                 self.note("[watchdog] think cap; soft nudge and one roomy retry");
                 self.push_hidden_user(THINK_DIVERGENCE_NOTE);
-                let widened = self.retry_with_runaway_room(tools).await;
+                let widened = self.retry_with_runaway_room(tools).await?;
                 if self.cancel.is_cancelled() {
                     return self.finish(String::new(), Some("aborted".into()), steps);
                 }
-                match widened {
-                    Some(t) => {
-                        steps += 1;
-                        prompt_tokens += t.prompt_tokens;
-                        completion_tokens += t.completion_tokens;
-                        if !t.watchdog_hit || !t.content.is_empty() || !t.tool_calls.is_empty() {
-                            turn = t;
-                        }
-                    }
-                    None => {}
+                if let Some(t) = widened {
+                    steps += 1;
+                    prompt_tokens += t.prompt_tokens;
+                    completion_tokens += t.completion_tokens;
+                    turn = t;
                 }
-                if turn.watchdog_hit && turn.content.is_empty() && turn.tool_calls.is_empty() {
-                    self.mark_clean();
-                    return self.finish(self.last_spoken.clone().unwrap_or_default(), None, steps);
+            }
+
+            if turn.watchdog_hit {
+                self.length_truncations = self.length_truncations.saturating_add(1);
+                if self.length_truncations >= LENGTH_TRUNCATION_ABORT {
+                    return self.finish_cap_exhausted(steps);
                 }
+                if !turn.tool_calls.is_empty() {
+                    // pi: length-truncated tool args may salvage-parse; none are safe.
+                    self.note("[watchdog] length; fail truncated tool calls");
+                    self.push_assistant(&turn);
+                    self.fail_truncated_tools(std::mem::take(&mut turn.tool_calls));
+                    continue;
+                }
+                if crate::stutter::is_substantial_reply(&turn.content) {
+                    self.push_assistant(&turn);
+                    self.last_spoken = Some(turn.content.clone());
+                    return self.finish(turn.content, None, steps);
+                }
+                if self.tools_this_turn && !self.channel_nudged {
+                    self.channel_nudged = true;
+                    self.note("[watchdog] think cap; one wrap-up after tools");
+                    self.push_hidden_user(EMPTY_CHANNEL_NOTE);
+                    continue;
+                }
+                return self.finish_cap_exhausted(steps);
             }
 
             if !turn.reasoning.is_empty() && self.print && !self.stdio.think_streamed() {
@@ -1258,6 +1294,7 @@ impl<C: Completer> Agent<C> {
     }
 
     async fn execute_tools(&mut self, calls: Vec<ToolCall>) {
+        self.tools_this_turn = true;
         for call in &calls {
             self.note(&format!("[{}] {}", call.name, preview_args(call)));
         }
@@ -1336,6 +1373,22 @@ impl<C: Completer> Agent<C> {
             self.sync_effort(PolicyReason::Upgrade);
         }
         self.inject_skill_from_tools(&fail_blob);
+    }
+
+    fn fail_truncated_tools(&mut self, calls: Vec<ToolCall>) {
+        self.tools_this_turn = true;
+        for call in calls {
+            let name = if call.name.is_empty() {
+                "unknown"
+            } else {
+                call.name.as_str()
+            };
+            self.note(&format!("[{name}] skipped truncated"));
+            self.commit_tool(
+                name,
+                ToolResponse::text(&call.id, LENGTH_TRUNCATED_TOOL, ToolState::Error),
+            );
+        }
     }
 
     fn defer_divergent_tools(&mut self, calls: Vec<ToolCall>) {
@@ -1950,20 +2003,16 @@ impl<C: Completer> Agent<C> {
 
     /// After a true think-cap hit, preserve the model's selected reasoning mode
     /// and give it one wider retry. The hidden trajectory note is injected by
-    /// the caller; a second cap hit is a hard resource exhaustion, not a signal
-    /// to replace the model's choice with a thinking-off answer.
-    async fn retry_with_runaway_room(&self, tools: Option<&[Value]>) -> Option<ModelTurn> {
+    /// the caller. HTTP errors propagate (do not look like an empty stop).
+    async fn retry_with_runaway_room(&self, tools: Option<&[Value]>) -> Result<Option<ModelTurn>> {
         let Some(prev) = self.completer.policy() else {
-            self.arm_sink();
-            let retry = tokio::select! {
-                biased;
-                _ = self.cancel.cancelled() => None,
-                turn = self.completer.complete(&self.messages, tools) => turn.ok(),
-            };
-            return retry.filter(|t| !t.watchdog_hit && !t.parse_fail);
+            return Ok(self
+                .complete_resilient(tools)
+                .await?
+                .filter(|t| !t.parse_fail));
         };
         if !prev.enabled {
-            return None;
+            return Ok(None);
         }
         let mut raised = prev.clone();
         raised.max_think_tokens = raised.max_think_tokens.max(NO_TOOL_THINK_FLOOR);
@@ -1971,14 +2020,9 @@ impl<C: Completer> Agent<C> {
             .max_tokens
             .max(raised.max_think_tokens + NO_TOOL_ANSWER_RESERVE);
         self.completer.set_policy(raised);
-        self.arm_sink();
-        let retry = tokio::select! {
-            biased;
-            _ = self.cancel.cancelled() => None,
-            turn = self.completer.complete(&self.messages, tools) => turn.ok(),
-        };
+        let retry = self.complete_resilient(tools).await;
         self.completer.set_policy(prev);
-        retry.filter(|t| !t.watchdog_hit && !t.parse_fail)
+        Ok(retry?.filter(|t| !t.parse_fail))
     }
 
     fn last_real_user(&self) -> &str {
@@ -2057,6 +2101,24 @@ impl<C: Completer> Agent<C> {
             pending_steer: take_steer(&self.steer),
             streamed_text: self.stdio.text_streamed(),
         })
+    }
+
+    /// Think-cap exhaustion: never substitute a tool-hop narration (`last_essay`)
+    /// for a missing answer. A locked `last_spoken` delivery is still kept.
+    fn finish_cap_exhausted(&mut self, steps: u32) -> Result<AgentOutcome> {
+        self.mark_clean();
+        let text = self
+            .last_spoken
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| crate::stutter::is_substantial_reply(s))
+            .unwrap_or("")
+            .to_string();
+        if text.is_empty() {
+            self.finish(EMPTY_STOP_FALLBACK.to_string(), None, steps)
+        } else {
+            self.finish(text, None, steps)
+        }
     }
 
     fn compact_if_needed(&mut self) -> Option<String> {
@@ -2587,6 +2649,14 @@ const NO_TOOL_ANSWER_RESERVE: u32 = 4096;
 /// converge once it has one concrete observation about its trajectory.
 const THINK_DIVERGENCE_NOTE: &str = "[trajectory] 本轮思考已触及长度预算，可能开始发散。\
 先压缩当前已知事实和未决问题；若证据已足够就作答或执行，若仍缺关键证据只补最小的一步。";
+
+/// pi: tool calls on a length-truncated assistant message are not executed.
+const LENGTH_TRUNCATED_TOOL: &str =
+    "Tool call was not executed: the response hit the think/output \
+token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.";
+
+/// Consecutive think-cap hops before giving up (pi agent-loop #8111).
+const LENGTH_TRUNCATION_ABORT: u32 = 3;
 
 /// One wrap-up hop when a physics cap would otherwise tombstone the turn.
 const PHYSICS_WRAP_NOTE: &str = "[trajectory] 本轮已接近步数、时间或上下文上限。\
@@ -4650,6 +4720,126 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
         let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
         let out = agent.run("hi").await.unwrap();
         assert_eq!(out.stop_reason, None);
+        assert_eq!(out.text, EMPTY_STOP_FALLBACK);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn watchdog_after_tools_wraps_up_instead_of_stopping() {
+        let dir =
+            std::env::temp_dir().join(format!("q38-wd-wrap-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("read", json!({"path": "ping.txt"})),
+                ModelTurn::watchdog(),
+                ModelTurn::watchdog(),
+                turn_text("仓库审查结论"),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("read ping.txt then review").await.unwrap();
+        assert_eq!(out.text, "仓库审查结论");
+        assert!(agent.messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains(EMPTY_CHANNEL_NOTE))
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn watchdog_does_not_keep_tool_narration_as_answer() {
+        let dir =
+            std::env::temp_dir().join(format!("q38-wd-essay-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let narration = "请先看完仓库再下结论。".repeat(20);
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_said(&narration, "read", json!({"path": "ping.txt"})),
+                ModelTurn::watchdog(),
+                ModelTurn::watchdog(),
+                ModelTurn::watchdog(),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("read ping.txt then review").await.unwrap();
+        assert_eq!(out.text, EMPTY_STOP_FALLBACK);
+        assert!(
+            !out.text.contains("请先看完仓库"),
+            "tool narration leaked as the answer: {}",
+            out.text
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn watchdog_truncated_tools_are_not_executed() {
+        let dir =
+            std::env::temp_dir().join(format!("q38-wd-len-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("keep.txt"), "safe\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let mut truncated = turn_tool("write", json!({"path": "keep.txt", "contents": "pwned\n"}));
+        truncated.watchdog_hit = true;
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                truncated,
+                turn_text("re-issued without writing"),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("overwrite keep.txt").await.unwrap();
+        assert_eq!(out.text, "re-issued without writing");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("keep.txt")).unwrap(),
+            "safe\n"
+        );
+        let err = agent
+            .messages
+            .iter()
+            .find(|m| m.role == "tool")
+            .and_then(|m| m.content.clone())
+            .unwrap_or_default();
+        assert!(
+            err.contains("not executed") && err.contains("truncated"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn watchdog_truncated_tools_abort_after_bound() {
+        let dir =
+            std::env::temp_dir().join(format!("q38-wd-bound-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        o.max_steps = 12;
+        let mut hops = Vec::new();
+        for _ in 0..LENGTH_TRUNCATION_ABORT {
+            let mut t = turn_tool("read", json!({"path": "missing.txt"}));
+            t.watchdog_hit = true;
+            hops.push(t);
+        }
+        hops.push(turn_text("should-not-run"));
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from(hops)),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("read missing.txt").await.unwrap();
         assert_eq!(out.text, EMPTY_STOP_FALLBACK);
         let _ = std::fs::remove_dir_all(dir);
     }

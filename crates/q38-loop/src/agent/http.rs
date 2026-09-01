@@ -1,12 +1,15 @@
 //! OpenAI-compat chat completion. Same request builder as probe.
 //!
 //! Streams when a token sink is armed (TUI/CLI) or when thinking is on and
-//! `max_think_tokens > 0` so the watchdog can drop the body at the think cap.
+//! `max_think_tokens > 0` so the watchdog can stop at the think cap. A cap
+//! hit keeps the partial SSE (pi `stopReason=length`): the loop may fail
+//! truncated tools instead of discarding the hop.
 //! XML `<tool_call>` is merged with OpenAI `tool_calls` after think-split.
 //! When the native `tool_calls` array is empty, complete XML blocks are also
 //! recovered from `reasoning_content` (QwenPaw `tag_parser` path for local Qwen
 //! that leaks tools into think).
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -877,7 +880,7 @@ async fn read_sse(
                 p.push_raw(&acc.reasoning, &acc.content, !acc.tool_calls.is_empty());
             }
             if watchdog_hit(family, watchdog, &acc) {
-                return Err(Error::Watchdog);
+                return finalize_sse(acc, true, decode_started);
             }
         }
     }
@@ -894,14 +897,60 @@ async fn read_sse(
             p.push_raw(&acc.reasoning, &acc.content, !acc.tool_calls.is_empty());
         }
         if watchdog_hit(family, watchdog, &acc) {
-            return Err(Error::Watchdog);
+            return finalize_sse(acc, true, decode_started);
         }
     }
-    let mut turn = turn_from_json(&acc.into_message_json(), false)?;
+    finalize_sse(acc, false, decode_started)
+}
+
+fn finalize_sse(
+    acc: StreamAcc,
+    watchdog: bool,
+    decode_started: Option<Instant>,
+) -> Result<ModelTurn> {
+    let v = acc.into_message_json();
+    let mut turn = turn_from_json(&v, watchdog)?;
+    if watchdog {
+        turn.watchdog_hit = true;
+        reattach_truncated_tools(&mut turn, &v);
+    }
     if let Some(t0) = decode_started {
         apply_wall_decode(&mut turn, t0);
     }
     Ok(turn)
+}
+
+/// Incomplete JSON args are dropped by truncated parse. Keep named stubs so
+/// the loop can fail them (pi: do not execute a length-truncated batch).
+fn reattach_truncated_tools(turn: &mut ModelTurn, v: &Value) {
+    let Some(arr) = v
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    let mut have: HashSet<String> = turn.tool_calls.iter().map(|c| c.id.clone()).collect();
+    for item in arr {
+        let name = item["function"]["name"].as_str().unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let id = match item["id"].as_str() {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => format!("truncated-{name}"),
+        };
+        if !have.insert(id.clone()) {
+            continue;
+        }
+        turn.tool_calls.push(ToolCall {
+            id,
+            name: name.to_string(),
+            arguments: json!({}),
+        });
+    }
+    if !turn.tool_calls.is_empty() {
+        turn.raw_tool_calls = Some(super::openai_tool_calls(&turn.tool_calls));
+    }
 }
 
 fn watchdog_hit(family: Family, cap: Option<u32>, acc: &StreamAcc) -> bool {
@@ -1521,6 +1570,36 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["choices"][0]["delta"]["content"], "hi");
         assert!(buf.push("data: [DONE]\n\n").is_empty());
+    }
+
+    #[test]
+    fn watchdog_finalize_keeps_partial_and_named_tools() {
+        let mut acc = StreamAcc::new();
+        acc.apply(&json!({
+            "choices": [{
+                "delta": {
+                    "reasoning_content": "long plan",
+                    "content": "here is a start"
+                }
+            }]
+        }));
+        acc.apply(&json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "c1",
+                        "function": {"name": "write", "arguments": "{\"path\":"}
+                    }]
+                }
+            }]
+        }));
+        let turn = finalize_sse(acc, true, None).unwrap();
+        assert!(turn.watchdog_hit);
+        assert!(turn.content.contains("here is a start"));
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "write");
+        assert_eq!(turn.tool_calls[0].id, "c1");
     }
 
     #[test]
