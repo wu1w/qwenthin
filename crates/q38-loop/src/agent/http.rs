@@ -699,6 +699,7 @@ struct StreamAcc {
     completion_tokens: u64,
     cached_tokens: Option<u64>,
     timings: Option<Value>,
+    finish_reason: Option<String>,
 }
 
 impl StreamAcc {
@@ -711,6 +712,7 @@ impl StreamAcc {
             completion_tokens: 0,
             cached_tokens: None,
             timings: None,
+            finish_reason: None,
         }
     }
 
@@ -736,6 +738,9 @@ impl StreamAcc {
         let choice = &chunk["choices"][0];
         if choice.is_null() {
             return;
+        }
+        if let Some(r) = choice["finish_reason"].as_str() {
+            self.finish_reason = Some(r.to_string());
         }
         if choice.get("delta").is_none() {
             if let Some(msg) = choice.get("message") {
@@ -900,6 +905,16 @@ async fn read_sse(
             return finalize_sse(acc, true, decode_started);
         }
     }
+    // A finished generation always terminates with `finish_reason` and/or
+    // `data: [DONE]`. A body that just ends is a gateway/upstream cut
+    // (single-slot engines behind nginx routinely drop queued streams);
+    // accepting the fragment as a normal stop turns one flaky hop into a
+    // silent empty answer. Surface it as transient so the hop retries.
+    if !sse.done && acc.finish_reason.is_none() {
+        return Err(Error::Http(
+            "stream connection closed before completion (no finish_reason)".into(),
+        ));
+    }
     finalize_sse(acc, false, decode_started)
 }
 
@@ -988,6 +1003,9 @@ fn think_blob(reasoning: &str, content: &str) -> String {
 #[derive(Default)]
 struct SseBuf {
     leftover: String,
+    /// A `data: [DONE]` terminator arrived. Absence at body end means the
+    /// connection died mid-stream (gateway cut), not a finished generation.
+    done: bool,
 }
 
 impl SseBuf {
@@ -1002,6 +1020,9 @@ impl SseBuf {
                 2
             };
             self.leftover = self.leftover[idx + skip..].to_string();
+            if sse_event_is_done(&raw) {
+                self.done = true;
+            }
             if let Some(v) = parse_sse_event(&raw) {
                 out.push(v);
             }
@@ -1014,6 +1035,9 @@ impl SseBuf {
             return Vec::new();
         }
         let raw = std::mem::take(&mut self.leftover);
+        if sse_event_is_done(&raw) {
+            self.done = true;
+        }
         parse_sse_event(&raw).into_iter().collect()
     }
 }
@@ -1025,6 +1049,14 @@ fn find_event_break(s: &str) -> Option<usize> {
         (None, Some(b)) => Some(b),
         (None, None) => None,
     }
+}
+
+fn sse_event_is_done(raw: &str) -> bool {
+    raw.lines().any(|line| {
+        line.trim_end_matches('\r')
+            .strip_prefix("data:")
+            .is_some_and(|rest| rest.trim() == "[DONE]")
+    })
 }
 
 fn parse_sse_event(raw: &str) -> Option<Value> {
@@ -1624,5 +1656,69 @@ mod tests {
         assert!(!should_probe_slots(EngineProfile::Generic));
         assert!(!should_probe_slots(EngineProfile::Auto));
         assert!(!should_probe_slots(EngineProfile::Vllm));
+    }
+
+    /// One-shot SSE endpoint: serves `body` after the response headers, then
+    /// closes the socket (no Content-Length; EOF ends the stream).
+    async fn sse_server(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{addr}/v1/chat/completions")
+    }
+
+    #[tokio::test]
+    async fn premature_stream_close_is_transient_error() {
+        // A gateway cutting a queued/streaming request (single-slot vLLM
+        // behind nginx) must not read as a finished, near-empty generation.
+        let url = sse_server(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial think\"}}]}\n\n",
+        )
+        .await;
+        let mut resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let err = read_sse(&mut resp, Family::Qwen38, None, None)
+            .await
+            .expect_err("body cut without finish_reason must error");
+        let msg = err.to_string();
+        assert!(msg.contains("closed before completion"), "{msg}");
+        assert!(crate::llm_http::is_transient(&err), "must retry: {msg}");
+    }
+
+    #[tokio::test]
+    async fn finish_reason_without_done_is_accepted() {
+        let url = sse_server(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        )
+        .await;
+        let mut resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let turn = read_sse(&mut resp, Family::Qwen38, None, None)
+            .await
+            .expect("finish_reason terminates the stream cleanly");
+        assert_eq!(turn.content, "ok");
+        assert!(!turn.watchdog_hit);
+    }
+
+    #[tokio::test]
+    async fn done_marker_without_finish_reason_is_accepted() {
+        let url = sse_server(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let mut resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let turn = read_sse(&mut resp, Family::Qwen38, None, None)
+            .await
+            .expect("[DONE] terminates the stream cleanly");
+        assert_eq!(turn.content, "ok");
     }
 }

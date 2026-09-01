@@ -1,4 +1,19 @@
-//! ReAct agent. Loop shape from QwenPaw `react_agent._reasoning`.
+//! ReAct agent. Loop shape from QwenPaw `react_agent._reasoning`; authority
+//! shape from pi/dsh: a thin shell around a single adjudicator.
+//!
+//! Termination authority lives in exactly three functions:
+//! - `preflight_stop` — supervisor rulings before a model call (deferred gate
+//!   TERMINATE, context budget).
+//! - `adjudicate` — one completed hop in, one `Verdict` out (continue / run
+//!   this tool batch / stop). Every stop-or-rescue policy — watchdog ladder,
+//!   parse repair, stutter, channel promotion, incomplete rescue, dump
+//!   detection, stop gates — rules inside this function and nowhere else.
+//! - `conclude` — the single terminal. Maps a `StopCause` to delivered text
+//!   (delivery → artifact fallback → think salvage → canned line), logs one
+//!   stop event, builds the outcome.
+//!
+//! The `drive` loop itself only runs mechanisms: complete, dispatch verdicts,
+//! execute tools, push queued notes. It makes no rulings.
 //!
 //! Per user turn (`run`):
 //! 1. apply deferred TERMINATE from a previous tool iter (before the model)
@@ -12,12 +27,21 @@
 //!
 //! Parse failures retry the same messages (kwargs only). A think-cap hit
 //! keeps the partial stream (pi `stopReason=length`): truncated tool calls
-//! are failed, not executed; an empty cap after tools gets one wrap-up hop
-//! instead of using the last tool narration as the answer.
-//! Trajectory detectors (doom / name / path / stutter / dump) inject one
-//! hidden observation and then stay silent. Step, time, and context budgets
-//! get the same treatment: one wrap-up hop, then a quiet finish that keeps
-//! the last spoken text. User abort is the only user-visible stop reason.
+//! are failed, not executed, and the cut thought is appended to the
+//! transcript so the next hop continues from it instead of re-deriving.
+//! No completed hop is ever discarded (pi: partial output is still output).
+//!
+//! Rescue is bounded and prefix-stable: at most one hidden nudge per turn
+//! across all failure kinds (think-cap / empty / stub), then one
+//! thinking-off conclude hop, then local synthesis — locked spoken text,
+//! else the model's own parked/truncated analysis, else the last essay.
+//! `tools[]` and the effort sentence never change mid-turn (both render into
+//! the system prefix; flipping them forces a full prompt refill), so wrap
+//! hops keep tools in the request and drop leaked calls after parsing.
+//! User abort is the only user-visible stop reason. Trajectory detectors
+//! (doom / name / path / stutter / dump) inject one hidden observation and
+//! then stay silent. Step, time, and context budgets get the same treatment:
+//! one wrap-up hop, then a quiet finish that keeps the last spoken text.
 //! `ThinkPolicy` kwargs stay frozen for the turn except an ephemeral no-tool
 //! think clip, watchdog restore, and a same-session auto-upgrade. A later
 //! clean step drops back to the turn baseline.
@@ -294,8 +318,13 @@ pub fn apply_unattended_policy(opts: &mut RunOpts, cfg: &crate::config::Config) 
 
 const DEFAULT_COMPACT_RATIO: f64 = 0.70;
 const TURN_START_COMPACT_PREFIX: u32 = 120_000;
+/// Tool-count compact only when the cheap prefix estimate is already large.
+/// Eight tiny reads at ~3k tokens must stay live — otherwise a follow-up like
+/// 「有结论了吗」archives the evidence and the model re-reads the same files.
+const TURN_START_COMPACT_TOOL_PREFIX: u32 = 32_000;
 /// A finished tool-heavy turn should not be replayed as a cold prefill, even
-/// when the cheap byte estimate sits under 120k.
+/// when the cheap byte estimate sits under 120k. Gated by
+/// `TURN_START_COMPACT_TOOL_PREFIX` so a 20k-token review is not wiped.
 const TURN_START_COMPACT_TOOLS: usize = 8;
 /// In-memory images from the previous turn. Archive sooner than the wire cap.
 const TURN_START_COMPACT_IMAGES: usize = 4;
@@ -356,9 +385,34 @@ fn should_compact_follow_up(
     if working_window == 0 {
         return false;
     }
-    tool_messages >= tool_threshold
+    (tool_messages >= tool_threshold && prefix >= TURN_START_COMPACT_TOOL_PREFIX)
         || image_parts > TURN_START_COMPACT_IMAGES
         || should_compact_at_user_turn(prefix, reserve, working_window, compact_ratio)
+}
+
+/// Short status/conclusion follow-ups should write, not start another read loop.
+fn follow_up_wants_wrap(user: &str) -> bool {
+    let t = user.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.chars().count() > 80 {
+        return false;
+    }
+    const MARK: &[&str] = &[
+        "结论",
+        "看完",
+        "读完",
+        "进展",
+        "怎样了",
+        "好了吗",
+        "有结果",
+        "done?",
+        "conclusion",
+        "progress",
+    ];
+    let l = t.to_ascii_lowercase();
+    MARK.iter().any(|m| t.contains(m) || l.contains(m))
 }
 
 fn live_tool_count(messages: &[ChatMessage]) -> usize {
@@ -481,9 +535,14 @@ pub struct Agent<C> {
     read_paths: HashSet<String>,
     /// Paths whose content the live transcript has seen (read/view/write/edit).
     /// `write` to an existing file outside this set is a blind overwrite and is
-    /// refused with a re-read fact. Rebuilt from the transcript each turn;
-    /// cleared on compact (the content left the window with it).
+    /// refused with a re-read fact. Rebuilt from the transcript each turn and
+    /// unioned with `compacted_read_paths` so a sidecar-fresh Agent still
+    /// remembers files whose bodies left the window.
     observed_paths: HashSet<String>,
+    /// Paths read before the last compact. Sidecar constructs a new Agent per
+    /// RPC, so `read_paths` is empty at follow-up compact; this set is filled
+    /// from the transcript *before* bodies are archived.
+    compacted_read_paths: HashSet<String>,
     /// Consumed on the first `run_message` so a soak leftover env is visible once.
     window_overlay: Option<WorkingWindowOverlay>,
     /// S1/S2 judgment guards over successful edits.
@@ -512,6 +571,64 @@ pub struct Agent<C> {
     tools_this_turn: bool,
     /// One roomy think-cap retry already ran this user turn.
     watchdog_roomy_tried: bool,
+    /// User asked to conclude, or a physics budget wrap. Think-cap after
+    /// tools does not set this.
+    wrap_up_after_tools: bool,
+    /// Wrap-up already tried a tight think cap; next hop is thinking-off.
+    wrap_up_off: bool,
+    /// One hidden note already fired for a no-tool 边做边说 stub this turn.
+    stub_nudged: bool,
+    /// Total rescue observations this user turn (think-cap / empty / stub).
+    /// One nudge total, then the ladder jumps straight to the conclude hop —
+    /// mixed failure kinds must not each earn their own retry.
+    rescue_notes: u32,
+    /// Longest substantial reasoning seen this user turn. Terminal fallback
+    /// when every rescue hop fails: deliver the model's own analysis instead
+    /// of a canned apology (pi: partial output is still output).
+    turn_think_salvage: Option<String>,
+    /// Model hops taken this user turn (including rescue retries).
+    turn_steps: u32,
+    /// Prompt tokens accumulated this user turn.
+    turn_prompt_tokens: u64,
+    /// Completion tokens accumulated this user turn.
+    turn_completion_tokens: u64,
+    /// Consecutive malformed tool-call parses this user turn.
+    parse_retries: u32,
+}
+
+/// The single termination authority's ruling for one model hop. `adjudicate`
+/// is the only producer; the `drive` shell only dispatches.
+enum Verdict {
+    /// A rescue was applied (hidden note / policy overlay already armed).
+    /// Take another hop with the transcript as-is.
+    Continue,
+    /// Execute this tool batch, then push `notes` (in order) and continue.
+    /// `divergent` batches record well-formed results without executing.
+    Tools {
+        calls: Vec<ToolCall>,
+        divergent: bool,
+        notes: Vec<String>,
+    },
+    /// The turn is over.
+    Stop(StopCause),
+}
+
+/// Why the turn ended. `conclude` is the only place that maps a cause to the
+/// delivered text and the logged stop event.
+enum StopCause {
+    /// Cancelled by the user/driver. Never synthesizes text.
+    Aborted,
+    /// A delivery (model wrote its answer) or a gate ruling on one. Empty
+    /// text falls back to the best visible artifact in `conclude`.
+    Deliver {
+        text: String,
+        reason: Option<String>,
+    },
+    /// The rescue ladder is spent without a delivery. `conclude` synthesizes
+    /// from artifacts: locked spoken → parked think → last essay → fallback.
+    Exhausted,
+    /// The endpoint kept failing mid-turn; deliver the degradation notice.
+    Degraded { text: String, reason: String },
 }
 
 impl<C: Completer> Agent<C> {
@@ -674,6 +791,7 @@ impl<C: Completer> Agent<C> {
             last_essay: None,
             read_paths: HashSet::new(),
             observed_paths: HashSet::new(),
+            compacted_read_paths: HashSet::new(),
             window_overlay: opts.working_window_overlay,
             edit_guard: guard::EditGuard::new(),
             narrate: opts.narrate && !opts.print && interactive_channel(&opts.channel),
@@ -688,6 +806,15 @@ impl<C: Completer> Agent<C> {
             length_truncations: 0,
             tools_this_turn: false,
             watchdog_roomy_tried: false,
+            wrap_up_after_tools: false,
+            wrap_up_off: false,
+            stub_nudged: false,
+            rescue_notes: 0,
+            turn_think_salvage: None,
+            turn_steps: 0,
+            turn_prompt_tokens: 0,
+            turn_completion_tokens: 0,
+            parse_retries: 0,
         })
     }
 
@@ -765,276 +892,405 @@ impl<C: Completer> Agent<C> {
         self.length_truncations = 0;
         self.tools_this_turn = false;
         self.watchdog_roomy_tried = false;
+        self.wrap_up_after_tools = false;
+        self.wrap_up_off = false;
+        self.stub_nudged = false;
+        self.rescue_notes = 0;
+        self.turn_think_salvage = None;
         self.last_spoken = None;
         self.last_essay = None;
         self.read_paths.clear();
         self.observed_paths = observed_from_messages(&self.messages, &self.workspace);
+        self.observed_paths
+            .extend(self.compacted_read_paths.iter().cloned());
         let user = self.last_real_user().to_string();
+        if follow_up_wants_wrap(&user) && !self.observed_paths.is_empty() {
+            self.wrap_up_after_tools = true;
+            self.channel_nudged = true;
+            self.rescue_notes = 1;
+            self.push_hidden_user(TOOLS_WRAP_NOTE);
+        }
         self.edit_guard.reset_turn(&user);
         self.oracle_cmd = None;
         self.snapshot_test_baseline().await;
-        let mut steps = 0u32;
-        let mut prompt_tokens = 0u64;
-        let mut completion_tokens = 0u64;
-        let mut parse_retries = 0u32;
+        self.turn_steps = 0;
+        self.turn_prompt_tokens = 0;
+        self.turn_completion_tokens = 0;
+        self.parse_retries = 0;
 
+        // pi-thin shell: complete → adjudicate → dispatch. Every continue /
+        // rescue / stop ruling is made inside `adjudicate` (the single
+        // termination authority); every outcome leaves through `conclude`
+        // (the single terminal). The shell only runs mechanisms.
         loop {
             self.drain_background();
             if self.cancel.is_cancelled() {
-                return self.finish(String::new(), Some("aborted".into()), steps);
+                return self.conclude(StopCause::Aborted);
             }
-            // QwenPaw: pending gate TERMINATE fires before the next model call.
-            if let Some(reason) = self.pending_stop.take() {
-                let text = self.last_spoken.clone().unwrap_or_default();
-                if reason.is_empty() || is_physics_stop(&reason) {
-                    if !reason.is_empty() {
-                        self.note(&reason);
-                    }
-                    return self.finish(text, None, steps);
-                }
-                self.note(&reason);
-                return self.finish(text, Some(reason), steps);
+            if let Some(cause) = self.preflight_stop() {
+                return self.conclude(cause);
             }
 
-            if let Some(reason) = self.compact_if_needed() {
-                self.note(&reason);
-                if self.physics_nudged {
-                    return self.finish(self.last_spoken.clone().unwrap_or_default(), None, steps);
-                }
-                self.physics_nudged = true;
-                self.push_hidden_user(PHYSICS_WRAP_NOTE);
-            }
-
+            // Tools stay in the request even on wrap/conclude hops: the tool
+            // schema renders into the system section of the chat template, so
+            // dropping `tools[]` mid-turn re-renders the prefix and forces a
+            // full prompt refill (minutes at 20k+ tokens on a local engine).
+            // Leaked wrap-hop calls are cleared after parsing instead.
             let tools_owned = self.tools.clone();
             let tools = if tools_owned.is_empty() {
                 None
             } else {
                 Some(tools_owned.as_slice())
             };
-
-            let Some(mut turn) = self.complete_or_abort(tools).await? else {
-                return self.finish(String::new(), Some("aborted".into()), steps);
-            };
-            steps += 1;
-            prompt_tokens += turn.prompt_tokens;
-            completion_tokens += turn.completion_tokens;
-
-            if turn.watchdog_hit
-                && turn.tool_calls.is_empty()
-                && !crate::stutter::is_substantial_reply(&turn.content)
-                && !self.watchdog_roomy_tried
-            {
-                // Think-only cap: one roomy retry (unchanged). Partial tools
-                // skip this and fail-not-execute below (pi length).
-                self.watchdog_roomy_tried = true;
-                self.note("[watchdog] think cap; soft nudge and one roomy retry");
-                self.push_hidden_user(THINK_DIVERGENCE_NOTE);
-                let widened = self.retry_with_runaway_room(tools).await?;
-                if self.cancel.is_cancelled() {
-                    return self.finish(String::new(), Some("aborted".into()), steps);
-                }
-                if let Some(t) = widened {
-                    steps += 1;
-                    prompt_tokens += t.prompt_tokens;
-                    completion_tokens += t.completion_tokens;
-                    turn = t;
-                }
+            let prev_wrap = self.arm_wrap_up_policy();
+            let completed = self.complete_or_abort(tools).await;
+            if let Some(p) = prev_wrap {
+                self.completer.set_policy(p);
             }
+            let mut turn = match completed {
+                Ok(Some(t)) => t,
+                Ok(None) => return self.conclude(StopCause::Aborted),
+                Err(e) => match self.endpoint_failure_text(&e) {
+                    Some(text) => {
+                        self.note(&format!("[http] turn degraded: {e}"));
+                        return self.conclude(StopCause::Degraded {
+                            text,
+                            reason: format!("http: {e}"),
+                        });
+                    }
+                    None => return Err(e),
+                },
+            };
+            self.absorb_turn_usage(&turn);
 
-            if turn.watchdog_hit {
+            match self.adjudicate(&mut turn, tools).await? {
+                Verdict::Continue => {}
+                Verdict::Tools {
+                    calls,
+                    divergent,
+                    notes,
+                } => {
+                    if divergent {
+                        // Do not execute a cleanup/write batch before the model
+                        // has seen the divergence observation. Record
+                        // well-formed results, then hand control back.
+                        self.defer_divergent_tools(calls);
+                    } else {
+                        self.execute_tools(calls).await;
+                    }
+                    for note in notes {
+                        self.push_hidden_user(note);
+                    }
+                    self.flush_steer();
+                    if self.cancel.is_cancelled() {
+                        return self.conclude(StopCause::Aborted);
+                    }
+                }
+                Verdict::Stop(cause) => return self.conclude(cause),
+            }
+        }
+    }
+
+    /// Supervisor pre-flight: the deferred gate TERMINATE and the context
+    /// budget. Rulings only — the returned cause goes through `conclude`.
+    fn preflight_stop(&mut self) -> Option<StopCause> {
+        // QwenPaw: pending gate TERMINATE fires before the next model call.
+        if let Some(reason) = self.pending_stop.take() {
+            let text = self.last_spoken.clone().unwrap_or_default();
+            if reason.is_empty() || is_physics_stop(&reason) {
+                if !reason.is_empty() {
+                    self.note(&reason);
+                }
+                return Some(StopCause::Deliver { text, reason: None });
+            }
+            self.note(&reason);
+            return Some(StopCause::Deliver {
+                text,
+                reason: Some(reason),
+            });
+        }
+        if let Some(reason) = self.compact_if_needed() {
+            self.note(&reason);
+            if self.physics_nudged {
+                return Some(StopCause::Deliver {
+                    text: self.last_spoken.clone().unwrap_or_default(),
+                    reason: None,
+                });
+            }
+            self.physics_nudged = true;
+            self.wrap_up_after_tools = true;
+            self.push_hidden_user(PHYSICS_WRAP_NOTE);
+        }
+        None
+    }
+
+    /// Steps/usage accounting and salvage tracking for one completed hop
+    /// (primary or rescue retry).
+    fn absorb_turn_usage(&mut self, turn: &ModelTurn) {
+        self.turn_steps = self.turn_steps.saturating_add(1);
+        self.turn_prompt_tokens += turn.prompt_tokens;
+        self.turn_completion_tokens += turn.completion_tokens;
+        self.note_think_salvage(turn);
+    }
+
+    /// The single termination authority. One hop in, one verdict out, in the
+    /// historical ruling order: watchdog ladder → wrap leak → parse repair →
+    /// stutter → channel promotion → incomplete rescue → dump detection →
+    /// transcript record → stop gates. Nothing outside this function (and the
+    /// `preflight_stop` supervisor) may inject a rescue note or end the turn.
+    async fn adjudicate(
+        &mut self,
+        turn: &mut ModelTurn,
+        tools: Option<&[Value]>,
+    ) -> Result<Verdict> {
+        // pi: a hop is never discarded. Failed/truncated hops are appended
+        // to the transcript exactly once so (a) the next completion
+        // continues from the partial thought instead of re-deriving it
+        // from scratch and (b) the session log shows what happened.
+        let mut hop_recorded = false;
+
+        if turn.watchdog_hit
+            && turn.tool_calls.is_empty()
+            && !crate::stutter::is_substantial_reply(&turn.content)
+            && !self.watchdog_roomy_tried
+            && self.rescue_notes == 0
+            && !self.wrap_up_after_tools
+        {
+            // First think-cap of the turn, pre- or post-tools: keep the
+            // partial thought and give one roomy retry. The 512 runaway
+            // cap starves healthy synthesis (write-up after multi-file
+            // reads routinely needs 1-3k think tokens); a same-cap retry
+            // is guaranteed to cut again, so the retry must widen.
+            self.watchdog_roomy_tried = true;
+            self.rescue_notes += 1;
+            self.note("[watchdog] think cap; soft nudge and one roomy retry");
+            hop_recorded = self.push_failed_hop(turn);
+            self.push_hidden_user(THINK_DIVERGENCE_NOTE);
+            let widened = self.retry_with_runaway_room(tools).await?;
+            if self.cancel.is_cancelled() {
+                return Ok(Verdict::Stop(StopCause::Aborted));
+            }
+            if let Some(t) = widened {
+                self.absorb_turn_usage(&t);
+                *turn = t;
+                hop_recorded = false;
+            }
+        }
+
+        if turn.watchdog_hit {
+            if !turn.tool_calls.is_empty() {
                 self.length_truncations = self.length_truncations.saturating_add(1);
                 if self.length_truncations >= LENGTH_TRUNCATION_ABORT {
-                    return self.finish_cap_exhausted(steps);
+                    return Ok(Verdict::Stop(StopCause::Exhausted));
                 }
-                if !turn.tool_calls.is_empty() {
-                    // pi: length-truncated tool args may salvage-parse; none are safe.
-                    self.note("[watchdog] length; fail truncated tool calls");
-                    self.push_assistant(&turn);
-                    self.fail_truncated_tools(std::mem::take(&mut turn.tool_calls));
-                    continue;
-                }
-                if crate::stutter::is_substantial_reply(&turn.content) {
-                    self.push_assistant(&turn);
-                    self.last_spoken = Some(turn.content.clone());
-                    return self.finish(turn.content, None, steps);
-                }
-                if self.tools_this_turn && !self.channel_nudged {
-                    self.channel_nudged = true;
-                    self.note("[watchdog] think cap; one wrap-up after tools");
-                    self.push_hidden_user(EMPTY_CHANNEL_NOTE);
-                    continue;
-                }
-                return self.finish_cap_exhausted(steps);
+                // pi: length-truncated tool args may salvage-parse; none are safe.
+                self.note("[watchdog] length; fail truncated tool calls");
+                self.push_assistant(turn);
+                self.fail_truncated_tools(std::mem::take(&mut turn.tool_calls));
+                return Ok(Verdict::Continue);
             }
-
-            if !turn.reasoning.is_empty() && self.print && !self.stdio.think_streamed() {
-                eprintln!("[think]\n{}", turn.reasoning.trim());
-            }
-
-            if turn.parse_fail {
-                self.effort.note_parse_fail();
-                self.sync_effort(PolicyReason::Upgrade);
-                parse_retries += 1;
-                self.note("[parse] retry");
-                if parse_retries >= self.parse_stop_after {
-                    if !self.parse_nudged {
-                        self.parse_nudged = true;
-                        self.push_hidden_user(PARSE_REPAIR_NOTE);
-                        continue;
-                    }
-                    return self.finish(self.last_spoken.clone().unwrap_or_default(), None, steps);
-                }
-                continue;
-            }
-
-            if turn.tool_calls.is_empty() {
-                turn.content = strip_greeting_echo(self.last_real_user(), &turn.content);
-            }
-            if self.low_precision && crate::stutter::is_stutter(&turn.content, &turn.reasoning) {
-                if !self.stutter_nudged {
-                    self.stutter_nudged = true;
-                    self.push_hidden_user(crate::stutter::STUTTER_NOTE);
-                    continue;
-                }
-            }
-            if let Some(body) = Self::promote_write_reply(&turn) {
-                turn.content = body;
-            }
-            if let Some(body) = Self::promote_reasoning_reply(&turn) {
-                turn.content = body;
-            }
-            if self.needs_channel_rescue(&turn) {
-                if !self.channel_nudged {
-                    self.channel_nudged = true;
-                    self.note("[channel] empty visible reply; one wrap-up");
-                    self.push_hidden_user(EMPTY_CHANNEL_NOTE);
-                    continue;
-                }
-                self.mark_clean();
-                return self.finish_visible(String::new(), None, steps);
-            }
-            let mut trajectory_note = None;
-            let dump_anchor = self.last_spoken.clone().or_else(|| self.last_essay.clone());
-            if let Some(prev) = dump_anchor {
-                let quote_dump = turn.tool_calls.is_empty()
-                    && crate::stutter::is_blockquote_heavy(&turn.content)
-                    && crate::stutter::is_substantial_reply(&prev);
-                if quote_dump || self.is_answer_dump_hop(&prev, &turn) {
-                    let keep = self.last_spoken.clone().unwrap_or(prev);
-                    if turn.tool_calls.is_empty() {
-                        // No tools means the model chose to stop. Keep the first
-                        // identical bubble without labelling that choice a
-                        // harness failure.
-                        self.mark_clean();
-                        return self.finish(keep, None, steps);
-                    }
-                    trajectory_note = Some(crate::stutter::DUMP_NOTE);
-                }
-            }
-            self.push_assistant(&turn);
-            if crate::stutter::is_substantial_reply(&turn.content)
-                && !crate::stutter::is_blockquote_heavy(&turn.content)
-            {
-                self.last_essay = Some(turn.content.clone());
-            }
-            if Self::hop_locks_spoken(&turn) {
+            if Self::hop_is_delivery(turn) {
+                self.push_assistant(turn);
                 self.last_spoken = Some(turn.content.clone());
+                return Ok(Verdict::Stop(StopCause::Deliver {
+                    text: turn.content.clone(),
+                    reason: None,
+                }));
             }
-            let decision = self.gate_decision(&turn, steps, prompt_tokens, completion_tokens);
+            // Truncated think is not delivered as-is mid-ladder. Keep it in
+            // the transcript and change the decoding: a thinking-off hop
+            // writes `content` itself with the partial thought in context.
+            if !hop_recorded {
+                self.push_failed_hop(turn);
+            }
+            if self.wrap_up_after_tools {
+                if !self.wrap_up_off {
+                    self.wrap_up_off = true;
+                    self.note("[watchdog] wrap-up think cap; one thinking-off hop");
+                    return Ok(Verdict::Continue);
+                }
+                return Ok(Verdict::Stop(StopCause::Exhausted));
+            }
+            // Roomy retry already spent (or blocked): one thinking-off
+            // conclude hop before giving up — never straight to fallback.
+            // With thinking disabled the model writes `content` directly,
+            // with every preserved partial thought still in context.
+            self.arm_conclude_off("[watchdog] think cap persists; conclude thinking-off");
+            return Ok(Verdict::Continue);
+        }
 
-            if !turn.tool_calls.is_empty() {
-                if turn.content.trim().is_empty() {
-                    self.silent_tool_hops += 1;
-                } else {
-                    self.silent_tool_hops = 0;
-                }
-                // Defer TERMINATE until after this tool batch. A gate Continue
-                // with text is a one-shot trajectory observation after the
-                // batch's results; later repeats stay silent.
-                let mut gate_note = None;
-                let mut silent_note = None;
-                match &decision {
-                    GateDecision::Stop { reason } if is_physics_stop(reason) => {
-                        if !self.physics_nudged {
-                            self.physics_nudged = true;
-                            self.note(reason);
-                            gate_note = Some(PHYSICS_WRAP_NOTE.to_string());
-                        } else {
-                            self.note(reason);
-                            self.pending_stop = Some(String::new());
-                        }
-                    }
-                    GateDecision::Stop { reason } if !reason.is_empty() => {
-                        self.pending_stop = Some(reason.clone());
-                    }
-                    GateDecision::Continue { continuation, .. } if !continuation.is_empty() => {
-                        gate_note = Some(continuation.clone());
-                    }
-                    _ => {}
-                }
-                if self.silent_final_channel()
-                    && !self.silent_tool_nudged
-                    && self.silent_tool_hops >= SILENT_TOOL_STREAK
-                {
-                    self.silent_tool_nudged = true;
-                    self.note("[channel] silent tool streak; one style observation");
-                    silent_note = Some(SILENT_TOOL_NOTE.to_string());
-                }
-                let calls = std::mem::take(&mut turn.tool_calls);
-                if trajectory_note.is_some() {
-                    // Do not execute a cleanup/write batch before the model has
-                    // seen the divergence observation. Record well-formed tool
-                    // results, then give control straight back to the model.
-                    self.defer_divergent_tools(calls);
-                } else {
-                    self.execute_tools(calls).await;
-                }
-                if let Some(note) = gate_note {
-                    self.push_hidden_user(note);
-                }
-                if let Some(note) = silent_note {
-                    self.push_hidden_user(note);
-                }
-                if let Some(note) = trajectory_note {
-                    self.push_hidden_user(note);
-                }
-                self.flush_steer();
-                if self.cancel.is_cancelled() {
-                    return self.finish(String::new(), Some("aborted".into()), steps);
-                }
-                continue;
-            }
+        if self.wrap_up_after_tools && !turn.tool_calls.is_empty() {
+            self.note("[watchdog] wrap-up leaked tools; not executed");
+            turn.tool_calls.clear();
+            turn.raw_tool_calls = None;
+        }
 
-            match decision {
-                GateDecision::Continue { continuation, .. } => {
-                    self.mark_clean();
-                    let stop_reason = if continuation.is_empty() {
-                        None
-                    } else {
-                        Some(continuation)
-                    };
-                    return self.finish_visible(turn.content, stop_reason, steps);
+        if !turn.reasoning.is_empty() && self.print && !self.stdio.think_streamed() {
+            eprintln!("[think]\n{}", turn.reasoning.trim());
+        }
+
+        if turn.parse_fail {
+            self.effort.note_parse_fail();
+            self.sync_effort(PolicyReason::Upgrade);
+            self.parse_retries += 1;
+            self.note("[parse] retry");
+            if self.parse_retries >= self.parse_stop_after {
+                if !self.parse_nudged {
+                    self.parse_nudged = true;
+                    self.push_hidden_user(PARSE_REPAIR_NOTE);
+                    return Ok(Verdict::Continue);
                 }
-                GateDecision::Stop { reason } => {
-                    self.mark_clean();
-                    if is_physics_stop(&reason) {
-                        self.note(&reason);
-                        return self.finish_visible(turn.content, None, steps);
-                    }
-                    let stop_reason = if reason.is_empty() {
-                        None
-                    } else {
-                        Some(reason)
-                    };
-                    return self.finish_visible(turn.content, stop_reason, steps);
-                }
-                // Handler swallows per-gate Bypass; keep this arm so a future
-                // handler contract change cannot panic the loop.
-                GateDecision::Bypass => {
-                    self.mark_clean();
-                    return self.finish_visible(turn.content, None, steps);
-                }
+                return Ok(Verdict::Stop(StopCause::Deliver {
+                    text: self.last_spoken.clone().unwrap_or_default(),
+                    reason: None,
+                }));
             }
+            return Ok(Verdict::Continue);
+        }
+
+        if turn.tool_calls.is_empty() {
+            turn.content = strip_greeting_echo(self.last_real_user(), &turn.content);
+        }
+        if self.low_precision
+            && crate::stutter::is_stutter(&turn.content, &turn.reasoning)
+            && !self.stutter_nudged
+        {
+            self.stutter_nudged = true;
+            self.push_hidden_user(crate::stutter::STUTTER_NOTE);
+            return Ok(Verdict::Continue);
+        }
+        if let Some(body) = Self::promote_write_reply(turn) {
+            turn.content = body;
+        }
+        if turn.tool_calls.is_empty() {
+            if let Some(body) = Self::promote_reasoning_reply(turn) {
+                turn.content = body;
+            }
+        }
+        if turn.tool_calls.is_empty() && !Self::hop_is_delivery(turn) {
+            // Keep the incomplete hop (parked think / stub line) in the
+            // transcript so the rescue note refers to something the model
+            // can actually see, and nothing gets re-derived from scratch.
+            self.push_failed_hop(turn);
+            return Ok(self.rescue_incomplete(turn));
+        }
+        let mut trajectory_note = None;
+        let dump_anchor = self.last_spoken.clone().or_else(|| self.last_essay.clone());
+        if let Some(prev) = dump_anchor {
+            let quote_dump = turn.tool_calls.is_empty()
+                && crate::stutter::is_blockquote_heavy(&turn.content)
+                && crate::stutter::is_substantial_reply(&prev);
+            if quote_dump || self.is_answer_dump_hop(&prev, turn) {
+                let keep = self.last_spoken.clone().unwrap_or(prev);
+                if turn.tool_calls.is_empty() {
+                    // No tools means the model chose to stop. Keep the first
+                    // identical bubble without labelling that choice a
+                    // harness failure.
+                    return Ok(Verdict::Stop(StopCause::Deliver {
+                        text: keep,
+                        reason: None,
+                    }));
+                }
+                trajectory_note = Some(crate::stutter::DUMP_NOTE);
+            }
+        }
+        self.push_assistant(turn);
+        if crate::stutter::is_substantial_reply(&turn.content)
+            && !crate::stutter::is_blockquote_heavy(&turn.content)
+        {
+            self.last_essay = Some(turn.content.clone());
+        }
+        if Self::hop_locks_spoken(turn) {
+            self.last_spoken = Some(turn.content.clone());
+        }
+        let decision = self.gate_decision(turn);
+
+        if !turn.tool_calls.is_empty() {
+            if turn.content.trim().is_empty() {
+                self.silent_tool_hops += 1;
+            } else {
+                self.silent_tool_hops = 0;
+            }
+            // Defer TERMINATE until after this tool batch. A gate Continue
+            // with text is a one-shot trajectory observation after the
+            // batch's results; later repeats stay silent. Note order is
+            // frozen: gate, silent-streak, divergence.
+            let mut notes: Vec<String> = Vec::new();
+            match &decision {
+                GateDecision::Stop { reason } if is_physics_stop(reason) => {
+                    if !self.physics_nudged {
+                        self.physics_nudged = true;
+                        self.wrap_up_after_tools = true;
+                        self.note(reason);
+                        notes.push(PHYSICS_WRAP_NOTE.to_string());
+                    } else {
+                        self.note(reason);
+                        self.pending_stop = Some(String::new());
+                    }
+                }
+                GateDecision::Stop { reason } if !reason.is_empty() => {
+                    self.pending_stop = Some(reason.clone());
+                }
+                GateDecision::Continue { continuation, .. } if !continuation.is_empty() => {
+                    notes.push(continuation.clone());
+                }
+                _ => {}
+            }
+            if self.silent_final_channel()
+                && !self.silent_tool_nudged
+                && self.silent_tool_hops >= SILENT_TOOL_STREAK
+            {
+                self.silent_tool_nudged = true;
+                self.note("[channel] silent tool streak; one style observation");
+                notes.push(SILENT_TOOL_NOTE.to_string());
+            }
+            let divergent = trajectory_note.is_some();
+            if let Some(note) = trajectory_note {
+                notes.push(note.to_string());
+            }
+            return Ok(Verdict::Tools {
+                calls: std::mem::take(&mut turn.tool_calls),
+                divergent,
+                notes,
+            });
+        }
+
+        match decision {
+            GateDecision::Continue { continuation, .. } => {
+                let reason = if continuation.is_empty() {
+                    None
+                } else {
+                    Some(continuation)
+                };
+                Ok(Verdict::Stop(StopCause::Deliver {
+                    text: std::mem::take(&mut turn.content),
+                    reason,
+                }))
+            }
+            GateDecision::Stop { reason } => {
+                if is_physics_stop(&reason) {
+                    self.note(&reason);
+                    return Ok(Verdict::Stop(StopCause::Deliver {
+                        text: std::mem::take(&mut turn.content),
+                        reason: None,
+                    }));
+                }
+                let reason = if reason.is_empty() {
+                    None
+                } else {
+                    Some(reason)
+                };
+                Ok(Verdict::Stop(StopCause::Deliver {
+                    text: std::mem::take(&mut turn.content),
+                    reason,
+                }))
+            }
+            // Handler swallows per-gate Bypass; keep this arm so a future
+            // handler contract change cannot panic the loop.
+            GateDecision::Bypass => Ok(Verdict::Stop(StopCause::Deliver {
+                text: std::mem::take(&mut turn.content),
+                reason: None,
+            })),
         }
     }
 
@@ -1070,6 +1326,41 @@ impl<C: Completer> Agent<C> {
             turn.cached_tokens,
             turn.decode_tok_s,
         ));
+    }
+
+    /// pi-style transcript truth for hops that did not deliver: watchdog-cut
+    /// think, parked think, stub narration. Appended verbatim so the next
+    /// completion continues from the partial work instead of re-deriving it,
+    /// and the session log records what the model actually produced. True-null
+    /// hops (both channels blank) carry no information and are skipped.
+    /// Returns whether the hop was appended.
+    fn push_failed_hop(&mut self, turn: &ModelTurn) -> bool {
+        if turn.content.trim().is_empty() && turn.reasoning.trim().is_empty() {
+            return false;
+        }
+        self.push_assistant(turn);
+        true
+    }
+
+    /// Track the best reasoning produced this user turn. This is the terminal
+    /// fallback: when every rescue hop fails to write `content`, the model's
+    /// own analysis is delivered instead of a canned apology. Stuttery or
+    /// sub-substantial thinks never qualify.
+    fn note_think_salvage(&mut self, turn: &ModelTurn) {
+        let r = turn.reasoning.trim();
+        if r.is_empty()
+            || !crate::stutter::is_substantial_reply(r)
+            || crate::stutter::is_stutter("", r)
+        {
+            return;
+        }
+        let better = self
+            .turn_think_salvage
+            .as_deref()
+            .is_none_or(|cur| r.chars().count() > cur.chars().count());
+        if better {
+            self.turn_think_salvage = Some(r.to_string());
+        }
     }
 
     fn flush_steer(&mut self) {
@@ -1210,18 +1501,6 @@ impl<C: Completer> Agent<C> {
             .is_some_and(|(f, _)| f.silent_final_channel())
     }
 
-    /// Empty visible hop: leftover think, or a naked empty stop with nothing
-    /// already spoken. Do not dump unfinished CoT; do not deliver `""`.
-    fn needs_channel_rescue(&self, turn: &ModelTurn) -> bool {
-        if !turn.tool_calls.is_empty() || !turn.content.trim().is_empty() {
-            return false;
-        }
-        if !turn.reasoning.trim().is_empty() {
-            return true;
-        }
-        self.visible_stop_text().is_empty()
-    }
-
     /// Lift a finished answer that landed only in `reasoning_content`.
     /// Scratch plans and long CoT stay in think and get a wrap-up hop.
     fn promote_reasoning_reply(turn: &ModelTurn) -> Option<String> {
@@ -1241,6 +1520,68 @@ impl<C: Completer> Agent<C> {
         Some(r.to_string())
     }
 
+    fn hop_is_delivery(turn: &ModelTurn) -> bool {
+        turn.tool_calls.is_empty()
+            && !turn.content.trim().is_empty()
+            && !crate::stutter::is_progress_narration(&turn.content)
+    }
+
+    /// Escalate to the final conclude hop: tools stripped, thinking disabled.
+    /// The model gets one full-width generation to write the answer itself —
+    /// think-channel text is never copied out as a substitute.
+    fn arm_conclude_off(&mut self, why: &str) {
+        self.note(why);
+        self.wrap_up_after_tools = true;
+        self.wrap_up_off = true;
+        self.push_hidden_user(CONCLUDE_OFF_NOTE);
+    }
+
+    /// Rescue rung for a no-tool hop that is not a delivery: empty, or a
+    /// 边做边说 next-step line. Escalation always means "let the model write":
+    /// one hidden note total across all failure kinds (`rescue_notes`), then a
+    /// thinking-off conclude hop, finally `StopCause::Exhausted` synthesis.
+    /// Bounded so mixed think-cap / empty / stub failures cannot chain nudges.
+    fn rescue_incomplete(&mut self, turn: &ModelTurn) -> Verdict {
+        if self.wrap_up_after_tools {
+            if !self.wrap_up_off {
+                self.wrap_up_off = true;
+                self.note("[channel] wrap-up incomplete; one thinking-off hop");
+                return Verdict::Continue;
+            }
+            return Verdict::Stop(StopCause::Exhausted);
+        }
+        if turn.content.trim().is_empty() {
+            if !self.visible_stop_text().is_empty()
+                && crate::stutter::is_substantial_reply(&self.visible_stop_text())
+            {
+                // An earlier hop already spoke the answer; deliver it.
+                return Verdict::Stop(StopCause::Deliver {
+                    text: String::new(),
+                    reason: None,
+                });
+            }
+            if !self.channel_nudged && self.rescue_notes == 0 {
+                self.channel_nudged = true;
+                self.rescue_notes += 1;
+                self.note("[channel] empty visible reply; one wrap-up");
+                self.push_hidden_user(EMPTY_CHANNEL_NOTE);
+                return Verdict::Continue;
+            }
+            self.arm_conclude_off("[channel] still empty; conclude thinking-off");
+            return Verdict::Continue;
+        }
+        // Progress narration without tools.
+        if !self.stub_nudged && self.rescue_notes == 0 {
+            self.stub_nudged = true;
+            self.rescue_notes += 1;
+            self.note("[channel] next-step line without tools");
+            self.push_hidden_user(STUB_CONTINUE_NOTE);
+            return Verdict::Continue;
+        }
+        self.arm_conclude_off("[channel] stub persists; conclude thinking-off");
+        Verdict::Continue
+    }
+
     fn visible_stop_text(&self) -> String {
         self.last_spoken
             .as_deref()
@@ -1257,22 +1598,7 @@ impl<C: Completer> Agent<C> {
             .unwrap_or_default()
     }
 
-    fn finish_visible(
-        &mut self,
-        content: String,
-        stop_reason: Option<String>,
-        steps: u32,
-    ) -> Result<AgentOutcome> {
-        self.finish(content, stop_reason, steps)
-    }
-
-    fn gate_decision(
-        &self,
-        turn: &ModelTurn,
-        steps: u32,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-    ) -> GateDecision {
+    fn gate_decision(&self, turn: &ModelTurn) -> GateDecision {
         let fingerprints: Vec<ToolFingerprint> = turn
             .tool_calls
             .iter()
@@ -1283,10 +1609,10 @@ impl<C: Completer> Agent<C> {
             .collect();
         let names: Vec<String> = turn.tool_calls.iter().map(|c| c.name.clone()).collect();
         let mut ctx = GateCtx::new(&self.session_id);
-        ctx.iteration = steps;
+        ctx.iteration = self.turn_steps;
         ctx.prompt_tokens = turn.prompt_tokens;
         ctx.completion_tokens = turn.completion_tokens;
-        ctx.tokens_used = prompt_tokens + completion_tokens;
+        ctx.tokens_used = self.turn_prompt_tokens + self.turn_completion_tokens;
         ctx.tool_names = &names;
         ctx.fingerprints = &fingerprints;
         ctx.last_tool = fingerprints.last();
@@ -1771,7 +2097,7 @@ impl<C: Completer> Agent<C> {
     /// completion only; restore afterwards so a later coding hop keeps the
     /// session policy. `--think` lock is honored (left alone).
     fn widen_no_tool_think(&self) -> Option<ThinkPolicy> {
-        if self.effort.user_locked {
+        if self.wrap_up_after_tools || self.effort.user_locked {
             return None;
         }
         let prev = self.completer.policy()?;
@@ -2025,6 +2351,32 @@ impl<C: Completer> Agent<C> {
         Ok(retry?.filter(|t| !t.parse_fail))
     }
 
+    /// One-hop wrap overlay, restored by the caller. Does not persist via
+    /// `sync_effort`. The tight rung keeps the session `effort` untouched:
+    /// the effort sentence renders into the system prompt, so flipping it
+    /// mid-turn would invalidate the whole prefix cache. `max_think_tokens`
+    /// is harness-side (streaming watchdog) and prompt-neutral.
+    fn arm_wrap_up_policy(&self) -> Option<ThinkPolicy> {
+        if !self.wrap_up_after_tools {
+            return None;
+        }
+        let prev = self.completer.policy()?;
+        let next = if self.wrap_up_off {
+            let mut off = ThinkPolicy::off();
+            off.preserve = prev.preserve;
+            off.max_tokens = WRAP_ANSWER_TOKENS;
+            off
+        } else {
+            let mut tight = prev.clone();
+            tight.enabled = true;
+            tight.max_think_tokens = WRAP_THINK_CAP;
+            tight.max_tokens = WRAP_ANSWER_TOKENS;
+            tight
+        };
+        self.completer.set_policy(next);
+        Some(prev)
+    }
+
     fn last_real_user(&self) -> &str {
         self.messages
             .iter()
@@ -2070,22 +2422,30 @@ impl<C: Completer> Agent<C> {
         }
     }
 
-    fn finish(
-        &mut self,
-        text: String,
-        stop_reason: Option<String>,
-        steps: u32,
-    ) -> Result<AgentOutcome> {
+    /// The single terminal. Every turn — delivered, exhausted, degraded, or
+    /// aborted — leaves through here exactly once: text synthesis, the stop
+    /// event, and the outcome are decided in one place.
+    fn conclude(&mut self, cause: StopCause) -> Result<AgentOutcome> {
         self.drain_background();
-        if stop_reason.as_deref() == Some("aborted") {
-            self.coordinator.cancel_background();
-        }
+        let (text, stop_reason) = match cause {
+            StopCause::Aborted => {
+                self.coordinator.cancel_background();
+                (String::new(), Some("aborted".to_string()))
+            }
+            StopCause::Deliver { text, reason } => (text, reason),
+            StopCause::Exhausted => (self.exhausted_text(), None),
+            StopCause::Degraded { text, reason } => (text, Some(reason)),
+        };
+        // Empty delivered text falls back to the best artifact; a turn that
+        // burned minutes of decode surfaces that work, never a blank bubble.
         let text = if stop_reason.as_deref() != Some("aborted") && text.trim().is_empty() {
             let kept = self.visible_stop_text();
-            if kept.is_empty() {
-                EMPTY_STOP_FALLBACK.to_string()
-            } else {
+            if !kept.is_empty() {
                 kept
+            } else if let Some(salvage) = self.salvage_think_text() {
+                salvage
+            } else {
+                EMPTY_STOP_FALLBACK.to_string()
             }
         } else {
             text
@@ -2096,29 +2456,75 @@ impl<C: Completer> Agent<C> {
         Ok(AgentOutcome {
             text,
             stop_reason,
-            steps,
+            steps: self.turn_steps,
             session_id: self.session_id.clone(),
             pending_steer: take_steer(&self.steer),
             streamed_text: self.stdio.text_streamed(),
         })
     }
 
-    /// Think-cap exhaustion: never substitute a tool-hop narration (`last_essay`)
-    /// for a missing answer. A locked `last_spoken` delivery is still kept.
-    fn finish_cap_exhausted(&mut self, steps: u32) -> Result<AgentOutcome> {
-        self.mark_clean();
-        let text = self
+    /// Every rescue hop failed. The best artifact this turn produced, in
+    /// order: a locked spoken delivery, the model's own parked/truncated
+    /// analysis (think channel), then any earlier substantial visible text.
+    /// The canned apology is the true-nothing case only.
+    fn exhausted_text(&self) -> String {
+        let spoken = self
             .last_spoken
             .as_deref()
             .map(str::trim)
             .filter(|s| crate::stutter::is_substantial_reply(s))
-            .unwrap_or("")
-            .to_string();
-        if text.is_empty() {
-            self.finish(EMPTY_STOP_FALLBACK.to_string(), None, steps)
-        } else {
-            self.finish(text, None, steps)
+            .map(str::to_string);
+        if let Some(text) = spoken {
+            return text;
         }
+        if let Some(text) = self.salvage_think_text() {
+            return text;
+        }
+        let kept = self.visible_stop_text();
+        if crate::stutter::is_substantial_reply(&kept) && !crate::stutter::is_stutter(&kept, "") {
+            return kept;
+        }
+        EMPTY_STOP_FALLBACK.to_string()
+    }
+
+    /// Mid-turn endpoint failure (transient retries exhausted, or a
+    /// non-retryable 4xx): end the turn with a visible explanation instead of
+    /// a dead error stop — tool results already in the transcript stay usable.
+    /// A first-hop failure with nothing done yet still propagates so setup
+    /// problems (bad key, bad URL, auth) stay loud.
+    fn endpoint_failure_text(&self, err: &crate::Error) -> Option<String> {
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        let endpoint = match err {
+            crate::Error::Http(_) | crate::Error::Io(_) => true,
+            crate::Error::Msg(m) => m.to_ascii_lowercase().contains("http status"),
+            _ => false,
+        };
+        if !endpoint {
+            return None;
+        }
+        if self.turn_steps == 0 && !self.tools_this_turn && self.last_spoken.is_none() {
+            return None;
+        }
+        let detail: String = err.to_string().chars().take(160).collect();
+        Some(format!(
+            "上游模型接口持续报错（{detail}），这一轮先停在这里。已完成的工具结果都保留在会话里，稍后重试即可继续。"
+        ))
+    }
+
+    /// Terminal think salvage: a finished answer parked in the think channel
+    /// is delivered as-is; a truncated scratch CoT is framed honestly. Never
+    /// used mid-ladder — the conclude hop always gets its chance first.
+    fn salvage_think_text(&self) -> Option<String> {
+        let think = self.turn_think_salvage.as_deref()?.trim();
+        if think.is_empty() {
+            return None;
+        }
+        if crate::stutter::is_scratch_think(think) {
+            return Some(format!("{THINK_SALVAGE_PREFIX}\n\n{think}"));
+        }
+        Some(think.to_string())
     }
 
     fn compact_if_needed(&mut self) -> Option<String> {
@@ -2197,10 +2603,13 @@ impl<C: Completer> Agent<C> {
     }
 
     fn apply_compact_pass(&mut self) -> bool {
+        let mut prior = observed_from_messages(&self.messages, &self.workspace);
+        prior.extend(self.read_paths.iter().cloned());
+        prior.extend(self.compacted_read_paths.iter().cloned());
         if !self.try_compact() {
             return false;
         }
-        self.after_compact();
+        self.after_compact(prior);
         let tools = self.enable_recall();
         if tools {
             self.note("[compact] cache_invalidated=compact,tools");
@@ -2269,20 +2678,21 @@ impl<C: Completer> Agent<C> {
         }
     }
 
-    fn after_compact(&mut self) {
+    fn after_compact(&mut self, prior: HashSet<String>) {
         self.handler.reset_repeat(&self.session_id);
-        self.observed_paths.clear();
-        if self.read_paths.is_empty() {
+        self.compacted_read_paths.extend(prior.iter().cloned());
+        self.observed_paths = self.compacted_read_paths.clone();
+        self.read_paths.clear();
+        if prior.is_empty() {
             return;
         }
-        let mut paths: Vec<String> = self.read_paths.iter().cloned().collect();
+        let mut paths: Vec<String> = prior.into_iter().collect();
         paths.sort();
         paths.truncate(16);
         let body = paths.join("\n");
         self.push_hidden_user(format!(
             "[compact] prior reads left the live window. Files still on disk — page with read(path, offset, limit); do not repeat the same unpaged read:\n{body}"
         ));
-        self.read_paths.clear();
     }
 
     /// Append `recall` after compact. Returns true when `tools[]` changed
@@ -2644,11 +3054,32 @@ const NO_TOOL_THINK_FLOOR: u32 = 8192;
 /// Generation room reserved past the think floor for the visible answer.
 const NO_TOOL_ANSWER_RESERVE: u32 = 4096;
 
+/// After a physics / conclusion wrap: hop thinks briefly then must write.
+const WRAP_THINK_CAP: u32 = 768;
+const WRAP_ANSWER_TOKENS: u32 = 4096;
+
 /// Only injected after the streaming watchdog has actually fired. This keeps
 /// the common path free of process rules and lets the model decide how to
-/// converge once it has one concrete observation about its trajectory.
-const THINK_DIVERGENCE_NOTE: &str = "[trajectory] 本轮思考已触及长度预算，可能开始发散。\
-先压缩当前已知事实和未决问题；若证据已足够就作答或执行，若仍缺关键证据只补最小的一步。";
+/// converge once it has one concrete observation about its trajectory. The
+/// truncated thought stays in the transcript (pi `stopReason=length`), so the
+/// note points the model at its own partial work instead of a blank slate.
+const THINK_DIVERGENCE_NOTE: &str =
+    "[trajectory] 上一步思考在长度预算处被截断，截断前的内容已保留在上文。\
+基于已有思考收束：若证据已足够就把结论写进正文或执行，若仍缺关键证据只补最小的一步。";
+
+/// After tools already ran: write the answer, do not start another tool loop.
+const TOOLS_WRAP_NOTE: &str = "[trajectory] 关键证据已经在上下文里。\
+把结论写到正常回复；不要再调用工具，不要把结论只写在思考通道。";
+
+/// No-tool hop that only announced the next step (边做边说 without tools).
+const STUB_CONTINUE_NOTE: &str = "[trajectory] 上一跳只说了下一步、没有调用工具，也没有给出结论。\
+补上工具，或把完整结论写到正常回复。";
+
+/// Final conclude hop: thinking disabled, tools stripped. Injected when the
+/// model repeatedly parked work in think or stub lines; the next generation is
+/// content-only, so the answer must be written out, not planned.
+const CONCLUDE_OFF_NOTE: &str = "[trajectory] 思考额度已用完，本步已停用思考通道。\
+直接把最终结论写成完整的中文回复；不要调用工具，不要写计划。";
 
 /// pi: tool calls on a length-truncated assistant message are not executed.
 const LENGTH_TRUNCATED_TOOL: &str =
@@ -2675,7 +3106,16 @@ const EMPTY_CHANNEL_NOTE: &str = "[trajectory] 上一跳没有给用户可见回
 const SILENT_TOOL_NOTE: &str = "[trajectory] 连续几跳工具调用没有对用户说话。\
 接下来动手前用一句中文（≤20字）说明，再调工具；不要把说明只写在思考通道。";
 
-const EMPTY_STOP_FALLBACK: &str = "这一步停在了空回复上。请再说一次，或换个问法。";
+/// True-nothing terminal only: no spoken text, no salvageable think, no essay.
+/// Anything the model produced this turn is delivered in preference to this.
+const EMPTY_STOP_FALLBACK: &str = "模型连续几步都没有产出可交付的回复，这一轮先停在这里。\
+已完成的工具结果和思考都保留在会话里；直接重试即可继续，或把问题拆小一点再问。";
+
+/// Prefix for a truncated scratch CoT delivered as the terminal fallback.
+/// Honest framing beats an apology: the analysis is real work the user paid
+/// wall-clock for, it just never reached the visible channel.
+const THINK_SALVAGE_PREFIX: &str =
+    "这一轮思考额度用尽，结论没能写进正文。以下是截断前的分析过程，供参考：";
 
 /// Consecutive empty-content tool hops before the Flash-Next style observation.
 const SILENT_TOOL_STREAK: u32 = 4;
@@ -3072,6 +3512,27 @@ mod tests {
         }
     }
 
+    /// Plays the script, then fails the next hop with the given error once.
+    struct ErrTail {
+        inner: Scripted,
+        err: Mutex<Option<Error>>,
+    }
+
+    impl Completer for ErrTail {
+        async fn complete(
+            &self,
+            messages: &[ChatMessage],
+            tools: Option<&[Value]>,
+        ) -> Result<ModelTurn> {
+            if self.inner.turns.lock().expect("script").is_empty() {
+                if let Some(e) = self.err.lock().expect("err").take() {
+                    return Err(e);
+                }
+            }
+            self.inner.complete(messages, tools).await
+        }
+    }
+
     struct Delayed {
         inner: Scripted,
         delay: Duration,
@@ -3131,6 +3592,14 @@ mod tests {
     fn turn_think(reasoning: &str) -> ModelTurn {
         let mut t = turn_text("");
         t.reasoning = reasoning.into();
+        t
+    }
+
+    fn turn_watchdog_think(reasoning: &str) -> ModelTurn {
+        let mut t = ModelTurn::watchdog();
+        t.reasoning = reasoning.into();
+        t.prompt_tokens = 1;
+        t.completion_tokens = 1;
         t
     }
 
@@ -3329,13 +3798,46 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
             turns: Mutex::new(VecDeque::from([
                 turn_think("Let me check finish() and the gate Continue path."),
                 turn_think("Still need to look at inbound.rs for empty IM replies."),
+                turn_think("Now let me look at the sidecar reload path too."),
             ])),
             meter: false,
         };
         let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
         let out = agent.run("对照习惯").await.unwrap();
         assert_eq!(out.text, EMPTY_STOP_FALLBACK);
-        assert_eq!(out.steps, 2);
+        assert_eq!(out.steps, 3);
+        assert!(
+            !out.text.contains("inbound.rs"),
+            "think channel leaked: {}",
+            out.text
+        );
+        assert!(agent.messages.iter().any(|m| m
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains(CONCLUDE_OFF_NOTE)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Second empty hop escalates to a thinking-off conclude hop; a clean
+    /// answer written there is delivered as-is.
+    #[tokio::test]
+    async fn conclude_off_hop_delivers_clean_text() {
+        let dir = std::env::temp_dir().join(format!("q38-coff-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let essay = "结论：核心循环没有问题，收尾策略按预期工作，不需要再改。".repeat(3);
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_think("Let me check finish() first."),
+                turn_think("Wait — I should also verify the gate."),
+                turn_text(&essay),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+        let out = agent.run("对照习惯").await.unwrap();
+        assert_eq!(out.text, essay);
+        assert_eq!(out.steps, 3);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3344,13 +3846,17 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
         let dir = std::env::temp_dir().join(format!("q38-bare-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let scripted = Scripted {
-            turns: Mutex::new(VecDeque::from([turn_text(""), turn_text("")])),
+            turns: Mutex::new(VecDeque::from([
+                turn_text(""),
+                turn_text(""),
+                turn_text(""),
+            ])),
             meter: false,
         };
         let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
         let out = agent.run("hi").await.unwrap();
         assert_eq!(out.text, EMPTY_STOP_FALLBACK);
-        assert_eq!(out.steps, 2);
+        assert_eq!(out.steps, 3);
         assert!(agent.messages.iter().any(|m| m
             .content
             .as_deref()
@@ -4332,13 +4838,26 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
     }
 
     #[test]
-    fn follow_up_compacts_tool_heavy_even_under_120k() {
+    fn follow_up_compacts_tool_heavy_only_when_prefix_is_fat() {
         assert!(!should_compact_at_user_turn(1_000, 0, 500_000, 0.70));
-        assert!(should_compact_follow_up(1_000, 0, 500_000, 0.70, 8, 0, 8));
-        assert!(!should_compact_follow_up(1_000, 0, 500_000, 0.70, 7, 0, 8));
-        assert!(should_compact_follow_up(1_000, 0, 500_000, 0.70, 6, 0, 6));
+        assert!(!should_compact_follow_up(1_000, 0, 500_000, 0.70, 8, 0, 8));
+        assert!(!should_compact_follow_up(31_999, 0, 500_000, 0.70, 8, 0, 8));
+        assert!(should_compact_follow_up(32_000, 0, 500_000, 0.70, 8, 0, 8));
+        assert!(!should_compact_follow_up(32_000, 0, 500_000, 0.70, 7, 0, 8));
+        assert!(should_compact_follow_up(32_000, 0, 500_000, 0.70, 6, 0, 6));
         assert!(should_compact_follow_up(1_000, 0, 500_000, 0.70, 0, 5, 8));
         assert!(!should_compact_follow_up(1_000, 0, 0, 0.70, 8, 5, 8));
+    }
+
+    #[test]
+    fn conclusion_follow_up_is_short_status() {
+        assert!(follow_up_wants_wrap("看完了吗？有结论了吗"));
+        assert!(follow_up_wants_wrap("读完了吗？有什么进展？"));
+        assert!(follow_up_wants_wrap("有结论了吗？"));
+        assert!(!follow_up_wants_wrap("继续读"));
+        assert!(!follow_up_wants_wrap(
+            "github.com/wu1w/vllm-mi210你看下我的vllm仓库，看写的有没有问题，启动配置还能怎么优化"
+        ));
     }
 
     #[test]
@@ -4375,7 +4894,7 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
     }
 
     #[tokio::test]
-    async fn follow_up_archives_tool_heavy_turn_without_tokenizer() {
+    async fn follow_up_keeps_small_tool_turn_without_tokenizer() {
         let dir = std::env::temp_dir().join(format!("q38-fu-{}", uuid::Uuid::new_v4().simple()));
         let sess = dir.join("sessions");
         std::fs::create_dir_all(&sess).unwrap();
@@ -4412,16 +4931,88 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
         let second = agent.run("what did you find").await.unwrap();
         assert_eq!(second.text, "second done", "{:?}", second.stop_reason);
         let live_tools = agent.messages.iter().filter(|m| m.role == "tool").count();
-        assert_eq!(
-            live_tools, 0,
-            "follow-up must archive the previous tool turn, not replay it: {live_tools}"
+        assert!(
+            live_tools >= 8,
+            "small tool-heavy follow-up must keep the reads live: {live_tools}"
         );
         let log = SessionLog::open_in(&sess, "fu1").unwrap();
         assert!(
             log.events()
                 .iter()
+                .all(|e| !matches!(e, SessionEvent::Compact(_))),
+            "sub-32k tool turn should not archive on follow-up: {:?}",
+            log.events()
+                .iter()
+                .map(|e| e.type_name())
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn follow_up_archives_fat_tool_turn_and_remembers_paths() {
+        let dir =
+            std::env::temp_dir().join(format!("q38-fu-fat-{}", uuid::Uuid::new_v4().simple()));
+        let sess = dir.join("sessions");
+        std::fs::create_dir_all(&sess).unwrap();
+        let blob = "W".repeat(20_000);
+        for i in 0..8 {
+            std::fs::write(dir.join(format!("f{i}.txt")), &blob).unwrap();
+        }
+        let mut o = opts(&dir);
+        o.persist_session = true;
+        o.session_id = "fu-fat".into();
+        o.session_dir = Some(sess.clone());
+        o.max_steps = 20;
+        o.peripheral = false;
+        o.working_window = 8_000;
+        o.compact_ratio = 0.10;
+        o.generation_reserve = 0;
+        let mut turns = VecDeque::new();
+        for i in 0..8 {
+            turns.push_back(turn_tool_id(
+                &format!("c{i}"),
+                "read",
+                json!({"path": format!("f{i}.txt")}),
+            ));
+        }
+        turns.push_back(turn_text("first done"));
+        let scripted = Scripted {
+            turns: Mutex::new(turns),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o.clone()).unwrap();
+        let first = agent.run("read the eight files").await.unwrap();
+        assert_eq!(first.text, "first done", "{:?}", first.stop_reason);
+        drop(agent);
+
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([turn_text("second done")])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let second = agent.run("what did you find").await.unwrap();
+        assert_eq!(second.text, "second done", "{:?}", second.stop_reason);
+        let live_tools = agent.messages.iter().filter(|m| m.role == "tool").count();
+        assert_eq!(
+            live_tools, 0,
+            "fat tool-heavy follow-up must archive the previous turn: {live_tools}"
+        );
+        assert!(
+            agent.messages.iter().any(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.contains("prior reads left the live window"))
+            }),
+            "sidecar-fresh compact must still name the archived files"
+        );
+        let log = SessionLog::open_in(&sess, "fu-fat").unwrap();
+        assert!(
+            log.events()
+                .iter()
                 .any(|e| matches!(e, SessionEvent::Compact(_))),
-            "tool-heavy follow-up should compact without a prefix meter: {:?}",
+            "fat follow-up should compact without a prefix meter: {:?}",
             log.events()
                 .iter()
                 .map(|e| e.type_name())
@@ -4591,19 +5182,20 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
     }
 
     #[tokio::test]
-    async fn watchdog_second_cap_stops_without_disabling_thinking() {
+    async fn watchdog_second_cap_concludes_thinking_off() {
         let dir = std::env::temp_dir().join(format!("q38-agent-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let start = ThinkPolicy::effort_with(&crate::policy::ThinkBudget::default(), Effort::Low);
         assert_eq!(start.max_tokens, 8192);
-        // 两连 watchdog：已经提醒并给过空间，按硬资源上限停止，不再用
-        // thinking-off 答案替换模型自己的推理策略。
+        // 两连 watchdog：提醒过、也给过 roomy 空间之后，最后一跳换解码方式
+        // （thinking-off conclude），让模型自己把答案写进正文，而不是直接
+        // 交兜底句。
         let watch = PolicyWatch {
             inner: Scripted {
                 turns: Mutex::new(VecDeque::from([
                     ModelTurn::watchdog(),
                     ModelTurn::watchdog(),
-                    turn_text("should-not-run"),
+                    turn_text("结论：直接给出答案。"),
                 ])),
                 meter: false,
             },
@@ -4613,14 +5205,9 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
         let seen = watch.seen.clone();
         let mut agent = Agent::new(watch, opts(&dir)).unwrap();
         let out = agent.run("hi").await.unwrap();
-        assert_eq!(out.text, EMPTY_STOP_FALLBACK);
+        assert_eq!(out.text, "结论：直接给出答案。");
         assert_eq!(out.stop_reason, None);
         let seen = seen.lock().expect("seen").clone();
-        assert_eq!(
-            seen.iter().filter(|p| !p.enabled).count(),
-            0,
-            "watchdog must not replace model policy with thinking-off: {seen:?}"
-        );
         assert!(
             seen.iter().any(|p| {
                 p.enabled
@@ -4629,6 +5216,16 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
             }),
             "roomy retry must retain answer reserve: {seen:?}"
         );
+        assert!(
+            seen.iter().any(|p| !p.enabled),
+            "exhausted pre-tool think caps must end with a thinking-off conclude hop: {seen:?}"
+        );
+        assert!(agent.messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains(CONCLUDE_OFF_NOTE))
+        }));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4670,7 +5267,8 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
 
     #[tokio::test]
     async fn watchdog_after_tool_round_also_keeps_model_policy() {
-        // 用过工具也不改变原则：事实提醒 + 原推理模式下的一次宽预算重试。
+        // After tools, think-cap keeps tools[] and the model policy. It does
+        // not start a toolless wrap overlay.
         let dir = std::env::temp_dir().join(format!("q38-agent-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
@@ -4693,27 +5291,45 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
         let mut agent = Agent::new(watch, o).unwrap();
         let out = agent.run("read ping.txt then answer").await.unwrap();
         assert_eq!(out.text, "recovered");
+        assert!(agent.messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains(THINK_DIVERGENCE_NOTE))
+        }));
+        assert!(!agent.messages.iter().any(|m| {
+            m.content
+                .as_deref()
+                .is_some_and(|c| c.contains(TOOLS_WRAP_NOTE))
+        }));
         let seen = seen.lock().expect("seen").clone();
         assert!(
             seen.iter().all(|p| p.enabled),
-            "tool-using retry must not disable the model's thinking: {seen:?}"
+            "first think-cap hop after tools must keep thinking enabled: {seen:?}"
         );
         assert!(
             seen.iter()
-                .any(|p| p.enabled && p.max_think_tokens == NO_TOOL_THINK_FLOOR),
-            "tool-using turn should get the same roomy retry: {seen:?}"
+                .any(|p| p.max_think_tokens == NO_TOOL_THINK_FLOOR),
+            "post-tools think cap must widen for the retry, not rerun at the starved cap: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|p| p.max_think_tokens == WRAP_THINK_CAP),
+            "think-cap after tools must not start a toolless wrap: {seen:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn watchdog_second_empty_cap_ends_quietly() {
+    async fn watchdog_empty_caps_then_empty_conclude_ends_quietly() {
         let dir = std::env::temp_dir().join(format!("q38-agent-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
+        // Null think-caps carry nothing to salvage; the conclude hop also
+        // returns blank. Only then is the honest fallback allowed.
         let scripted = Scripted {
             turns: Mutex::new(VecDeque::from([
                 ModelTurn::watchdog(),
                 ModelTurn::watchdog(),
+                turn_text(""),
             ])),
             meter: false,
         };
@@ -4725,7 +5341,7 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
     }
 
     #[tokio::test]
-    async fn watchdog_after_tools_wraps_up_instead_of_stopping() {
+    async fn watchdog_after_tools_keeps_tools_and_continues() {
         let dir =
             std::env::temp_dir().join(format!("q38-wd-wrap-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4735,7 +5351,6 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
         let scripted = Scripted {
             turns: Mutex::new(VecDeque::from([
                 turn_tool("read", json!({"path": "ping.txt"})),
-                ModelTurn::watchdog(),
                 ModelTurn::watchdog(),
                 turn_text("仓库审查结论"),
             ])),
@@ -4748,7 +5363,422 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
             m.role == "user"
                 && m.content
                     .as_deref()
-                    .is_some_and(|c| c.contains(EMPTY_CHANNEL_NOTE))
+                    .is_some_and(|c| c.contains(THINK_DIVERGENCE_NOTE))
+        }));
+        assert!(!agent.messages.iter().any(|m| {
+            m.content
+                .as_deref()
+                .is_some_and(|c| c.contains(TOOLS_WRAP_NOTE))
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn watchdog_wrap_up_retries_thinking_off() {
+        let dir =
+            std::env::temp_dir().join(format!("q38-wd-off-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let start = ThinkPolicy::effort_with(&crate::policy::ThinkBudget::default(), Effort::Low);
+        let watch = PolicyWatch {
+            inner: Scripted {
+                turns: Mutex::new(VecDeque::from([
+                    turn_tool("read", json!({"path": "ping.txt"})),
+                    ModelTurn::watchdog(),
+                    ModelTurn::watchdog(),
+                    turn_text("仓库审查结论"),
+                ])),
+                meter: false,
+            },
+            policy: Mutex::new(start),
+            seen: std::sync::Arc::new(Mutex::new(Vec::new())),
+        };
+        let seen = watch.seen.clone();
+        let mut agent = Agent::new(watch, o).unwrap();
+        let out = agent.run("read ping.txt then review").await.unwrap();
+        assert_eq!(out.text, "仓库审查结论");
+        let seen = seen.lock().expect("seen").clone();
+        assert!(
+            seen.iter().any(|p| !p.enabled),
+            "second empty think-cap after tools must try thinking-off with tools still on: {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// pi `stopReason=length`: a watchdog-cut thought is appended to the
+    /// transcript so the next hop continues from it instead of re-deriving
+    /// the whole analysis from scratch (the old discard-and-respin burned
+    /// minutes of decode per rescue rung).
+    #[tokio::test]
+    async fn watchdog_cut_think_stays_in_transcript() {
+        let dir =
+            std::env::temp_dir().join(format!("q38-wd-keep-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let cut = "launch 脚本把 gpu-memory-utilization 设到 0.97，和 README 建议的 0.90 不一致，\
+长上下文压测时容易 OOM；bench.py 只测非流式吞吐，没有覆盖并发。接下来核对";
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("read", json!({"path": "ping.txt"})),
+                turn_watchdog_think(cut),
+                turn_text("结论：显存参数与 README 不一致，建议统一到 0.90。"),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("read ping.txt then review").await.unwrap();
+        assert_eq!(
+            out.text,
+            "结论：显存参数与 README 不一致，建议统一到 0.90。"
+        );
+        let kept = agent.messages.iter().any(|m| {
+            m.role == "assistant" && m.reasoning_content.as_deref().is_some_and(|r| r == cut)
+        });
+        assert!(kept, "cut think must stay in the transcript");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// When the nudge and the thinking-off conclude hop both fail, the turn
+    /// still delivers the model's own parked analysis — never the apology.
+    #[tokio::test]
+    async fn exhausted_ladder_salvages_parked_think() {
+        let dir =
+            std::env::temp_dir().join(format!("q38-salvage-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let review =
+            "仓库审查结论：launch 脚本把 gpu-memory-utilization 设为 0.97，而 README 建议 0.90，\
+两处需要统一；bench.py 只统计非流式吞吐，建议补一组并发请求的实测；fused GDN 核的 block size \
+是按 gfx90a 手调的，换卡前要重新对拍数值精度。整体结构没有问题，可以按上述三点收敛。";
+        assert!(crate::stutter::is_substantial_reply(review));
+        assert!(!crate::stutter::is_scratch_think(review));
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("read", json!({"path": "ping.txt"})),
+                turn_watchdog_think(review),
+                ModelTurn::watchdog(),
+                turn_text(""),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("read ping.txt then review").await.unwrap();
+        assert_eq!(out.text, review, "parked analysis must be delivered");
+        assert_eq!(out.stop_reason, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A truncated scratch CoT is still delivered at the terminal, framed
+    /// honestly, instead of the apology.
+    #[tokio::test]
+    async fn exhausted_ladder_frames_scratch_think() {
+        let dir =
+            std::env::temp_dir().join(format!("q38-scratch-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let scratch = "Let me check the launch flags first. The gpu-memory-utilization is 0.97 \
+in scripts/launch.sh but the README recommends 0.90, so long-context runs risk OOM. The bench \
+script only measures non-streaming throughput and never exercises concurrency, which hides \
+scheduler stalls. I still need to verify the fused kernel block size against gfx90a.";
+        assert!(crate::stutter::is_substantial_reply(scratch));
+        assert!(crate::stutter::is_scratch_think(scratch));
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("read", json!({"path": "ping.txt"})),
+                turn_watchdog_think(scratch),
+                ModelTurn::watchdog(),
+                turn_text(""),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("read ping.txt then review").await.unwrap();
+        assert!(
+            out.text.starts_with(THINK_SALVAGE_PREFIX),
+            "scratch CoT needs honest framing: {}",
+            out.text
+        );
+        assert!(out.text.contains("gpu-memory-utilization"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    struct ToolsWatch {
+        inner: Scripted,
+        tools_seen: std::sync::Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl Completer for ToolsWatch {
+        async fn complete(
+            &self,
+            messages: &[ChatMessage],
+            tools: Option<&[Value]>,
+        ) -> Result<ModelTurn> {
+            self.tools_seen
+                .lock()
+                .expect("tools_seen")
+                .push(tools.is_some_and(|t| !t.is_empty()));
+            self.inner.complete(messages, tools).await
+        }
+    }
+
+    /// The tool schema renders into the system prefix. Wrap and conclude hops
+    /// must keep `tools[]` in the request or every rescue hop pays a full
+    /// prompt refill (minutes at 20k tokens on a local engine).
+    #[tokio::test]
+    async fn rescue_hops_keep_tools_in_request() {
+        let dir =
+            std::env::temp_dir().join(format!("q38-toolskeep-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let watch = ToolsWatch {
+            inner: Scripted {
+                turns: Mutex::new(VecDeque::from([
+                    turn_tool("read", json!({"path": "ping.txt"})),
+                    ModelTurn::watchdog(),
+                    ModelTurn::watchdog(),
+                    turn_text("结论：没问题。"),
+                ])),
+                meter: false,
+            },
+            tools_seen: std::sync::Arc::new(Mutex::new(Vec::new())),
+        };
+        let seen = watch.tools_seen.clone();
+        let mut agent = Agent::new(watch, o).unwrap();
+        let out = agent.run("read ping.txt then review").await.unwrap();
+        assert_eq!(out.text, "结论：没问题。");
+        let seen = seen.lock().expect("tools_seen").clone();
+        assert_eq!(seen.len(), 4);
+        assert!(
+            seen.iter().all(|present| *present),
+            "every hop including wrap/conclude must keep tools[]: {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The wrap tight rung must not flip `effort`: the effort sentence lives
+    /// in the system prompt, so changing it mid-turn busts the prefix cache.
+    #[tokio::test]
+    async fn wrap_tight_rung_keeps_session_effort() {
+        let dir =
+            std::env::temp_dir().join(format!("q38-effkeep-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let start = ThinkPolicy::native_with(&crate::policy::ThinkBudget::default());
+        assert_eq!(start.effort, Some(Effort::Medium));
+        let watch = PolicyWatch {
+            inner: Scripted {
+                turns: Mutex::new(VecDeque::from([
+                    turn_tool("read", json!({"path": "ping.txt"})),
+                    turn_text("already read"),
+                    turn_text("结论：内容没问题。"),
+                ])),
+                meter: false,
+            },
+            policy: Mutex::new(start),
+            seen: std::sync::Arc::new(Mutex::new(Vec::new())),
+        };
+        let seen = watch.seen.clone();
+        let mut agent = Agent::new(watch, o).unwrap();
+        let first = agent.run("read ping.txt then review").await.unwrap();
+        assert_eq!(first.text, "already read");
+        let second = agent.run("有结论了吗？").await.unwrap();
+        assert_eq!(second.text, "结论：内容没问题。");
+        let seen = seen.lock().expect("seen").clone();
+        let tight: Vec<_> = seen
+            .iter()
+            .filter(|p| p.enabled && p.max_think_tokens == WRAP_THINK_CAP)
+            .collect();
+        assert!(!tight.is_empty(), "wrap tight rung must have run: {seen:?}");
+        assert!(
+            tight.iter().all(|p| p.effort == Some(Effort::Medium)),
+            "tight rung must keep the session effort sentence: {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A think-cap hop whose reasoning is a truncated CoT must never have that
+    /// CoT delivered as the answer — the ladder continues until the model
+    /// writes `content` itself (thinking-off hop).
+    #[tokio::test]
+    async fn watchdog_never_delivers_truncated_think() {
+        let dir =
+            std::env::temp_dir().join(format!("q38-wd-promo-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let review = format!(
+            "Let me summarize the review. {}",
+            "The launch script sets gpu-memory-utilization too high. Wait — actually ".repeat(30)
+        );
+        assert!(crate::stutter::is_substantial_reply(&review));
+        assert!(crate::stutter::is_scratch_think(&review));
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("read", json!({"path": "ping.txt"})),
+                ModelTurn::watchdog(),
+                turn_watchdog_think(&review),
+                turn_text("结论：启动脚本显存参数偏满，建议先降到 0.85 再压测一轮。"),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("read ping.txt then review").await.unwrap();
+        assert_eq!(
+            out.text,
+            "结论：启动脚本显存参数偏满，建议先降到 0.85 再压测一轮。"
+        );
+        assert!(
+            !out.text.contains("Let me summarize"),
+            "truncated CoT leaked: {}",
+            out.text
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A long review parked only in the think channel after tools is not
+    /// auto-promoted; the model must write it to `content` on the next hop.
+    #[tokio::test]
+    async fn parked_think_after_tools_is_rewritten_not_promoted() {
+        let dir =
+            std::env::temp_dir().join(format!("q38-wd-chan-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let review = format!(
+            "仓库审查结论：launch 脚本和 README 默认值不一致。{}",
+            "fused GDN kernel 的 block size 需要对照 bench.py 的实测。".repeat(25)
+        );
+        assert!(crate::stutter::is_substantial_reply(&review));
+        assert!(review.chars().count() > PROMOTE_REASONING_MAX);
+        let rewritten = "结论：launch 脚本和 README 默认值不一致，block size 要对照实测。";
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("read", json!({"path": "ping.txt"})),
+                ModelTurn::watchdog(),
+                turn_think(&review),
+                turn_text(rewritten),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("read ping.txt then review").await.unwrap();
+        assert_eq!(out.text, rewritten);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn conclusion_follow_up_wraps_without_reread() {
+        let dir =
+            std::env::temp_dir().join(format!("q38-wrap-ask-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        o.max_steps = 8;
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("read", json!({"path": "ping.txt"})),
+                turn_text("already read"),
+                turn_text("结论：内容没问题，启动参数可以再压一点显存。"),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let first = agent.run("read ping.txt then review").await.unwrap();
+        assert_eq!(first.text, "already read");
+        let second = agent.run("有结论了吗？").await.unwrap();
+        assert_eq!(second.text, "结论：内容没问题，启动参数可以再压一点显存。");
+        assert!(agent.messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains(TOOLS_WRAP_NOTE))
+        }));
+        let live_tools = agent.messages.iter().filter(|m| m.role == "tool").count();
+        assert_eq!(
+            live_tools, 1,
+            "conclusion follow-up must not re-read: {live_tools}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn progress_narration_without_tools_does_not_finish() {
+        let dir = std::env::temp_dir().join(format!("q38-stub-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("read", json!({"path": "ping.txt"})),
+                turn_text("补看构建对拍脚本。"),
+                turn_text("仓库审查结论"),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("read ping.txt then review").await.unwrap();
+        assert_eq!(out.text, "仓库审查结论");
+        assert!(agent.messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains(STUB_CONTINUE_NOTE))
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A second stub does not deliver the review parked in think — it forces a
+    /// thinking-off conclude hop where the model writes the answer itself.
+    #[tokio::test]
+    async fn second_stub_forces_thinking_off_conclusion() {
+        let dir =
+            std::env::temp_dir().join(format!("q38-stub-think-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let review = format!(
+            "仓库审查结论：launch 脚本和 README 默认值不一致。{}",
+            "fused GDN kernel 的 block size 需要对照 bench.py 的实测。".repeat(25)
+        );
+        assert!(crate::stutter::is_substantial_reply(&review));
+        let mut hop = turn_tool("read", json!({"path": "ping.txt"}));
+        hop.reasoning = review.clone();
+        hop.content = "看 HIP 核的 .cu 源码。".into();
+        let rewritten = "结论：launch 脚本和 README 默认值不一致，需要统一。";
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                hop,
+                turn_text("补看构建对拍脚本。"),
+                turn_text("补看构建对拍脚本。"),
+                turn_text(rewritten),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("read ping.txt then review").await.unwrap();
+        assert_eq!(out.text, rewritten);
+        assert!(agent.messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains(CONCLUDE_OFF_NOTE))
         }));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -4768,6 +5798,7 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
                 ModelTurn::watchdog(),
                 ModelTurn::watchdog(),
                 ModelTurn::watchdog(),
+                ModelTurn::watchdog(),
             ])),
             meter: false,
         };
@@ -4779,6 +5810,67 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
             "tool narration leaked as the answer: {}",
             out.text
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Mid-turn endpoint failure (non-retryable 4xx) must not kill the turn:
+    /// the user gets a visible explanation and the tool results stay usable.
+    #[tokio::test]
+    async fn http_error_after_tools_finishes_gracefully() {
+        let dir = std::env::temp_dir().join(format!("q38-http-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let scripted = ErrTail {
+            inner: Scripted {
+                turns: Mutex::new(VecDeque::from([turn_tool(
+                    "read",
+                    json!({"path": "ping.txt"}),
+                )])),
+                meter: false,
+            },
+            err: Mutex::new(Some(Error::Http(
+                "HTTP status client error (400 Bad Request) for url (http://x/v1/chat/completions)"
+                    .into(),
+            ))),
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("read ping.txt then review").await.unwrap();
+        assert!(
+            out.text.contains("上游模型接口"),
+            "expected graceful endpoint-failure text: {}",
+            out.text
+        );
+        assert!(
+            out.stop_reason
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("http:"),
+            "{:?}",
+            out.stop_reason
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A first-hop endpoint failure with nothing done stays loud (setup
+    /// problems like a bad key or URL must surface as errors, not prose).
+    #[tokio::test]
+    async fn http_error_first_hop_propagates() {
+        let dir = std::env::temp_dir().join(format!("q38-http0-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let scripted = ErrTail {
+            inner: Scripted {
+                turns: Mutex::new(VecDeque::new()),
+                meter: false,
+            },
+            err: Mutex::new(Some(Error::Http(
+                "HTTP status client error (401 Unauthorized) for url (http://x/v1/chat/completions)"
+                    .into(),
+            ))),
+        };
+        let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+        assert!(agent.run("hi").await.is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 

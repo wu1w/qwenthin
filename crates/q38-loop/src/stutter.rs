@@ -28,6 +28,49 @@ pub fn is_substantial_reply(s: &str) -> bool {
     reply_units(s) >= MIN_RESTATE_CHARS
 }
 
+/// Short 边做边说 / next-step line. A no-tool hop that is only this is not a
+/// finish: the model announced work, it did not deliver. Substantial replies
+/// are never narration, even if they mention “接下来”.
+pub fn is_progress_narration(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() || is_substantial_reply(t) {
+        return false;
+    }
+    if is_scratch_think(t) {
+        return true;
+    }
+    const MARK: &[&str] = &[
+        "先克隆",
+        "先看",
+        "先读",
+        "先查",
+        "先把",
+        "接着",
+        "通读",
+        "补看",
+        "补读",
+        "再看",
+        "再读",
+        "再查",
+        "仓库很小",
+    ];
+    if MARK.iter().any(|m| t.contains(m)) {
+        return true;
+    }
+    let l = t.to_ascii_lowercase();
+    if l.contains("let me ") || l.contains("i'll ") || l.contains("next i") || l.contains("next,") {
+        return true;
+    }
+    matches!(t.chars().next(), Some('看' | '读' | '查'))
+        && !t.contains("结论")
+        && !t.contains("建议")
+        && !t.contains("问题")
+        && !t.contains("修复")
+        && !t.contains("没问题")
+        && !t.contains("读完")
+        && !t.contains("看完")
+}
+
 /// Thinking that is still planning, not a finished user-facing answer.
 /// Flash-Next often stops with this still in `reasoning_content`.
 pub fn is_scratch_think(s: &str) -> bool {
@@ -467,6 +510,24 @@ is byte-stable and tools stay frozen.";
         assert!(!is_scratch_think("这让我想到 finish 路径的空回复问题。"));
         assert!(!is_scratch_think("我再强调：c2f9bca 已经修好了。"));
         assert!(!is_scratch_think("让我总结一下：空回复必须有兜底。"));
+    }
+
+    #[test]
+    fn progress_narration_is_not_a_finish() {
+        assert!(is_progress_narration("补看构建对拍脚本。"));
+        assert!(is_progress_narration("先克隆仓库到本地看看。"));
+        assert!(is_progress_narration("仓库很小，通读全部文件。"));
+        assert!(is_progress_narration("接着读补丁脚本和 JIT 脚本。"));
+        assert!(is_progress_narration("看 HIP 核的 .cu 源码。"));
+        assert!(is_progress_narration("Let me read build_and_test.py next."));
+        assert!(!is_progress_narration("仓库审查结论"));
+        assert!(!is_progress_narration("recovered"));
+        assert!(!is_progress_narration("你好"));
+        assert!(!is_progress_narration("读完了。"));
+        assert!(!is_progress_narration(
+            "修得没问题。复查通过。c2f9bca 跳过 URL 端口里的三位数字，不再误判成 HTTP 状态码。\
+网关软上限与空回复路径已经对齐。用户可见结论写在这里，没有未完成的计划。"
+        ));
     }
 
     #[test]
