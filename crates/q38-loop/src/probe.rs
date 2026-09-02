@@ -408,7 +408,7 @@ async fn complete_chat(
         return Err(Error::Http(err.to_string()));
     }
     let msg = &v["choices"][0]["message"];
-    let reasoning = msg["reasoning_content"].as_str().unwrap_or("").to_string();
+    let reasoning = message_reasoning(msg);
     let content = msg["content"].as_str().unwrap_or("").to_string();
     let think_text = if !reasoning.is_empty() {
         reasoning.clone()
@@ -892,8 +892,17 @@ async fn complete_messages(
     }
     let msg = &v["choices"][0]["message"];
     let content = msg["content"].as_str().unwrap_or("").to_string();
-    let reasoning = msg["reasoning_content"].as_str().unwrap_or("").to_string();
+    let reasoning = message_reasoning(msg);
     Ok((content, reasoning))
+}
+
+/// vLLM 0.28 puts think on `message.reasoning`; llama.cpp uses `reasoning_content`.
+fn message_reasoning(msg: &Value) -> String {
+    msg["reasoning_content"]
+        .as_str()
+        .or_else(|| msg["reasoning"].as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 fn clip_probe(s: &str) -> String {

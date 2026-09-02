@@ -68,13 +68,13 @@ pub fn build_chat_body(spec: &ChatRequestSpec<'_>) -> Value {
             }
         }
         EngineProfile::Vllm | EngineProfile::Sglang => {
+            // OpenAI Python `extra_body=` is merged into the JSON root by the
+            // client. A nested `"extra_body": {...}` key is not a vLLM/SGLang
+            // field — pydantic drops it, so enable_thinking / reasoning_effort /
+            // top_k never reach the template and Qwen3.8 stays on default xhigh.
             insert_openai_sampling(&mut root, &sampling);
-            let mut extra = Map::new();
-            insert_local_sampling(&mut extra, &sampling);
-            insert_kwargs_object(&mut extra, "chat_template_kwargs", &kwargs);
-            if !extra.is_empty() {
-                insert(&mut root, "extra_body", Value::Object(extra));
-            }
+            insert_local_sampling(&mut root, &sampling);
+            insert_kwargs_object(&mut root, "chat_template_kwargs", &kwargs);
         }
         EngineProfile::Generic => {
             insert_openai_sampling(&mut root, &sampling);
@@ -267,7 +267,8 @@ mod tests {
         let args = &body["messages"][1]["tool_calls"][0]["function"]["arguments"];
         assert!(args.is_string(), "{args}");
         assert_eq!(args.as_str().unwrap(), r#"{"path":"a.rs"}"#);
-        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body["chat_template_kwargs"].is_object());
+        assert!(body.get("extra_body").is_none());
     }
 
     #[test]
@@ -370,38 +371,41 @@ mod tests {
     }
 
     #[test]
-    fn vllm_puts_kwargs_in_extra_body() {
+    fn vllm_puts_kwargs_at_root() {
         let mut caps = EndpointCaps::qwen38_llamacpp();
         caps.profile = EngineProfile::Vllm;
         let policy = ThinkPolicy::agent_default();
         let msgs = vec![ChatMessage::user("hi")];
         let body = build_chat_body(&spec(&caps, &policy, &msgs, None));
-        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body.get("extra_body").is_none(), "{body}");
         assert_eq!(
-            body["extra_body"]["chat_template_kwargs"]["reasoning_effort"],
+            body["chat_template_kwargs"]["reasoning_effort"],
             json!("low")
         );
-        assert_eq!(body["extra_body"]["top_k"], json!(20));
-        assert!(body.get("top_k").is_none());
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(true));
+        assert_eq!(body["top_k"], json!(20));
+        assert_eq!(body["temperature"], json!(1.0));
         assert!(body.get("cache_prompt").is_none());
         assert!(body.get("id_slot").is_none());
     }
 
     #[test]
-    fn vllm_off_sends_preserve_in_extra_body() {
+    fn vllm_off_sends_preserve_at_root() {
         let mut caps = EndpointCaps::qwen38_llamacpp();
         caps.profile = EngineProfile::Vllm;
         let policy = ThinkPolicy::off();
         let msgs = vec![ChatMessage::user("hi")];
         let body = build_chat_body(&spec(&caps, &policy, &msgs, None));
+        assert!(body.get("extra_body").is_none(), "{body}");
         assert_eq!(
-            body["extra_body"]["chat_template_kwargs"]["preserve_thinking"],
+            body["chat_template_kwargs"]["preserve_thinking"],
             json!(true)
         );
         assert_eq!(
-            body["extra_body"]["chat_template_kwargs"]["enable_thinking"],
+            body["chat_template_kwargs"]["enable_thinking"],
             json!(false)
         );
+        assert_eq!(body["top_k"], json!(20));
         assert!(body.get("cache_prompt").is_none());
         assert!(body.get("id_slot").is_none());
     }
@@ -413,7 +417,9 @@ mod tests {
         let policy = ThinkPolicy::agent_default();
         let msgs = vec![ChatMessage::user("hi")];
         let body = build_chat_body(&spec(&caps, &policy, &msgs, None));
-        assert!(body["extra_body"]["chat_template_kwargs"].is_object());
+        assert!(body.get("extra_body").is_none(), "{body}");
+        assert!(body["chat_template_kwargs"].is_object());
+        assert_eq!(body["top_k"], json!(20));
     }
 
     #[test]

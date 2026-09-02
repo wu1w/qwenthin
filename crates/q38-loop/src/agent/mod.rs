@@ -391,6 +391,8 @@ fn should_compact_follow_up(
 }
 
 /// Short status/conclusion follow-ups should write, not start another read loop.
+/// Bare “继续” after files are already in context is a resume-to-write, not a
+/// new exploration — “继续读” still means keep reading.
 fn follow_up_wants_wrap(user: &str) -> bool {
     let t = user.trim();
     if t.is_empty() {
@@ -398,6 +400,14 @@ fn follow_up_wants_wrap(user: &str) -> bool {
     }
     if t.chars().count() > 80 {
         return false;
+    }
+    let exact = t.trim_end_matches(['。', '！', '？', '.', '!', '?']);
+    let exact_l = exact.to_ascii_lowercase();
+    if matches!(
+        exact_l.as_str(),
+        "继续" | "continue" | "接着" | "然后呢" | "go on"
+    ) {
+        return true;
     }
     const MARK: &[&str] = &[
         "结论",
@@ -412,7 +422,14 @@ fn follow_up_wants_wrap(user: &str) -> bool {
         "progress",
     ];
     let l = t.to_ascii_lowercase();
-    MARK.iter().any(|m| t.contains(m) || l.contains(m))
+    if MARK.iter().any(|m| t.contains(m) || l.contains(m)) {
+        return true;
+    }
+    // Short status questions: 检查完了吗 / 做完了吗 / 结束了吗
+    t.contains('吗')
+        && ["完", "结果", "结论", "进展", "怎样", "好了", "结束"]
+            .iter()
+            .any(|m| t.contains(m))
 }
 
 fn live_tool_count(messages: &[ChatMessage]) -> usize {
@@ -569,10 +586,13 @@ pub struct Agent<C> {
     length_truncations: u32,
     /// Any tool batch was committed this user turn (executed or failed-truncated).
     tools_this_turn: bool,
+    /// Consecutive tool batches that added no new `observed_paths` after at
+    /// least three files were already in context. Read/grep loops that reread
+    /// the same tree hit this; a write/edit or a new path resets it.
+    explore_stall: u32,
     /// One roomy think-cap retry already ran this user turn.
     watchdog_roomy_tried: bool,
-    /// User asked to conclude, or a physics budget wrap. Think-cap after
-    /// tools does not set this.
+    /// User asked to conclude, a physics budget wrap, or an explore-stall wrap.
     wrap_up_after_tools: bool,
     /// Wrap-up already tried a tight think cap; next hop is thinking-off.
     wrap_up_off: bool,
@@ -805,6 +825,7 @@ impl<C: Completer> Agent<C> {
             silent_tool_nudged: false,
             length_truncations: 0,
             tools_this_turn: false,
+            explore_stall: 0,
             watchdog_roomy_tried: false,
             wrap_up_after_tools: false,
             wrap_up_off: false,
@@ -891,6 +912,7 @@ impl<C: Completer> Agent<C> {
         self.silent_tool_nudged = false;
         self.length_truncations = 0;
         self.tools_this_turn = false;
+        self.explore_stall = 0;
         self.watchdog_roomy_tried = false;
         self.wrap_up_after_tools = false;
         self.wrap_up_off = false;
@@ -1009,6 +1031,11 @@ impl<C: Completer> Agent<C> {
                 reason: Some(reason),
             });
         }
+        if self.should_arm_explore_wrap() {
+            self.wrap_up_after_tools = true;
+            self.note("[watchdog] explore stall; wrap-up");
+            self.push_hidden_user(TOOLS_WRAP_NOTE);
+        }
         if let Some(reason) = self.compact_if_needed() {
             self.note(&reason);
             if self.physics_nudged {
@@ -1055,6 +1082,7 @@ impl<C: Completer> Agent<C> {
             && !self.watchdog_roomy_tried
             && self.rescue_notes == 0
             && !self.wrap_up_after_tools
+            && !self.tools_this_turn
         {
             // First think-cap of the turn, pre- or post-tools: keep the
             // partial thought and give one roomy retry. The 512 runaway
@@ -1089,7 +1117,7 @@ impl<C: Completer> Agent<C> {
                 self.fail_truncated_tools(std::mem::take(&mut turn.tool_calls));
                 return Ok(Verdict::Continue);
             }
-            if Self::hop_is_delivery(turn) {
+            if self.hop_is_delivery(turn) {
                 self.push_assistant(turn);
                 self.last_spoken = Some(turn.content.clone());
                 return Ok(Verdict::Stop(StopCause::Deliver {
@@ -1167,7 +1195,7 @@ impl<C: Completer> Agent<C> {
                 turn.content = body;
             }
         }
-        if turn.tool_calls.is_empty() && !Self::hop_is_delivery(turn) {
+        if turn.tool_calls.is_empty() && !self.hop_is_delivery(turn) {
             // Keep the incomplete hop (parked think / stub line) in the
             // transcript so the rescue note refers to something the model
             // can actually see, and nothing gets re-derived from scratch.
@@ -1520,10 +1548,25 @@ impl<C: Completer> Agent<C> {
         Some(r.to_string())
     }
 
-    fn hop_is_delivery(turn: &ModelTurn) -> bool {
-        turn.tool_calls.is_empty()
-            && !turn.content.trim().is_empty()
-            && !crate::stutter::is_progress_narration(&turn.content)
+    /// A no-tool hop is a delivery only if it actually answers.
+    ///
+    /// Wrap hops are stricter: a one-line plan is not a conclusion. The
+    /// wrap note already forbade more tools; accepting “收尾前再核实一眼”
+    /// as the turn result is how simple reviews stopped without an answer.
+    fn hop_is_delivery(&self, turn: &ModelTurn) -> bool {
+        if !turn.tool_calls.is_empty() || turn.content.trim().is_empty() {
+            return false;
+        }
+        if crate::stutter::is_progress_narration(&turn.content) {
+            return false;
+        }
+        if self.wrap_up_after_tools
+            && !crate::stutter::is_substantial_reply(&turn.content)
+            && !crate::stutter::is_verdict_line(&turn.content)
+        {
+            return false;
+        }
+        true
     }
 
     /// Escalate to the final conclude hop: tools stripped, thinking disabled.
@@ -1621,6 +1664,7 @@ impl<C: Completer> Agent<C> {
 
     async fn execute_tools(&mut self, calls: Vec<ToolCall>) {
         self.tools_this_turn = true;
+        let paths_before = self.observed_paths.len();
         for call in &calls {
             self.note(&format!("[{}] {}", call.name, preview_args(call)));
         }
@@ -1699,6 +1743,31 @@ impl<C: Completer> Agent<C> {
             self.sync_effort(PolicyReason::Upgrade);
         }
         self.inject_skill_from_tools(&fail_blob);
+        self.note_explore_stall(&calls, paths_before);
+    }
+
+    /// Count reread/grep batches that add no new files. The wrap itself is
+    /// armed in `preflight_stop` so the next hop sees TOOLS_WRAP_NOTE before
+    /// generating — same shape as a physics wrap, not a mid-batch interrupt.
+    fn note_explore_stall(&mut self, calls: &[ToolCall], paths_before: usize) {
+        if self.wrap_up_after_tools {
+            return;
+        }
+        let writing = calls
+            .iter()
+            .any(|c| matches!(c.name.as_str(), "write" | "edit"));
+        if writing || self.observed_paths.len() > paths_before {
+            self.explore_stall = 0;
+            return;
+        }
+        if self.observed_paths.len() < 3 {
+            return;
+        }
+        self.explore_stall = self.explore_stall.saturating_add(1);
+    }
+
+    fn should_arm_explore_wrap(&self) -> bool {
+        !self.wrap_up_after_tools && self.explore_stall >= EXPLORE_STALL_WRAP
     }
 
     fn fail_truncated_tools(&mut self, calls: Vec<ToolCall>) {
@@ -3054,6 +3123,11 @@ const NO_TOOL_THINK_FLOOR: u32 = 8192;
 /// Generation room reserved past the think floor for the visible answer.
 const NO_TOOL_ANSWER_RESERVE: u32 = 4096;
 
+/// Consecutive tool batches with no new observed path after ≥3 files are
+/// already in context. The next hop is a wrap-up, not another grep of the
+/// same tree. Write/edit or a newly seen path reset the counter.
+const EXPLORE_STALL_WRAP: u32 = 4;
+
 /// After a physics / conclusion wrap: hop thinks briefly then must write.
 const WRAP_THINK_CAP: u32 = 768;
 const WRAP_ANSWER_TOKENS: u32 = 4096;
@@ -4179,13 +4253,13 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
             turns: Mutex::new(VecDeque::from([
                 turn_tool("read", ping.clone()),
                 turn_tool("read", ping.clone()),
-                turn_text("wrapped up"),
+                turn_text("结论：已收束。"),
             ])),
             meter: false,
         };
         let mut agent = Agent::new(scripted, o).unwrap();
         let out = agent.run("read ping.txt").await.unwrap();
-        assert_eq!(out.text, "wrapped up");
+        assert_eq!(out.text, "结论：已收束。");
         assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
         let hidden: Vec<_> = agent
             .messages
@@ -4785,13 +4859,13 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
         let mut o = opts(&dir);
         o.working_window = 10;
         let scripted = Scripted {
-            turns: Mutex::new(VecDeque::from([turn_text("should not run")])),
+            turns: Mutex::new(VecDeque::from([turn_text("结论：窗口已满。")])),
             meter: true,
         };
         let mut agent = Agent::new(scripted, o).unwrap();
         let out = agent.run("hi").await.unwrap();
         assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
-        assert_eq!(out.text, "should not run");
+        assert_eq!(out.text, "结论：窗口已满。");
         assert!(out.steps >= 1);
         let hidden: Vec<_> = agent
             .messages
@@ -4854,6 +4928,10 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
         assert!(follow_up_wants_wrap("看完了吗？有结论了吗"));
         assert!(follow_up_wants_wrap("读完了吗？有什么进展？"));
         assert!(follow_up_wants_wrap("有结论了吗？"));
+        assert!(follow_up_wants_wrap("继续"));
+        assert!(follow_up_wants_wrap("continue"));
+        assert!(follow_up_wants_wrap("检查完了吗？"));
+        assert!(follow_up_wants_wrap("做完了吗"));
         assert!(!follow_up_wants_wrap("继续读"));
         assert!(!follow_up_wants_wrap(
             "github.com/wu1w/vllm-mi210你看下我的vllm仓库，看写的有没有问题，启动配置还能怎么优化"
@@ -4882,13 +4960,13 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
         o.working_window = 10;
         o.compact_ratio = 0.10;
         let scripted = Scripted {
-            turns: Mutex::new(VecDeque::from([turn_text("should not run")])),
+            turns: Mutex::new(VecDeque::from([turn_text("结论：窗口已满。")])),
             meter: true,
         };
         let mut agent = Agent::new(scripted, o).unwrap();
         let out = agent.run("hi").await.unwrap();
         assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
-        assert_eq!(out.text, "should not run");
+        assert_eq!(out.text, "结论：窗口已满。");
         assert!(out.steps >= 1);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -5266,9 +5344,10 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
     }
 
     #[tokio::test]
-    async fn watchdog_after_tool_round_also_keeps_model_policy() {
-        // After tools, think-cap keeps tools[] and the model policy. It does
-        // not start a toolless wrap overlay.
+    async fn watchdog_after_tool_round_concludes_thinking_off() {
+        // After tools, think-cap does not widen thinking: the review is
+        // already in context and more CoT just parks it. One thinking-off
+        // hop writes `content`. tools[] stay in the request (prefix cache).
         let dir = std::env::temp_dir().join(format!("q38-agent-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
@@ -5295,26 +5374,22 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
             m.role == "user"
                 && m.content
                     .as_deref()
-                    .is_some_and(|c| c.contains(THINK_DIVERGENCE_NOTE))
+                    .is_some_and(|c| c.contains(CONCLUDE_OFF_NOTE))
         }));
         assert!(!agent.messages.iter().any(|m| {
             m.content
                 .as_deref()
-                .is_some_and(|c| c.contains(TOOLS_WRAP_NOTE))
+                .is_some_and(|c| c.contains(THINK_DIVERGENCE_NOTE))
         }));
         let seen = seen.lock().expect("seen").clone();
         assert!(
-            seen.iter().all(|p| p.enabled),
-            "first think-cap hop after tools must keep thinking enabled: {seen:?}"
+            seen.iter().any(|p| !p.enabled),
+            "post-tools think-cap must conclude thinking-off, not widen CoT: {seen:?}"
         );
         assert!(
             seen.iter()
-                .any(|p| p.max_think_tokens == NO_TOOL_THINK_FLOOR),
-            "post-tools think cap must widen for the retry, not rerun at the starved cap: {seen:?}"
-        );
-        assert!(
-            !seen.iter().any(|p| p.max_think_tokens == WRAP_THINK_CAP),
-            "think-cap after tools must not start a toolless wrap: {seen:?}"
+                .all(|p| p.max_think_tokens != NO_TOOL_THINK_FLOOR || !p.enabled),
+            "post-tools think cap must not take the roomy pre-tool retry: {seen:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -5363,12 +5438,12 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
             m.role == "user"
                 && m.content
                     .as_deref()
-                    .is_some_and(|c| c.contains(THINK_DIVERGENCE_NOTE))
+                    .is_some_and(|c| c.contains(CONCLUDE_OFF_NOTE))
         }));
         assert!(!agent.messages.iter().any(|m| {
             m.content
                 .as_deref()
-                .is_some_and(|c| c.contains(TOOLS_WRAP_NOTE))
+                .is_some_and(|c| c.contains(THINK_DIVERGENCE_NOTE))
         }));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -5387,7 +5462,6 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
                 turns: Mutex::new(VecDeque::from([
                     turn_tool("read", json!({"path": "ping.txt"})),
                     ModelTurn::watchdog(),
-                    ModelTurn::watchdog(),
                     turn_text("仓库审查结论"),
                 ])),
                 meter: false,
@@ -5402,7 +5476,7 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests.";
         let seen = seen.lock().expect("seen").clone();
         assert!(
             seen.iter().any(|p| !p.enabled),
-            "second empty think-cap after tools must try thinking-off with tools still on: {seen:?}"
+            "first post-tools think-cap must try thinking-off with tools still on: {seen:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -5545,7 +5619,6 @@ scheduler stalls. I still need to verify the fused kernel block size against gfx
                 turns: Mutex::new(VecDeque::from([
                     turn_tool("read", json!({"path": "ping.txt"})),
                     ModelTurn::watchdog(),
-                    ModelTurn::watchdog(),
                     turn_text("结论：没问题。"),
                 ])),
                 meter: false,
@@ -5557,7 +5630,7 @@ scheduler stalls. I still need to verify the fused kernel block size against gfx
         let out = agent.run("read ping.txt then review").await.unwrap();
         assert_eq!(out.text, "结论：没问题。");
         let seen = seen.lock().expect("tools_seen").clone();
-        assert_eq!(seen.len(), 4);
+        assert_eq!(seen.len(), 3);
         assert!(
             seen.iter().all(|present| *present),
             "every hop including wrap/conclude must keep tools[]: {seen:?}"
@@ -5628,7 +5701,6 @@ scheduler stalls. I still need to verify the fused kernel block size against gfx
         let scripted = Scripted {
             turns: Mutex::new(VecDeque::from([
                 turn_tool("read", json!({"path": "ping.txt"})),
-                ModelTurn::watchdog(),
                 turn_watchdog_think(&review),
                 turn_text("结论：启动脚本显存参数偏满，建议先降到 0.85 再压测一轮。"),
             ])),
@@ -5668,7 +5740,6 @@ scheduler stalls. I still need to verify the fused kernel block size against gfx
         let scripted = Scripted {
             turns: Mutex::new(VecDeque::from([
                 turn_tool("read", json!({"path": "ping.txt"})),
-                ModelTurn::watchdog(),
                 turn_think(&review),
                 turn_text(rewritten),
             ])),
@@ -5740,6 +5811,147 @@ scheduler stalls. I still need to verify the fused kernel block size against gfx
                     .as_deref()
                     .is_some_and(|c| c.contains(STUB_CONTINUE_NOTE))
         }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn plan_stub_without_tools_is_not_a_finish() {
+        let dir = std::env::temp_dir().join(format!("q38-stub2-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("read", json!({"path": "ping.txt"})),
+                turn_text("快补最后一块：LICENSE/NOTICE/.gitignore 还没看，扫一眼就交结论。"),
+                turn_text("仓库审查结论"),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("read ping.txt then review").await.unwrap();
+        assert_eq!(out.text, "仓库审查结论");
+        assert!(agent.messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains(STUB_CONTINUE_NOTE))
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn continue_follow_up_wraps_once_files_were_read() {
+        let dir = std::env::temp_dir().join(format!("q38-cont-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        o.max_steps = 12;
+        let first = format!(
+            "仓库审查结论：{}",
+            "launch 默认值需要和 README 对齐。".repeat(8)
+        );
+        let scripted = Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("read", json!({"path": "ping.txt"})),
+                turn_text(&first),
+                turn_text("仓库审查结论：续写完毕。"),
+            ])),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out1 = agent.run("read ping.txt then review").await.unwrap();
+        assert_eq!(out1.text, first);
+        let out2 = agent.run("继续").await.unwrap();
+        assert_eq!(out2.text, "仓库审查结论：续写完毕。");
+        assert!(agent.messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains(TOOLS_WRAP_NOTE))
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn reread_stall_wraps_instead_of_looping() {
+        let dir = std::env::temp_dir().join(format!("q38-stall-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(name), "ok\n").unwrap();
+        }
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        o.max_steps = 16;
+        let mut hops = VecDeque::from([
+            turn_tool("read", json!({"path": "a.txt"})),
+            turn_tool("read", json!({"path": "b.txt"})),
+            turn_tool("read", json!({"path": "c.txt"})),
+        ]);
+        for _ in 0..EXPLORE_STALL_WRAP {
+            hops.push_back(turn_tool("read", json!({"path": "a.txt"})));
+        }
+        hops.push_back(turn_text("仓库审查结论"));
+        let scripted = Scripted {
+            turns: Mutex::new(hops),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("review these files").await.unwrap();
+        assert_eq!(out.text, "仓库审查结论");
+        assert!(agent.messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains(TOOLS_WRAP_NOTE))
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn wrap_plan_stub_is_not_a_finish() {
+        // Live 2026-09-02: wrap note fired, then the model wrote
+        // “收尾前快速核实两处疑点…” and the turn stopped. Wrap hops must
+        // keep going until a real answer (or exhausted salvage).
+        let dir =
+            std::env::temp_dir().join(format!("q38-wrapstub-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(name), "ok\n").unwrap();
+        }
+        let mut o = opts(&dir);
+        o.peripheral = false;
+        o.max_steps = 16;
+        let answer = format!(
+            "仓库审查结论：主循环收尾必须写正文。{}",
+            "drive 只分发，adjudicate 是唯一裁决点。".repeat(8)
+        );
+        let mut hops = VecDeque::from([
+            turn_tool("read", json!({"path": "a.txt"})),
+            turn_tool("read", json!({"path": "b.txt"})),
+            turn_tool("read", json!({"path": "c.txt"})),
+        ]);
+        for _ in 0..EXPLORE_STALL_WRAP {
+            hops.push_back(turn_tool("read", json!({"path": "a.txt"})));
+        }
+        hops.push_back(turn_text(
+            "收尾前快速核实两处疑点（注释与条件是否一致、空文本交付路径）。",
+        ));
+        hops.push_back(turn_text(&answer));
+        let scripted = Scripted {
+            turns: Mutex::new(hops),
+            meter: false,
+        };
+        let mut agent = Agent::new(scripted, o).unwrap();
+        let out = agent.run("review these files").await.unwrap();
+        assert_eq!(out.text, answer);
+        assert!(
+            !out.text.contains("核实两处疑点"),
+            "wrap plan stub leaked as the answer: {}",
+            out.text
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

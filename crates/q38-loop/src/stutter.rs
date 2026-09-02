@@ -53,6 +53,19 @@ pub fn is_progress_narration(s: &str) -> bool {
         "再读",
         "再查",
         "仓库很小",
+        "快补",
+        "还没看",
+        "还没读",
+        "扫一眼",
+        "最后一块",
+        "还差",
+        "收尾前",
+        "先确认",
+        "细读",
+        "核实",
+        "继续读",
+        "再细看",
+        "再收尾",
     ];
     if MARK.iter().any(|m| t.contains(m)) {
         return true;
@@ -61,14 +74,29 @@ pub fn is_progress_narration(s: &str) -> bool {
     if l.contains("let me ") || l.contains("i'll ") || l.contains("next i") || l.contains("next,") {
         return true;
     }
-    matches!(t.chars().next(), Some('看' | '读' | '查'))
-        && !t.contains("结论")
-        && !t.contains("建议")
-        && !t.contains("问题")
-        && !t.contains("修复")
-        && !t.contains("没问题")
-        && !t.contains("读完")
-        && !t.contains("看完")
+    matches!(t.chars().next(), Some('看' | '读' | '查')) && !is_verdict_line(t)
+}
+
+/// Short conclusive line. Used so wrap hops can still finish with a compact
+/// verdict (`仓库审查结论`, `recovered`) while rejecting plan stubs of the
+/// same length.
+pub fn is_verdict_line(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    const MARK: &[&str] = &[
+        "结论",
+        "建议",
+        "没问题",
+        "已完成",
+        "没有问题",
+        "读完了",
+        "看完了",
+        "recovered",
+    ];
+    let l = t.to_ascii_lowercase();
+    MARK.iter().any(|m| t.contains(m) || l.contains(m))
 }
 
 /// Thinking that is still planning, not a finished user-facing answer.
@@ -520,7 +548,21 @@ is byte-stable and tools stay frozen.";
         assert!(is_progress_narration("接着读补丁脚本和 JIT 脚本。"));
         assert!(is_progress_narration("看 HIP 核的 .cu 源码。"));
         assert!(is_progress_narration("Let me read build_and_test.py next."));
+        assert!(is_progress_narration(
+            "快补最后一块：LICENSE/NOTICE/.gitignore 还没看，扫一眼就交结论。"
+        ));
+        assert!(is_progress_narration(
+            "收尾前快速核实两处疑点（注释与条件是否一致、空文本交付路径）。"
+        ));
+        assert!(is_progress_narration(
+            "还差最后一步，先确认几个关键文件的行数再收尾。"
+        ));
         assert!(!is_progress_narration("仓库审查结论"));
+        assert!(is_verdict_line("仓库审查结论"));
+        assert!(is_verdict_line("recovered"));
+        assert!(!is_verdict_line(
+            "收尾前快速核实两处疑点（注释与条件是否一致、空文本交付路径）。"
+        ));
         assert!(!is_progress_narration("recovered"));
         assert!(!is_progress_narration("你好"));
         assert!(!is_progress_narration("读完了。"));
